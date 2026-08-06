@@ -168,19 +168,43 @@ pub fn map_page(
 static MAPPER: Mutex<Option<OffsetPageTable<'static>>> = Mutex::new(None);
 static FRAME_ALLOCATOR: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
 
+/// The single sanctioned way to touch `MAPPER` and/or `FRAME_ALLOCATOR`,
+/// mirroring `task::with_scheduler` and `keyboard::with_queue`: both locks
+/// are plain `spin::Mutex`, and the 100 Hz timer ISR can preempt any task
+/// mid-critical-section on this single-core kernel. Without disabling
+/// interrupts for the duration of the lock(s), a tick landing while a task
+/// holds either lock would have the ISR's own path (or a re-scheduled task)
+/// spin on a lock its own preemption victim can never resume to release --
+/// the same deadlock shape already fixed once in `task.rs` and again in
+/// `allocator.rs`/`keyboard.rs`. Both locks are always acquired together
+/// here, in the same order, so there's no separate lock-ordering hazard to
+/// introduce by routing everything through one function.
+fn with_paging<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut Option<OffsetPageTable<'static>>, &mut Option<BootInfoFrameAllocator>) -> R,
+{
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut mapper = MAPPER.lock();
+        let mut frame_allocator = FRAME_ALLOCATOR.lock();
+        f(&mut mapper, &mut frame_allocator)
+    })
+}
+
 /// Install the mapper and frame allocator built during heap setup as the
 /// kernel-wide instances used by diagnostics and (from later phases) new
 /// mappings outside the heap.
 pub fn install(mapper: OffsetPageTable<'static>, frame_allocator: BootInfoFrameAllocator) {
-    *MAPPER.lock() = Some(mapper);
-    *FRAME_ALLOCATOR.lock() = Some(frame_allocator);
+    with_paging(|mapper_slot, frame_allocator_slot| {
+        *mapper_slot = Some(mapper);
+        *frame_allocator_slot = Some(frame_allocator);
+    });
 }
 
 /// Whether `install` has run. Diagnostics use this to report "paging not
 /// active" instead of silently showing zeroes if heap init fell back to
 /// the static array (see `memory::init_heap`).
 pub fn is_active() -> bool {
-    MAPPER.lock().is_some()
+    with_paging(|mapper_slot, _| mapper_slot.is_some())
 }
 
 /// Frame allocator statistics for `sysinfo`/`monitor`.
@@ -190,8 +214,10 @@ pub struct FrameStats {
 }
 
 pub fn frame_stats() -> Option<FrameStats> {
-    FRAME_ALLOCATOR.lock().as_ref().map(|allocator| FrameStats {
-        allocated: allocator.frames_allocated(),
-        free_in_pool: allocator.frames_in_free_pool(),
+    with_paging(|_, frame_allocator_slot| {
+        frame_allocator_slot.as_ref().map(|allocator| FrameStats {
+            allocated: allocator.frames_allocated(),
+            free_in_pool: allocator.frames_in_free_pool(),
+        })
     })
 }

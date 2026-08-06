@@ -294,12 +294,23 @@ lock as held-by-someone-who-isn't-running-and-never-will-be-again.
   forever waiting for a release that can only happen once the ISR itself
   returns via `iretq` -- which can't happen until it stops spinning. Fixed
   the same way: `keyboard::with_queue` is now the single access point.
+- **Bug 4 -- `paging::MAPPER`/`FRAME_ALLOCATOR`, the last unaudited pair.**
+  `paging::install`/`is_active`/`frame_stats` (the latter two reachable
+  from `sysinfo`/`monitor`, ordinary shell commands run with interrupts
+  enabled) locked these two `spin::Mutex`es directly. Nothing on this
+  single-core kernel currently locks them from inside a timer-preempted,
+  already-interrupt-disabled section, so this was latent rather than
+  demonstrated -- but a future Phase 4 caller (a page fault handler, a
+  syscall doing `mmap`-like work) reaching either lock from such a context
+  would reproduce Bugs 1-3's exact shape. Fixed the same way, ahead of
+  Phase 4 rather than after: `paging::with_paging` is the single access
+  point for both locks, acquired together under one `without_interrupts`.
 
 `without_interrupts` (from the `x86_64` crate) nests safely -- it only
 disables/restores the flag it personally changed, so `with_scheduler`
-calling into code that also calls `with_queue`, or the interrupt-safe
-allocator, composes correctly without double-disabling or prematurely
-re-enabling anything.
+calling into code that also calls `with_queue` or `with_paging`, or the
+interrupt-safe allocator, composes correctly without double-disabling or
+prematurely re-enabling anything.
 
 ## Networking
 
