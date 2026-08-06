@@ -65,9 +65,10 @@ flowchart LR
 ## Boot sequence
 
 1. `bootloader` crate loads the kernel ELF from the BIOS disk image.
-2. `kernel_main` initializes the heap, then interrupts (GDT/TSS, IDT,
-   PIC remap + mask, PIT timer, `sti`), then ATA, TuwaiqFS, tasks, and
-   network.
+2. `kernel_main` enables `EFER.NXE` (`paging::enable_nx`, before any page
+   table exists -- see Phase 4 below), initializes the heap, then
+   interrupts (GDT/TSS, IDT, PIC remap + mask, PIT timer, `sti`), then ATA,
+   TuwaiqFS, tasks, and network.
 3. Framebuffer or VGA console starts; shell prints boot banner and prompt.
 
 Interrupts must come immediately after the heap: the keyboard event queue
@@ -92,8 +93,10 @@ interrupts live rather than a purely polled CPU.
 | `fs.rs` | In-memory tree API for shell |
 | `tuwaiqfs.rs` | On-disk serialization (TuwaiqFS v2) |
 | `ata.rs` | Primary master PIO sector I/O |
-| `task.rs` | Preemptive scheduler: real TCBs, per-task stacks, context switch |
-| `usermode.rs` | Phase 4 Ring 3 foundation: user pages, `iretq` entry, demo payloads |
+| `task.rs` | Preemptive scheduler: real TCBs, per-task stacks, context switch, user-process lifecycle, CR3/RSP0 switching |
+| `usermode.rs` | Low-level `iretq` primitive that drops CPL to 3 |
+| `elf.rs` | Minimal ELF64 loader: validates and maps `PT_LOAD` segments into a process's address space |
+| `syscall.rs` | Real syscall ABI: entry stub, dispatch, user-pointer validation |
 | `loader.rs` / `programs/` | Built-in program registry |
 | `apps/` | notes, editor, monitor |
 | `net/` | Driver trait, loopback, HTTP stub |
@@ -169,6 +172,10 @@ See [docs/TUWAIQFS.md](docs/TUWAIQFS.md). The full directory tree is flattened t
   buffer (0xB8000) in this project's boot configuration -- writing to it
   from a fault/panic path will page-fault, which is why fault reporting
   only touches the framebuffer console (see `interrupts::report_fault`)
+- User processes (Phase 4): own private stack + ELF segments in
+  `0x_7000_0000_0000 .. +1 GiB`, own private page-table root -- see the
+  Phase 4 section below for the full virtual-memory layout and isolation
+  mechanism
 
 ## Paging (Phase 2)
 
@@ -249,76 +256,247 @@ execution state, not bookkeeping strings.
   just relabels it -- is the verification this phase's own engineering
   rules require before it counts as done, not just a clean compile.
 
-## Ring 3 foundation (Phase 4, first milestone)
+## Phase 4: user-mode process model
 
-`usermode.rs` proves the kernel can genuinely drop the CPU to CPL=3 and get
-back, and that a privileged instruction executed there traps safely instead
-of corrupting anything. It is deliberately *not* a process model: no ELF
-loader into user memory, no per-process address space, no syscall ABI --
-those are the rest of Phase 4. Two demo payloads, driven by the `usermode
-[enter|fault]` shell command, exercise the full mechanism:
+Phase 4 replaced the milestone-1 Ring 3 *demo* (a hand-copied payload with
+no address-space isolation, one shared page, one process at a time) with a
+real process model: genuine ELF64 programs, each with its own private
+address space, scheduled and preempted exactly like any kernel task, with a
+real syscall interface and hardware-enforced fault isolation. This section
+documents it as it stands today; the earlier milestone's demo code
+(`usermode.rs`'s payloads, the `usermode` shell command) no longer exists --
+see git history for that snapshot if needed.
 
-- **GDT/TSS**: `gdt.rs` adds `Descriptor::user_code_segment()` /
-  `user_data_segment()` entries (DPL=3; `add_entry` encodes that into the
-  returned selector's RPL automatically) and `gdt::set_kernel_stack`, which
-  writes the TSS's RSP0 -- the stack the CPU switches to on *any* interrupt
-  or exception that catches it running at CPL=3. Without this, a trap out
-  of Ring 3 would hand the CPU an invalid stack to build its interrupt
-  frame on; this is concretely what "kernel stacks stay under kernel
-  control through the TSS" means.
-- **Entry**: `usermode::enter_ring3` (hand-written asm, same style as
-  `task.rs`'s `context_switch`) builds the five-word `iretq` frame (SS,
-  RSP, RFLAGS, CS, RIP) by hand and executes `iretq` -- the only
-  instruction in this kernel that actually changes CPL. `RFLAGS` is a
-  literal `0x202`: `IF=1` (interrupts stay on in Ring 3 -- Phase 1-3
-  preemption keeps working) and `IOPL=00`, so I/O port instructions fault
-  from Ring 3 exactly like every other privileged instruction.
-- **Payloads**: two small `global_asm!` blocks, copied at runtime into a
-  dedicated page mapped `PRESENT | WRITABLE | USER_ACCESSIBLE` (the kernel
-  never executes them at their in-image address, only reads their bytes).
-  The "clean" payload runs a couple of harmless instructions then executes
-  `int 0x80`; the "fault" payload executes `cli`. Both get their own 4 KiB
-  user stack page, mapped the same way.
-- **The one gate back**: vector `0x80` is registered in the IDT with
-  DPL=3 (`interrupts.rs`) -- every other vector stays at the default DPL=0
-  and would itself fault a Ring 3 `int` attempt before the handler ever
-  ran. Its handler logs the trap's `CS`/`RIP` (the CPU stamps the *actual*
-  CPL onto `CS`'s low bits when building the frame -- this is the
-  hardware-produced proof CPL=3 was real, not just "a function named
-  enter_ring3 was called") and ends the demo task via `task::exit()`, the
-  same scheduler machinery that already correctly abandons a task's call
-  stack on ordinary exit.
-- **Privileged-instruction recovery**: `cli` at CPL=3 is rejected by the
-  CPU with a GPF purely as a hardware consequence of the privilege level --
-  nothing in this kernel special-cases *which* instruction faults. Before
-  this milestone, `general_protection_fault_handler` always halted forever
-  (a Ring 0 fault means something in trusted code is broken -- halting
-  before it corrupts more state is correct). It now checks the trapped
-  frame's `CS` RPL first: RPL=3 means the fault is a *Ring 3* program doing
-  something CPL=3 forbids, not a kernel bug, so the handler kills only that
-  task (`task::exit()`) and the kernel carries on -- the same distinction
-  every real OS makes between a kernel panic and a killed userspace
-  process. A Ring-0-origin GPF is completely unaffected: this branch was
-  unreachable before Phase 4 (nothing ran below CPL=0), so existing
-  behavior for every other fault path is unchanged.
-- **Why only one Ring-3-capable task at a time**: the TSS has exactly one
-  RSP0 slot. A full process model swaps it on every context switch, so
-  each task's trap always lands on its own stack under arbitrary
-  preemption -- real scheduler-integration work, out of scope here. Instead
-  each demo task calls `task::current_kernel_stack_top()` and
-  `gdt::set_kernel_stack` once, at its own start, and the shell command
-  that drives this module never has two such tasks in flight at once. This
-  is sound for exactly the reason it's simple: no other task (shell, idle,
-  heartbeat) ever runs Ring 3 code, so RSP0's value is simply never
-  consulted while any of them is current.
-- **Verified live in QEMU** (see the PR for full serial-log evidence): the
-  `int 0x80` handler logged `CS=0x2b` (GDT index 5, RPL=3) and
-  `SS=0x23` (index 4, RPL=3) on the clean-return trap; the `cli` demo
-  produced exactly one GPF, `error_code=0`, `code_segment=43` (0x2b,
-  RPL=3), `RIP` pointing exactly at the mapped fault payload's address --
-  then the full Phase 1-3 regression checklist, a reboot with filesystem
-  persistence, and the heartbeat counter all continued normally in the
-  same session afterward.
+### Process model
+
+A user process is a `task.rs` `Tcb` like any other, plus a `ProcessState`:
+its own `paging::AddressSpace`, the ELF entry point and user stack top it
+should start at, and (once it has run) an exit code. `ps`/`taskinfo` read
+this genuine state -- nothing here is cosmetic:
+
+- **PID** = task id (the same id space kernel tasks use; `sys_getpid`
+  returns it directly).
+- **Privilege**: `Privilege::Kernel` or `Privilege::User`, shown in `ps`.
+- **State**: the same `Ready`/`Running`/`Blocked`/`Terminated` machinery
+  Phase 3 already had -- a user process blocks, sleeps, and gets preempted
+  through the identical scheduler path a kernel task does.
+- **Own user stack**: a dedicated, `WRITABLE | USER_ACCESSIBLE | NO_EXECUTE`
+  region mapped by `task::spawn_user_process` (4 pages, 16 KiB) inside the
+  process's own address space.
+- **Own kernel stack**: the same 32 KiB `Box<[u8; STACK_SIZE]>` every task
+  already gets (`task::new_user_tcb`) -- this is what the TSS's RSP0 points
+  at while this process is current (see below).
+- **Own address-space/page-table root**: see the next section.
+- **Lifecycle**: `task::spawn_user_process` (create + add to the
+  scheduler) -> runs via the normal scheduling loop -> `task::exit_with_code`
+  (via the `EXIT` syscall or fault-isolation recovery) marks it `Terminated`
+  and records an exit code -> the next `schedule()` call that switches away
+  from it frees its address space (see below).
+- **Exit status**: `Task::exit_code`, `Some` once terminated. `ps`/`taskinfo`
+  print it; `runelf`/`isolate` wait for it and report it.
+
+No second scheduler was built: `task.rs`'s existing round-robin
+`Scheduler`/`prepare_switch`/`schedule` loop is the *only* scheduler, and a
+user process is simply a `Tcb` whose `process` field is `Some`.
+
+### Ring 0 / Ring 3 boundary
+
+- **GDT**: `gdt.rs` has null, kernel-code, TSS, and Ring 3 code/data
+  descriptors (DPL=3; `Descriptor::user_code_segment()`/`user_data_segment()`,
+  whose DPL `add_entry` encodes directly into the returned selector's RPL).
+- **Entry into Ring 3**: `usermode::enter_ring3` -- a small hand-written
+  `iretq` trampoline, the *only* place in this kernel that changes CPL. It
+  builds the five-word interrupt-return frame (RIP, CS, RFLAGS, RSP, SS) by
+  hand; `RFLAGS = 0x202` (`IF=1`, interrupts stay on; `IOPL=00`, so I/O port
+  instructions fault from Ring 3 like every other privileged instruction).
+  `task.rs`'s `rust_user_entry` (a new user task's very first run, reached
+  through `user_task_trampoline`) is the only caller.
+- **Return from Ring 3**: only ever through a trap -- the syscall gate
+  (`int 0x80`, normal exit) or a fault (page fault / GPF, recovery exit).
+  There is no "ordinary return" path; a user process's Ring 3 call stack is
+  always abandoned, exactly like a kernel task's stack is abandoned on
+  `exit()`.
+- **TSS / RSP0**: `gdt::set_kernel_stack` writes `TSS.privilege_stack_table[0]`
+  -- the stack the CPU switches to on *any* interrupt/exception/syscall that
+  catches the CPU at CPL=3. `task::schedule()` calls it on **every**
+  scheduler switch, with the incoming task's own kernel stack top (0 only
+  for the boot "shell" task, which never runs Ring 3 code and so never
+  consults RSP0). This is what removed Milestone 1's "only one Ring-3
+  process at a time" limitation: RSP0 is a single CPU-global field, but it's
+  now kept current on every switch, so whichever process is running always
+  traps onto *its own* kernel stack, not some other process's.
+
+### Per-process address spaces
+
+- **Layout**: `paging::USER_SPACE_BASE = 0x_7000_0000_0000`,
+  `USER_SPACE_SIZE = 1 GiB`. Every process's ELF segments and its stack
+  live somewhere in this one range, which sits inside a single PML4 entry
+  (`USER_REGION_PML4_INDEX`). Kernel mappings (heap at `0x_4444_4444_0000`,
+  kernel image, physical-memory identity window, kernel/IST stacks) occupy
+  entirely different PML4 entries and are untouched.
+- **Construction** (`paging::new_address_space`): allocate a fresh PML4
+  frame, copy all 511 *other* entries verbatim from the kernel's own
+  top-level table (same physical subtree pointers, same flags -- copying an
+  entry cannot change its `USER_ACCESSIBLE` bit, so kernel pages stay
+  exactly as supervisor-only as they always were), and leave
+  `USER_REGION_PML4_INDEX` completely empty. This is the actual isolation
+  mechanism: two processes' private subtrees live under the same PML4
+  index but are never the same physical subtree, so there is no shared
+  page-table entry through which one could reach the other's memory, even
+  though both may use the identical virtual address.
+- **Mapping** (`paging::map_in_address_space`): maps one page into a given
+  `AddressSpace`, independent of whether it's the active CR3 (via a
+  physical-memory-offset-mapped `OffsetPageTable` built over that specific
+  PML4 frame). Refuses anything outside `USER_REGION_PML4_INDEX` -- a second,
+  independent check beyond `elf.rs`'s own range validation.
+- **Frame ownership**: `AddressSpace` tracks every physical frame it owns
+  (its own page-table subtree *and* every mapped leaf page) via a
+  `TrackingFrameAllocator` wrapper that records each frame `map_to` hands
+  out internally, including intermediate P3/P2/P1 tables `map_to` allocates
+  opaquely. `free_address_space` (called once CR3 has moved off it -- see
+  below) returns every one of them to the global allocator in one pass, no
+  tree-walk needed.
+- **CR3 switching**: `paging::switch_to` loads a `PhysFrame` into CR3.
+  `task::schedule()` calls it on *every* switch (not only when the address
+  space actually changes) with either the incoming user process's own PML4
+  or `paging::kernel_pml4_frame()` for a kernel-only task -- reloading CR3
+  to its current value is just a slightly wasteful TLB flush, a better
+  trade than trusting a separately maintained "currently loaded" cache to
+  never drift from reality.
+- **Frame lifecycle / leak avoidance**: an address space is only ever freed
+  once CR3 has provably moved off it (`free_address_space`'s own safety
+  contract). For the common case -- a process terminating itself via `exit`
+  or fault recovery -- `Scheduler::prepare_switch` takes the outgoing
+  (Terminated, current) task's address space out of its `Tcb` while still
+  holding the scheduler lock, and `schedule()` frees it *after* loading the
+  new CR3 but *before* the actual stack switch. For `kill`-ing a
+  *non-current* task, its address space is provably already inactive (CR3
+  can only ever equal the current task's own), so `kill` frees it
+  immediately rather than waiting for a future switch.
+- **Known leak** (pre-existing, not introduced by Phase 4): a `Tcb` is
+  never removed from the scheduler's task list once `Terminated` -- `kill`
+  and the old Phase 3 code already had this property for kernel tasks. A
+  terminated user process's 32 KiB kernel-stack `Box` therefore also leaks
+  (its *address-space* frames are correctly freed, only the `Tcb`/kernel-stack
+  allocation itself is not). Not a new regression; worth fixing whenever
+  process reaping is added.
+
+### Syscall ABI
+
+`int 0x80`, DPL=3. `RAX` = syscall number on entry / return value on exit;
+`RDI`/`RSI`/`RDX` = up to three arguments. `>= 0` is success, `-1` is a
+generic failure -- no `errno`-style detail channel in this minimal ABI.
+
+| # | name | args | returns |
+|---|------|------|---------|
+| 0 | EXIT | `code: i32` | never returns |
+| 1 | WRITE | `ptr: *const u8, len: usize` | bytes written, or `-1` |
+| 2 | YIELD | -- | `0` |
+| 3 | GETPID | -- | this process's task id |
+
+Any other number: `-1`, logged, the process keeps running (`syscall.rs`
+`dispatch`'s `_` arm) -- unknown syscalls fail safely rather than crashing
+anything.
+
+**Entry mechanism**: `syscall_entry` (`syscall.rs`) is hand-written asm, not
+`extern "x86-interrupt"` -- that calling convention only exposes the
+CPU-pushed frame, not general-purpose registers, and this ABI needs to read
+`RAX`/`RDI`/`RSI`/`RDX` and write a return value back into `RAX`. It saves
+all 15 GPRs (verified 16-byte SysV stack alignment at the `call` into Rust:
+120 bytes of pushes plus the CPU's own 40-byte privilege-change entry
+adjustment lands exactly on a 16-byte boundary), calls into
+`syscall_dispatch`, restores every register (`RAX` now holding the result),
+and `iretq`s back to Ring 3. `int 0x80` is registered as an interrupt gate
+(not a trap gate), so the CPU itself clears `IF` on entry -- the entire
+syscall body runs with interrupts disabled, which is also what makes the
+pointer-validation step below race-free: nothing can preempt a process
+between validating a pointer and using it within the same syscall.
+
+**Pointer validation**: `WRITE` is the only syscall taking a pointer.
+`sys_write` first rejects `len > 4096` outright, then calls
+`task::copy_from_current_user`, which walks the *calling* process's own
+page tables (`paging::translate_in_address_space`, then
+`read_bytes_from_address_space`) and only copies bytes once every page in
+`[ptr, ptr+len)` is confirmed `PRESENT | USER_ACCESSIBLE` (checked
+arithmetic throughout -- an overflowing `ptr+len` is rejected, not wrapped).
+The kernel's own physical-memory-offset mapping is the only thing ever
+dereferenced; a user-supplied pointer's numeric value is never trusted or
+dereferenced directly under the live CR3. An invalid pointer or range is a
+clean `-1`, never a Ring 0 page fault from kernel code blindly trusting
+user input.
+
+### ELF64 loader
+
+`elf.rs`. Supported subset, documented exactly (see the module's own docs
+for the full list): `ELFCLASS64`, `ELFDATA2LSB`, `ET_EXEC` only (no
+relocations/PIE -- every address in the file must already be final),
+`EM_X86_64`, only `PT_LOAD` segments processed (`PT_DYNAMIC`/`PT_INTERP`
+reject the whole file; anything else is silently skipped), no section
+headers read at all. Every offset/size taken from the file goes through
+checked arithmetic before use.
+
+Two passes: the first validates and rejects the *entire* file if anything
+is malformed or unsupported, before mapping a single page -- a partially
+loaded process is never a thing this loader can hand control to. The
+second pass maps each segment's pages `WRITABLE` first (so the kernel-side
+copy can populate it through the physical-memory-offset path), zeroes the
+*entire* freshly mapped range (not just the BSS tail -- a reused physical
+frame must never leak a previous process's contents to a new one), copies
+in the file bytes, then narrows the pages to their real, final permissions
+via `paging::update_flags_in_address_space` if those differ from the
+staging flags. A segment's `p_flags` map directly: `PF_X` absent ->
+`NO_EXECUTE` added (meaningful only because `paging::enable_nx` already ran
+at the very start of `kernel_main`, before any page table exists); `PF_W`
+present -> `WRITABLE` kept, otherwise dropped once loading finishes.
+
+### Process / fault lifecycle
+
+| Trigger | Path | Result |
+|---|---|---|
+| `EXIT` syscall | `syscall::sys_exit` -> `task::exit_with_code` | Process terminates with the given code; kernel continues |
+| Privileged instruction at CPL=3 | GPF, `code_segment & 3 == 3` -> `task::exit_with_code(132)` | Only that process terminates; kernel continues |
+| Kernel-memory / unmapped access at CPL=3 | Page fault, `code_segment & 3 == 3` -> `task::exit_with_code(139)` | Only that process terminates; kernel continues |
+| Invalid syscall number | `syscall::dispatch`'s `_` arm | `-1` returned; process keeps running |
+| Invalid user pointer to `WRITE` | `task::copy_from_current_user` returns `None` | `-1` returned; process keeps running |
+| Any fault at CPL=0 | Same handlers, `code_segment & 3 != 3` | Unconditional halt -- unchanged kernel-panic policy, never routed around |
+
+The exit codes (139/132) deliberately echo the Unix "128 + signal number"
+convention (SIGSEGV/SIGILL) purely as a recognizable value in `ps` output --
+this kernel has no real signal delivery.
+
+### Known limitations
+
+- Single, fixed 1 GiB user address range shared (disjointly) by every
+  process -- no ASLR, no growth beyond it, no `mmap`-style dynamic mapping.
+- No dynamic linking (`ET_EXEC` only), no relocations, no filesystem-backed
+  executable loading yet (`runelf` loads from six build-time-embedded ELF
+  binaries only).
+- Terminated `Tcb`s (and their kernel-stack allocation) are never reaped --
+  a pre-existing property of `task.rs`, not new to Phase 4 (see above).
+- No dedicated automated test exercises "execute code from a `NO_EXECUTE`
+  page" specifically (EFER.NXE itself *is* verified -- see `paging::enable_nx`
+  -- and every data/stack page is correctly marked `NO_EXECUTE`; only a
+  fault-injection test for that exact case wasn't added this pass, to avoid
+  introducing a hang-prone test into the verification harness under time
+  pressure).
+- Syscall surface is intentionally minimal (4 syscalls) -- no filesystem,
+  no IPC, no memory-mapping syscalls yet.
+
+### Verification performed
+
+All of the following were exercised live in QEMU in a single session (see
+the Phase 4 completion PR for full serial-log/screenshot evidence):
+real ELF execution at CPL=3 with a full syscall round trip (`runelf hello`);
+an unknown syscall number safely rejected (`runelf bad_syscall`); an
+invalid user pointer safely rejected (`runelf bad_pointer`); direct kernel-memory
+access denied by hardware (`runelf bad_kernel`); unmapped-memory access
+faulting correctly (`runelf bad_unmapped`); a privileged instruction
+trapped and recovered (`runelf bad_privileged`); two concurrent processes
+with distinct, hardware-confirmed PML4 physical addresses running under
+real timer preemption with interleaved output (`isolate`); a faulting
+process leaving a concurrently running sibling and the kernel itself
+unaffected (`isolate bad_privileged`); the full Phase 1-3 regression
+checklist; and TuwaiqFS content surviving a full VM reset.
 
 ## Locking invariant
 
@@ -388,15 +566,45 @@ calling into code that also calls `with_queue` or `with_paging`, or the
 interrupt-safe allocator, composes correctly without double-disabling or
 prematurely re-enabling anything.
 
+**Phase 4 extension, audited rather than newly broken.** The per-process
+address-space functions added in `paging.rs` (`new_address_space`,
+`map_in_address_space`, `translate_in_address_space`,
+`read_bytes_from_address_space`, and friends) split into two categories:
+those that touch the global `MAPPER`/`FRAME_ALLOCATOR` locks go through
+`with_paging` exactly like Bug 4's fix, inheriting its interrupt safety
+automatically. The rest operate purely on one `AddressSpace`'s own
+physical memory via the physical-memory-offset mapping -- no `spin::Mutex`
+involved at all, so the deadlock shape above cannot occur there by
+construction. Their safety instead comes from a different, equally load-bearing
+invariant: exactly one execution context ever touches a given
+`AddressSpace` at a time. During ELF loading it's exclusively owned by the
+spawning task's own call stack (not yet visible to the scheduler or any
+interrupt handler); during a syscall it's the *current* process's own
+space, and the syscall gate is an interrupt gate (CPU clears `IF` on
+entry), so nothing can preempt into a second reader/writer mid-syscall
+either. `task::schedule()` itself -- the one place that both changes CR3
+*and* frees a reclaimed `AddressSpace` -- runs the whole sequence inside a
+single `without_interrupts` block, same as before Phase 4.
+
 ## Networking
 
 Loopback driver echoes packets in RAM. `ping localhost` validates the stack. HTTP client returns 503 stubs for future AI Bridge integration.
 
 ## Build pipeline
 
-1. `cargo build -p kernel --target x86_64-unknown-none`
-2. `cargo build -p tuwaiqos` → `build.rs` wraps kernel in BIOS image
-3. Output: `boot-bios-tuwaiqos.img`
+1. `userland/hello` (own `[workspace]`, not a member of the root one --
+   see that crate's `Cargo.toml`): six real, statically linked, fixed-address
+   ELF64 executables (`hello` + five `bad_*` fault-injection programs),
+   built from `cargo build --release` run *inside* that directory (its
+   `.cargo/config.toml` supplies the static-relocation/large-code-model/
+   no-PIE flags a fixed high address like `0x_7000_0000_0000` requires --
+   running from the repo root would silently miss that config).
+2. `cargo build -p kernel --target x86_64-unknown-none` -- `shell.rs`
+   embeds all six binaries from step 1 via `include_bytes!`.
+3. `cargo build -p tuwaiqos` → `build.rs` wraps kernel in BIOS image
+4. Output: `boot-bios-tuwaiqos.img`
+
+`scripts/build.ps1` runs all of this in order.
 
 ## Historical note
 

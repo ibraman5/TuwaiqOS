@@ -27,32 +27,57 @@
       (shell, idle, a heartbeat task) verified live in QEMU.
 - [x] Ring 3 foundation: user code/data GDT segments, a TSS whose RSP0 can
       be pointed at a specific kernel stack at runtime, and a real
-      `iretq`-based Ring 0 -> Ring 3 transition with a safe trap back
-      (`usermode` shell command). Verified live in QEMU: CPL=3 genuinely
-      reached (CS/SS RPL=3 on the trap frame), a privileged instruction
-      executed from Ring 3 takes a General Protection Fault that the
-      kernel recovers from by killing only the offending task, and the
-      full Phase 1-3 regression (scheduler, heartbeat, shell, paging,
-      filesystem persistence across reboot) still passes afterward. Not
-      yet a process model: one shared address space, no ELF loader into
-      user memory, no syscall ABI, and only one Ring-3-capable task may
-      run at a time (see `usermode.rs`'s module docs) -- that's the rest
-      of Phase 4.
-- [ ] Per-process address spaces / user-mode memory isolation (frame
-      allocator, mapper, and a real scheduler all exist now; nothing uses
-      them together for process isolation yet)
-- [ ] Syscall interface (the Ring 3 <-> Ring 0 boundary above is real, but
-      `int 0x80` is currently a one-shot "demo is over" gate, not a
-      general syscall ABI)
-- [ ] ELF program loader
+      `iretq`-based Ring 0 -> Ring 3 transition with a safe trap back.
+      Verified live in QEMU: CPL=3 genuinely reached (CS/SS RPL=3 on the
+      trap frame), a privileged instruction executed from Ring 3 takes a
+      General Protection Fault the kernel recovers from, and the full
+      Phase 1-3 regression still passes afterward. Superseded by the full
+      process model below -- this milestone's demo code no longer exists.
+- [x] Full user-mode process model, per-process address spaces, syscall
+      ABI, and ELF64 execution: real `Tcb`-integrated user processes (own
+      PID, state, private address space, own kernel + user stacks, exit
+      status) scheduled by the *same* Phase 3 scheduler, no second
+      scheduler built. Each process gets a genuinely private page-table
+      root (`paging::AddressSpace`) -- kernel mappings copied in without
+      `USER_ACCESSIBLE`, the process's own 1 GiB user region left entirely
+      empty for it alone -- with CR3 and the TSS's RSP0 both switched
+      correctly on every scheduler transition, so any number of processes
+      interleave safely under real preemption. `elf.rs` is a real,
+      hand-rolled ELF64 loader (documented supported subset: `ET_EXEC`,
+      `EM_X86_64`, `PT_LOAD` only, checked arithmetic throughout) that maps
+      each segment with its own real, final permissions (code RX, data
+      RW+NX, stack RW+NX, `EFER.NXE` enabled and verified before relying on
+      any of it). `syscall.rs` implements a real 4-syscall ABI
+      (EXIT/WRITE/YIELD/GETPID) over the `int 0x80` gate, with every user
+      pointer validated against the caller's own page tables before the
+      kernel ever dereferences it -- an invalid pointer or an unknown
+      syscall number both fail cleanly, never crash the kernel. A user
+      fault (privileged instruction, kernel-memory access, unmapped
+      access) terminates only the offending process; a Ring 0 fault keeps
+      the kernel's unchanged, strict halt policy. Verified live in QEMU in
+      one session: a real ELF process completing a full syscall round
+      trip; each of the fault-isolation categories above triggered and
+      recovered from individually; two concurrent processes with distinct,
+      hardware-confirmed PML4 physical addresses interleaving under timer
+      preemption, one of them deliberately faulted without affecting the
+      other or the kernel; the full Phase 1-3 regression checklist; and
+      TuwaiqFS content surviving a full VM reset. See `ARCHITECTURE.md`'s
+      "Phase 4: user-mode process model" section for the complete design,
+      ABI reference, and known limitations (fixed single user-address
+      range, no dynamic linking, no filesystem-backed executable loading
+      yet, terminated-task kernel-stack reaping still pending -- pre-existing
+      since Phase 3, not new here).
 - [ ] Real NIC driver (e1000 / virtio-net)
 - [ ] AI Bridge HTTP client wired to gateway
 - [ ] `cd` command and path-aware completion
 
 ## v0.7 — planned
 
-- [ ] Full user-mode process model: per-process address spaces and a real
-      syscall interface built on the Ring 3 foundation landed in v0.6
+- [ ] Filesystem-backed executable loading (`elf.rs` already parses real
+      ELF64 bytes; only six build-time-embedded binaries are loadable today)
+- [ ] Dynamic linking / relocations (current loader is `ET_EXEC`-only)
+- [ ] Broader syscall surface (filesystem, IPC, memory-mapping) as real
+      use cases justify each one
 - [ ] FAT32 read-only partition support
 - [ ] VirtualBox/VMware optimized drivers
 - [ ] Package manager for built-in apps
