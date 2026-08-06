@@ -20,7 +20,6 @@ use crate::net;
 use crate::paging;
 use crate::reboot;
 use crate::task;
-use crate::usermode;
 
 const MAX_LINE: usize = 128;
 const HISTORY_SIZE: usize = 16;
@@ -320,7 +319,8 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
         "notes" => handle_notes(mode, args),
         "editor" => handle_editor(mode, args),
         "monitor" => handle_monitor(boot_info, mode),
-        "usermode" => handle_usermode(mode, args),
+        "runelf" => handle_runelf(mode, args),
+        "isolate" => handle_isolate(mode, args),
         "ai" => handle_ai_command(mode, line, args),
         "ask" => handle_ask_command(mode, args),
         _ => {
@@ -402,23 +402,42 @@ fn handle_monitor(boot_info: &BootInfo, mode: ConsoleMode) {
     }
 }
 
-/// Runs one of the two Phase 4 Ring 3 foundation demos (see `usermode.rs`)
-/// as its own task and waits for it to finish before returning, so the
-/// reported outcome reflects what genuinely happened rather than a fixed
-/// string -- the real evidence (CPL, RIP, trap path) is on the serial log,
-/// this just confirms the task actually reached a terminal state.
-fn handle_usermode(mode: ConsoleMode, args: &str) {
-    let sub = args.trim();
-    let (label, entry): (&str, fn()) = match sub {
-        "" | "enter" => ("usermode-enter", usermode::demo_clean_entry as fn()),
-        "fault" => ("usermode-fault", usermode::demo_fault_entry as fn()),
-        _ => {
-            println(mode, "Usage: usermode [enter|fault]");
-            return;
-        }
-    };
+/// The six real, compiled ELF64 test programs (`userland/hello`), embedded
+/// at build time -- see that crate's `src/bin/*.rs` for what each one
+/// actually does. `hello` is the well-behaved one; the five `bad_*` binaries
+/// each deliberately trigger one required fault-isolation category (see
+/// `ARCHITECTURE.md`'s "User process fault isolation" section).
+fn embedded_program(name: &str) -> Option<&'static [u8]> {
+    match name {
+        "hello" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/hello"
+        ))),
+        "bad_syscall" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/bad_syscall"
+        ))),
+        "bad_pointer" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/bad_pointer"
+        ))),
+        "bad_privileged" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/bad_privileged"
+        ))),
+        "bad_kernel" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/bad_kernel"
+        ))),
+        "bad_unmapped" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/bad_unmapped"
+        ))),
+        _ => None,
+    }
+}
 
-    let id = task::spawn(label, entry);
+fn wait_for_terminated(id: u32) {
     loop {
         match task::info(id) {
             Ok(t) if t.state == task::TaskState::Terminated => break,
@@ -426,15 +445,166 @@ fn handle_usermode(mode: ConsoleMode, args: &str) {
             Err(_) => break,
         }
     }
+}
 
-    print(mode, "Task ");
-    print_u64(mode, id as u64);
-    println(mode, " (");
-    print(mode, label);
-    println(
-        mode,
-        ") finished -- see serial log for Ring 3 entry/trap proof.",
-    );
+fn print_process_result(mode: ConsoleMode, id: u32) {
+    match task::info(id) {
+        Ok(t) => {
+            print(mode, "  pid=");
+            print_u64(mode, t.id as u64);
+            print(mode, " name=");
+            print(mode, &t.name);
+            print(mode, " state=");
+            print(mode, task::state_label(t.state));
+            print(mode, " exit_code=");
+            match t.exit_code {
+                Some(code) => print_i64(mode, code as i64),
+                None => print(mode, "none"),
+            }
+            println(mode, "");
+        }
+        Err(reason) => {
+            print(mode, "  task error: ");
+            println(mode, reason);
+        }
+    }
+}
+
+/// `runelf <name>` -- loads one of the embedded ELF64 test programs as a
+/// real user process (`task::spawn_user_process`, which goes through the
+/// genuine ELF loader in `elf.rs`) and waits for it to terminate. The
+/// reported result reflects the process's actual final state (`ps`
+/// under the hood), not a fixed string; the detailed evidence of what
+/// happened while it ran (Ring 3 entry, syscalls, any fault) is on the
+/// serial log.
+fn handle_runelf(mode: ConsoleMode, args: &str) {
+    let name = args.trim();
+    let Some(bytes) = embedded_program(name) else {
+        println(
+            mode,
+            "Usage: runelf <hello|bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped>",
+        );
+        return;
+    };
+
+    match task::spawn_user_process(name, bytes) {
+        Ok(id) => {
+            print(mode, "Spawned pid ");
+            print_u64(mode, id as u64);
+            print(mode, " (");
+            print(mode, name);
+            println(mode, "), waiting for it to finish...");
+            wait_for_terminated(id);
+            print_process_result(mode, id);
+        }
+        Err(reason) => {
+            print(mode, "Process load error: ");
+            println(mode, reason);
+        }
+    }
+}
+
+/// `isolate [program_b]` -- the Phase 4 process-isolation proof. Spawns
+/// *two* processes back to back (both `Ready` and interleaving under the
+/// same 100 Hz timer preemption everything else in this kernel runs under
+/// -- neither is waited on before the other starts): `hello` and, by
+/// default, a second independent `hello` instance -- or, if `program_b` is
+/// given (e.g. `isolate bad_privileged`), that program instead, which lets
+/// this same command double as the "faulting one process does not kill
+/// another" proof: pid A keeps running and exits cleanly regardless of
+/// what happens to pid B.
+///
+/// Prints hardware evidence that the two are genuinely separate: each
+/// process's own PML4 physical address (`task::process_pml4_phys`) and
+/// owned physical frame count (`task::process_frame_count`) -- two
+/// different page-table roots is the actual mechanism behind "process A
+/// cannot read process B's memory," not a claim this command makes on its
+/// own.
+fn handle_isolate(mode: ConsoleMode, args: &str) {
+    let name_b = {
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            "hello"
+        } else {
+            trimmed
+        }
+    };
+    let (Some(bytes_a), Some(bytes_b)) = (embedded_program("hello"), embedded_program(name_b))
+    else {
+        println(
+            mode,
+            "Usage: isolate [bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped]",
+        );
+        return;
+    };
+
+    // Capture each process's PML4/frame-count evidence *immediately* after
+    // spawning it -- not after printing anything. Printing goes through
+    // the framebuffer/VGA character-by-character path, which takes long
+    // enough in wall-clock terms that the 100 Hz timer can (and, for a
+    // process as short-lived as `hello`, reliably does) preempt into it,
+    // let it run to completion, and free its address space before this
+    // function would otherwise have gotten around to reading it -- which
+    // would print a reclaimed `PML4=0x0` instead of real evidence. This
+    // way the values printed below are always the genuine snapshot taken
+    // right as each process started, regardless of how fast it finishes.
+    let Ok(id_a) = task::spawn_user_process("hello-a", bytes_a) else {
+        print(mode, "Process load error spawning hello-a");
+        println(mode, "");
+        return;
+    };
+    let pml4_a = task::process_pml4_phys(id_a).unwrap_or(0);
+    let frames_a = task::process_frame_count(id_a).unwrap_or(0);
+
+    let Ok(id_b) = task::spawn_user_process(name_b, bytes_b) else {
+        print(mode, "Process load error spawning ");
+        println(mode, name_b);
+        return;
+    };
+    let pml4_b = task::process_pml4_phys(id_b).unwrap_or(0);
+    let frames_b = task::process_frame_count(id_b).unwrap_or(0);
+
+    print(mode, "Spawned pid ");
+    print_u64(mode, id_a as u64);
+    print(mode, " (hello-a) and pid ");
+    print_u64(mode, id_b as u64);
+    print(mode, " (");
+    print(mode, name_b);
+    println(mode, "), running concurrently under preemption.");
+
+    print(mode, "  pid ");
+    print_u64(mode, id_a as u64);
+    print(mode, " PML4=");
+    print_hex(mode, pml4_a);
+    print(mode, " frames=");
+    print_u64(mode, frames_a as u64);
+    println(mode, "");
+
+    print(mode, "  pid ");
+    print_u64(mode, id_b as u64);
+    print(mode, " PML4=");
+    print_hex(mode, pml4_b);
+    print(mode, " frames=");
+    print_u64(mode, frames_b as u64);
+    println(mode, "");
+
+    if pml4_a != 0 && pml4_a == pml4_b {
+        println(
+            mode,
+            "  WARNING: both processes report the SAME PML4 -- address spaces are NOT isolated!",
+        );
+    } else if pml4_a != 0 && pml4_b != 0 {
+        println(
+            mode,
+            "  Confirmed: distinct PML4 physical addresses -- genuinely separate page tables.",
+        );
+    }
+
+    wait_for_terminated(id_a);
+    wait_for_terminated(id_b);
+    println(mode, "Both finished:");
+    print_process_result(mode, id_a);
+    print_process_result(mode, id_b);
 }
 
 fn handle_touch(mode: ConsoleMode, args: &str) {
@@ -496,17 +666,33 @@ fn handle_write(mode: ConsoleMode, args: &str) {
 fn handle_ps(mode: ConsoleMode) {
     match task::list() {
         Ok(tasks) => {
-            println(mode, "PID   NAME");
+            println(mode, "PID   NAME             PRIV    STATE      EXIT");
             for task in tasks {
                 print_u64(mode, task.id as u64);
                 print(mode, "     ");
-                println(mode, &task.name);
+                pad_print(mode, &task.name, 17);
+                pad_print(mode, task::privilege_label(task.privilege), 8);
+                pad_print(mode, task::state_label(task.state), 11);
+                match task.exit_code {
+                    Some(code) => print_i64(mode, code as i64),
+                    None => print(mode, "-"),
+                }
+                println(mode, "");
             }
         }
         Err(reason) => {
             print(mode, "Task error: ");
             println(mode, reason);
         }
+    }
+}
+
+/// Print `text` left-padded to at least `width` columns with spaces --
+/// keeps `ps`'s columns aligned regardless of name/state string length.
+fn pad_print(mode: ConsoleMode, text: &str, width: usize) {
+    print(mode, text);
+    for _ in text.len()..width {
+        print_char(mode, b' ');
     }
 }
 
@@ -520,6 +706,8 @@ fn handle_taskinfo(mode: ConsoleMode, args: &str) {
                     print_u64(mode, task.id as u64);
                     print(mode, ": ");
                     println(mode, &task.name);
+                    print(mode, "  Privilege: ");
+                    println(mode, task::privilege_label(task.privilege));
                     print(mode, "  State: ");
                     println(mode, task::state_label(task.state));
                 }
@@ -545,8 +733,30 @@ fn handle_taskinfo(mode: ConsoleMode, args: &str) {
             println(mode, "");
             print(mode, "Name: ");
             println(mode, &task.name);
+            print(mode, "Privilege: ");
+            println(mode, task::privilege_label(task.privilege));
             print(mode, "State: ");
             println(mode, task::state_label(task.state));
+            if task.privilege == task::Privilege::User {
+                print(mode, "Exit code: ");
+                match task.exit_code {
+                    Some(code) => {
+                        print_i64(mode, code as i64);
+                        println(mode, "");
+                    }
+                    None => println(mode, "none (still running)"),
+                }
+                if let Some(pml4) = task::process_pml4_phys(id) {
+                    print(mode, "Address space PML4: ");
+                    print_hex(mode, pml4);
+                    println(mode, "");
+                }
+                if let Some(frames) = task::process_frame_count(id) {
+                    print(mode, "Address space frames: ");
+                    print_u64(mode, frames as u64);
+                    println(mode, "");
+                }
+            }
         }
         Err(reason) => {
             print(mode, "Task error: ");
@@ -672,7 +882,11 @@ fn print_help(mode: ConsoleMode) {
     println(mode, "  ls | pwd | touch | mkdir | cat | write");
     println(mode, "  ps | taskinfo | kill | yield | net status | ping");
     println(mode, "  run <program> | notes | editor");
-    println(mode, "  usermode [enter|fault]");
+    println(
+        mode,
+        "  runelf <hello|bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped>",
+    );
+    println(mode, "  isolate [bad_program]");
     println(mode, "  ai | ai status | ask <question>");
     println(mode, "");
     println(mode, "Tip: use Up/Down for history, Tab to complete.");
@@ -747,8 +961,8 @@ fn command_names() -> &'static [&'static str] {
     &[
         "help", "about", "version", "banner", "sysinfo", "monitor", "uptime", "reboot", "clear",
         "cls", "echo", "meminfo", "memtest", "ls", "pwd", "touch", "mkdir", "cat", "write", "ps",
-        "taskinfo", "kill", "yield", "net", "ping", "run", "notes", "editor", "usermode", "ai",
-        "ask",
+        "taskinfo", "kill", "yield", "net", "ping", "run", "notes", "editor", "runelf", "isolate",
+        "ai", "ask",
     ]
 }
 
@@ -873,6 +1087,19 @@ fn print_u64(mode: ConsoleMode, mut value: u64) {
     while count > 0 {
         count -= 1;
         print_char(mode, digits[count]);
+    }
+}
+
+fn print_i64(mode: ConsoleMode, value: i64) {
+    if value < 0 {
+        print_char(mode, b'-');
+        // `wrapping_neg` rather than plain `-value`: avoids overflow for
+        // `i64::MIN`, whose magnitude doesn't fit in an `i64` (this ABI
+        // never produces anything near that extreme, but the conversion
+        // should not panic even in principle).
+        print_u64(mode, value.wrapping_neg() as u64);
+    } else {
+        print_u64(mode, value as u64);
     }
 }
 

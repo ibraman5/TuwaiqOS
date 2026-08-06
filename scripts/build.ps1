@@ -15,7 +15,37 @@ Write-Host "=== TuwaiqOS build ===" -ForegroundColor Cyan
 Write-Host "Toolchain: $env:RUSTUP_TOOLCHAIN"
 
 Write-Host ""
-Write-Host "[1/2] Building bare-metal kernel..." -ForegroundColor Yellow
+Write-Host "[1/3] Building userland test ELF programs (hello + bad_*)..." -ForegroundColor Yellow
+# Standalone crate, own [workspace] -- see userland/hello/Cargo.toml. Must
+# build before the kernel: kernel/src/shell.rs embeds its six binaries via
+# include_bytes!. Shares this script's CARGO_TARGET_DIR so the embedded
+# paths are predictable. Invoked from *inside* the package directory
+# deliberately -- cargo's config-file discovery walks up from the current
+# working directory, not from --manifest-path, so running this from the
+# repo root would silently miss userland/hello/.cargo/config.toml (the
+# static-relocation/large-code-model/no-PIE flags a fixed high address
+# like 0x700000000000 requires) and either mis-link as PIE or crash the
+# linker outright.
+Push-Location (Join-Path $ProjectRoot "userland\hello")
+try {
+    cargo build --release
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+} finally {
+    Pop-Location
+}
+
+$UserlandBins = @("hello", "bad_syscall", "bad_pointer", "bad_privileged", "bad_kernel", "bad_unmapped")
+foreach ($bin in $UserlandBins) {
+    $path = Join-Path $ProjectRoot "target\x86_64-unknown-none\release\$bin"
+    if (-not (Test-Path $path)) {
+        Write-Host "userland binary '$bin' not found after step 1." -ForegroundColor Red
+        exit 1
+    }
+}
+Write-Host "userland binaries: $($UserlandBins -join ', ')" -ForegroundColor Green
+
+Write-Host ""
+Write-Host "[2/3] Building bare-metal kernel..." -ForegroundColor Yellow
 cargo build --package kernel --target x86_64-unknown-none
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -24,13 +54,13 @@ if (-not (Test-Path $KernelElf)) {
     $KernelElf = Join-Path $ProjectRoot "target\x86_64-unknown-none\debug\kernel.exe"
 }
 if (-not (Test-Path $KernelElf)) {
-    Write-Host "Kernel ELF not found after step 1." -ForegroundColor Red
+    Write-Host "Kernel ELF not found after step 2." -ForegroundColor Red
     exit 1
 }
 Write-Host "Kernel ELF: $KernelElf" -ForegroundColor Green
 
 Write-Host ""
-Write-Host "[2/2] Building BIOS disk image..." -ForegroundColor Yellow
+Write-Host "[3/3] Building BIOS disk image..." -ForegroundColor Yellow
 cargo build --package tuwaiqos
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
