@@ -106,7 +106,11 @@ pub fn init_heap(physical_memory_offset: Option<u64>, memory_regions: &'static M
         }
     }
 
-    paging::install(mapper, frame_allocator);
+    paging::install(
+        mapper,
+        frame_allocator,
+        VirtAddr::new(physical_memory_offset),
+    );
     allocator::init(HEAP_START, HEAP_SIZE);
 }
 
