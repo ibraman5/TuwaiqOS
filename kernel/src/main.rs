@@ -13,6 +13,7 @@ mod ai_bridge;
 mod allocator;
 mod apps;
 mod ata;
+mod elf;
 mod font8x8;
 mod framebuffer_console;
 mod fs;
@@ -26,6 +27,7 @@ mod paging;
 mod programs;
 mod reboot;
 mod shell;
+mod syscall;
 mod task;
 mod tuwaiqfs;
 mod usermode;
@@ -52,6 +54,9 @@ entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("TuwaiqOS v0.5 kernel_main: booting");
+
+    // Must run before any page table exists: see `paging::enable_nx`.
+    paging::enable_nx();
 
     memory::init_heap(
         boot_info.physical_memory_offset.into_option(),

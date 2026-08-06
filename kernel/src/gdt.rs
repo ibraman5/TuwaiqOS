@@ -48,12 +48,14 @@ fn new_stack() -> VirtAddr {
 /// Not a `lazy_static` like the rest of this file: `privilege_stack_table[0]`
 /// (RSP0 -- the stack the CPU loads when a Ring 3 -> Ring 0 privilege change
 /// happens on any interrupt or exception) must be updatable at *runtime*,
-/// once per Ring-3-capable task, via `set_kernel_stack` -- see that
-/// function's docs and `task::current_kernel_stack_top`. `lazy_static`'s
-/// generated wrapper only exposes `Deref`, not `DerefMut`, so a plain
-/// mutable static plus explicit `unsafe` field access (exactly like `PICS`
-/// in `interrupts.rs`, which is hardware-adjacent state for the same
-/// reason) is the straightforward correct tool here, not a workaround.
+/// on every scheduler switch -- see `set_kernel_stack` and `task::schedule`,
+/// which calls it with the incoming task's own kernel stack top so any
+/// number of user processes can interleave under preemption safely, each
+/// trapping onto its own stack. `lazy_static`'s generated wrapper only
+/// exposes `Deref`, not `DerefMut`, so a plain mutable static plus explicit
+/// `unsafe` field access (exactly like `PICS` in `interrupts.rs`, which is
+/// hardware-adjacent state for the same reason) is the straightforward
+/// correct tool here, not a workaround.
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
 struct Selectors {
@@ -162,17 +164,14 @@ pub fn user_data_selector() -> SegmentSelector {
 /// means concretely: without it, RSP0 stays zeroed, and a trap out of Ring
 /// 3 would hand the CPU an invalid stack to build its interrupt frame on.
 ///
-/// **Scope note (Phase 4 foundation, not the full process model):** RSP0 is
-/// a single, CPU-global field -- there is exactly one "the kernel stack for
-/// the next Ring 3 -> Ring 0 trap" at a time. A task that is about to run
-/// Ring 3 code must call this with its own kernel stack top (see
-/// `task::current_kernel_stack_top`) before doing so, and only one
-/// Ring-3-capable task may be in flight at a time; nothing in this phase
-/// swaps RSP0 automatically on every ordinary context switch the way a full
-/// per-process scheduler would. Kernel-only tasks (shell, idle, heartbeat)
-/// never trap from CPL=3, so RSP0's value is simply unused while any of
-/// them is current -- see `usermode.rs`'s module docs for the full
-/// reasoning.
+/// RSP0 is a single, CPU-global field -- there is exactly one "the kernel
+/// stack for the next Ring 3 -> Ring 0 trap" at a time. `task::schedule`
+/// calls this on *every* switch with the incoming task's own kernel stack
+/// top, so whichever process is current always has the right RSP0 loaded
+/// before it (or anything it's mid-syscall/mid-fault in) can possibly trap.
+/// Kernel-only tasks (shell, idle, heartbeat) never trap from CPL=3, so
+/// RSP0's value is simply unused while any of them is current -- see
+/// `task.rs`'s `Tcb::kernel_stack_top` docs.
 pub fn set_kernel_stack(top: VirtAddr) {
     without_interrupts(|| {
         // Safety: a `VirtAddr` write is a single aligned 8-byte store (so

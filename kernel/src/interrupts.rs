@@ -11,19 +11,28 @@ use lazy_static::lazy_static;
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
-use x86_64::PrivilegeLevel;
+use x86_64::{PrivilegeLevel, VirtAddr};
 
-use crate::{framebuffer_console, gdt, keyboard};
+use crate::{framebuffer_console, gdt, keyboard, syscall};
 
-/// The one vector Ring 3 code is allowed to invoke via `int n` (see
-/// `usermode.rs`) -- registered below with DPL=3, every other vector stays
-/// at the default DPL=0 and would itself General-Protection-Fault if a
-/// Ring 3 `int` instruction targeted it. Chosen clear of both the CPU
-/// exception range (0-31) and the remapped hardware IRQ range
-/// (`PIC_1_OFFSET..PIC_2_OFFSET+8`, 32-47); 0x80 is also the traditional
-/// x86 "syscall gate" vector, which this deliberately echoes even though
-/// there is no syscall ABI behind it yet.
-const USERMODE_RETURN_VECTOR: u8 = 0x80;
+/// The one vector Ring 3 code is allowed to invoke via `int n` -- the real
+/// syscall ABI now (see `syscall.rs`), registered below with DPL=3; every
+/// other vector stays at the default DPL=0 and would itself
+/// General-Protection-Fault if a Ring 3 `int` instruction targeted it.
+/// Chosen clear of both the CPU exception range (0-31) and the remapped
+/// hardware IRQ range (`PIC_1_OFFSET..PIC_2_OFFSET+8`, 32-47); 0x80 is also
+/// the traditional x86 "syscall gate" vector, which this deliberately
+/// echoes.
+const SYSCALL_VECTOR: u8 = 0x80;
+
+/// Exit codes `exit_with_code` records for a process the kernel terminates
+/// on its behalf after fault-isolation recovery (see `general_protection_fault_handler`
+/// / `page_fault_handler` below) -- deliberately echoing the traditional
+/// Unix "128 + signal number" convention (`SIGSEGV`=11, `SIGILL`=4) purely
+/// as a recognizable, self-documenting value in `ps`/`taskinfo` output, not
+/// because this kernel has real Unix signals.
+const EXIT_CODE_SEGV: i32 = 139;
+const EXIT_CODE_ILL: i32 = 132;
 
 /// Legacy PICs are remapped so hardware IRQs 0-15 land at vectors 32-47,
 /// clear of the CPU's own exception vectors 0-31.
@@ -108,14 +117,27 @@ lazy_static! {
                 .set_stack_index(gdt::IRQ_IST_INDEX);
         }
 
-        // Ring 3's one gate back into Ring 0 (see `usermode.rs`). DPL=3 is
-        // required for the `int 0x80` instruction Ring 3 code executes to
-        // be allowed at all -- without it, the CPU rejects the attempt
-        // with a Ring-0-origin-looking GPF before this handler ever runs,
-        // since a software `int` requires CPL <= the gate's DPL.
-        idt[USERMODE_RETURN_VECTOR as usize]
-            .set_handler_fn(usermode_return_handler)
-            .set_privilege_level(PrivilegeLevel::Ring3);
+        // The syscall gate (see `syscall.rs`). Not `set_handler_fn`: that
+        // only accepts the `extern "x86-interrupt"` ABI, which exposes the
+        // CPU-pushed frame but not general-purpose registers -- the ABI
+        // `syscall.rs` documents needs to read/write `RAX`/`RDI`/`RSI`/`RDX`,
+        // so `syscall_entry` is hand-written asm instead, registered here
+        // by raw address. DPL=3 is required for the `int 0x80` instruction
+        // Ring 3 code executes to be allowed at all -- without it, the CPU
+        // rejects the attempt with a Ring-0-origin-looking GPF before this
+        // handler ever runs, since a software `int` requires CPL <= the
+        // gate's DPL.
+        //
+        // Safety: `syscall::syscall_entry` is a valid code address for the
+        // lifetime of the kernel (a `global_asm!` symbol, not freed or
+        // reused), and its calling convention (raw entry, all GPRs
+        // saved/restored by hand, ending in `iretq`) is exactly what an
+        // IDT gate handler must do -- see `syscall.rs`'s module docs.
+        unsafe {
+            idt[SYSCALL_VECTOR as usize]
+                .set_handler_addr(VirtAddr::new(syscall::syscall_entry as *const () as u64))
+                .set_privilege_level(PrivilegeLevel::Ring3);
+        }
 
         idt
     };
@@ -210,41 +232,6 @@ extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
-/// Ring 3's deliberate, DPL=3 gate back into Ring 0 (see `usermode.rs`).
-/// `code_segment`'s low two bits are the CPL the CPU was actually running
-/// at when this trap fired -- the concrete, hardware-produced proof that
-/// the instructions immediately before this `int 0x80` genuinely executed
-/// at CPL=3, not just "the kernel called a function named enter_ring3".
-///
-/// Never returns to the interrupted Ring 3 code: the demo task this runs
-/// on behalf of is done once it's reached here (see `usermode.rs`'s module
-/// docs on why the abandoned Ring 3 call stack is never resumed), so this
-/// hands off directly to `task::exit()` -- the same scheduler machinery
-/// that already correctly abandons a task's call stack when it exits from
-/// ordinary (non-interrupt) context.
-extern "x86-interrupt" fn usermode_return_handler(stack_frame: InterruptStackFrame) {
-    let cs = stack_frame.code_segment;
-    let cpl = cs & 0b11;
-    serial_println!(
-        "usermode: trapped to Ring 0 via int {:#x} -- CS={:#x} (CPL={}) RIP={:?} SS={:#x} RSP={:?}",
-        USERMODE_RETURN_VECTOR,
-        cs,
-        cpl,
-        stack_frame.instruction_pointer,
-        stack_frame.stack_segment,
-        stack_frame.stack_pointer
-    );
-    if cpl == 3 {
-        serial_println!("usermode: confirmed -- trap originated at CPL=3");
-    } else {
-        serial_println!(
-            "usermode: WARNING -- expected CPL=3, saw CPL={} (unexpected call site)",
-            cpl
-        );
-    }
-    crate::task::exit();
-}
-
 extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     error_code: u64,
@@ -271,6 +258,26 @@ extern "x86-interrupt" fn page_fault_handler(
         error_code,
         stack_frame
     );
+
+    // Same reasoning as the GPF handler below: a Ring-3-origin page fault
+    // (unmapped address, or a permission the mapping genuinely doesn't
+    // grant -- writing a read-only page, executing a NO_EXECUTE one,
+    // touching kernel memory that was never USER_ACCESSIBLE in this
+    // process's own address space) is a user program doing something its
+    // own mappings forbid, not a kernel bug. Recover by ending only that
+    // process; a Ring-0-origin page fault is a genuine kernel memory-safety
+    // bug and keeps the unconditional halt below, unchanged from before
+    // Phase 4.
+    if stack_frame.code_segment & 0b11 == 3 {
+        serial_println!(
+            "usermode: page fault trapped safely from CPL=3 at {:?} (RIP={:?}) -- \
+             terminating the offending process, kernel continues",
+            fault_addr,
+            stack_frame.instruction_pointer
+        );
+        crate::task::exit_with_code(EXIT_CODE_SEGV);
+    }
+
     report_fault("page fault");
     loop {
         x86_64::instructions::hlt();
@@ -290,24 +297,24 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     // A GPF whose saved CS has RPL=3 can only mean the faulting instruction
     // itself executed at CPL=3 -- the CPU stamps the *current* CS onto the
     // frame it builds, it is not something the interrupted code could have
-    // faked. Before Phase 4 this branch was unreachable (nothing ran below
-    // CPL=0), so it changes no existing behavior: a Ring-0-origin GPF still
-    // falls through to the unconditional halt below exactly as before,
-    // because the kernel faulting is a real, unrecoverable bug, not
-    // something to route around. A Ring-3-origin GPF is different in kind,
-    // the same way a real OS treats "kernel bug" and "userspace program
-    // did something CPL=3 forbids" differently: this milestone's only
-    // Ring 3 code is `usermode.rs`'s deliberately-privileged-instruction
-    // demo, so recovering by ending just that task and letting the
-    // scheduler carry on proves the trap didn't corrupt anything, which a
-    // permanent halt here could never demonstrate.
+    // faked. A Ring-0-origin GPF still falls through to the unconditional
+    // halt below exactly as it always has, because the kernel faulting is
+    // a real, unrecoverable bug, not something to route around. A
+    // Ring-3-origin GPF is different in kind, the same way a real OS
+    // treats "kernel bug" and "userspace program did something CPL=3
+    // forbids" differently: any user process executing a privileged
+    // instruction (or otherwise tripping a protection check) takes exactly
+    // this path, and recovering by ending just that process and letting
+    // the scheduler carry on proves the trap didn't corrupt the kernel or
+    // any other process, which a permanent halt here could never
+    // demonstrate.
     if stack_frame.code_segment & 0b11 == 3 {
         serial_println!(
             "usermode: privileged instruction trapped safely from CPL=3 (RIP={:?}) -- \
              terminating the offending task, kernel continues",
             stack_frame.instruction_pointer
         );
-        crate::task::exit();
+        crate::task::exit_with_code(EXIT_CODE_ILL);
     }
 
     report_fault("general protection fault");
