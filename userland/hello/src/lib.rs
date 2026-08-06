@@ -1,0 +1,68 @@
+//! Shared syscall ABI helper for this crate's test binaries
+//! (`src/bin/*.rs`). See `kernel/src/syscall.rs` for the authoritative ABI
+//! documentation -- this is just a thin, duplicated-nowhere wrapper around
+//! it: `int 0x80`, `RAX` = syscall number in / return value out,
+//! `RDI`/`RSI`/`RDX` = args 1-3.
+
+#![no_std]
+
+use core::arch::asm;
+use core::panic::PanicInfo;
+
+pub const SYS_EXIT: u64 = 0;
+pub const SYS_WRITE: u64 = 1;
+pub const SYS_YIELD: u64 = 2;
+pub const SYS_GETPID: u64 = 3;
+
+/// # Safety
+/// Caller is responsible for `num`/`a1`/`a2`/`a3` meaning what the
+/// kernel's syscall ABI expects for that syscall number.
+#[inline(always)]
+pub unsafe fn syscall(num: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let ret: i64;
+    // Safety: `int 0x80` is the kernel's documented, DPL=3 syscall gate;
+    // every register the asm reads or writes is declared, so the
+    // compiler's view of clobbered state stays accurate.
+    unsafe {
+        asm!(
+            "int 0x80",
+            inlateout("rax") num => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+pub fn write(msg: &[u8]) {
+    // Safety: `msg` is a valid slice for its own lifetime; `write` only
+    // reads `len` bytes starting at `ptr`.
+    unsafe {
+        syscall(SYS_WRITE, msg.as_ptr() as u64, msg.len() as u64, 0);
+    }
+}
+
+pub fn u64_to_decimal(mut value: u64, buf: &mut [u8; 20]) -> &[u8] {
+    if value == 0 {
+        buf[0] = b'0';
+        return &buf[..1];
+    }
+    let mut i = buf.len();
+    while value > 0 {
+        i -= 1;
+        buf[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    &buf[i..]
+}
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    // Safety: exit code 1, no pointers involved.
+    unsafe {
+        syscall(SYS_EXIT, 1, 0, 0);
+    }
+    loop {}
+}
