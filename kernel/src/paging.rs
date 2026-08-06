@@ -221,3 +221,19 @@ pub fn frame_stats() -> Option<FrameStats> {
         })
     })
 }
+
+/// Map one page in the *global* installed mapper/frame allocator (as
+/// opposed to `map_page`, which takes a locally-owned mapper -- used only
+/// during early heap setup, before `install` has run). This is the entry
+/// point Phase 4's `usermode.rs` uses to map the user code/stack pages it
+/// needs: same underlying `map_page`, just reached through `with_paging` so
+/// it's safe to call from ordinary task context with interrupts enabled.
+pub fn map_user_page(page: Page<Size4KiB>, flags: PageTableFlags) -> Result<(), &'static str> {
+    with_paging(|mapper_slot, frame_allocator_slot| {
+        let mapper = mapper_slot.as_mut().ok_or("paging not active")?;
+        let frame_allocator = frame_allocator_slot
+            .as_mut()
+            .ok_or("frame allocator not active")?;
+        map_page(mapper, frame_allocator, page, flags)
+    })
+}

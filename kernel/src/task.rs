@@ -108,6 +108,13 @@ struct Tcb {
     /// Absolute tick count (see `interrupts::ticks`) at which a `Blocked`
     /// task should become `Ready` again. Zero means "not sleeping".
     wake_at_tick: u64,
+    /// Top of this task's own kernel stack (16-byte aligned), or 0 for the
+    /// boot task (id 1, "shell"), which has no stack this module allocated
+    /// (see `stack` above). Exposed via `current_kernel_stack_top` so a
+    /// task can register itself as the Ring 3 trap landing pad
+    /// (`gdt::set_kernel_stack`) before dropping to user mode -- see
+    /// `usermode.rs`.
+    kernel_stack_top: u64,
 }
 
 struct Scheduler {
@@ -248,6 +255,7 @@ pub fn init() {
         stack: None,
         saved_rsp: 0,
         wake_at_tick: 0,
+        kernel_stack_top: 0,
     };
     let idle = new_tcb(2, "idle", idle_entry);
 
@@ -270,7 +278,8 @@ pub fn init() {
 fn new_tcb(id: u32, name: &str, entry: fn()) -> Tcb {
     let mut stack = Box::new([0u8; STACK_SIZE]);
     let stack_top = unsafe { stack.as_mut_ptr().add(STACK_SIZE) as usize };
-    let mut sp = stack_top & !0xF; // 16-byte align, matching the SysV stack ABI
+    let aligned_top = stack_top & !0xF; // 16-byte align, matching the SysV stack ABI
+    let mut sp = aligned_top;
     sp -= INITIAL_FRAME_SIZE;
 
     // Safety: `sp` was just computed from a freshly allocated, 16-byte
@@ -299,6 +308,7 @@ fn new_tcb(id: u32, name: &str, entry: fn()) -> Tcb {
         stack: Some(stack),
         saved_rsp: sp as u64,
         wake_at_tick: 0,
+        kernel_stack_top: aligned_top as u64,
     }
 }
 
@@ -474,4 +484,20 @@ pub fn kill(id: u32) -> Result<(), &'static str> {
 
 pub fn state_label(state: TaskState) -> &'static str {
     state.label()
+}
+
+/// The currently running task's own kernel stack top, or `None` for the
+/// boot task (id 1, "shell"), which owns no stack this module allocated.
+/// See `Tcb::kernel_stack_top`'s docs -- this is how a task about to run
+/// Ring 3 code finds the address to hand to `gdt::set_kernel_stack`.
+pub fn current_kernel_stack_top() -> Option<u64> {
+    with_scheduler(|slot| {
+        let sched = slot.as_ref()?;
+        let top = sched.tasks[sched.current].kernel_stack_top;
+        if top == 0 {
+            None
+        } else {
+            Some(top)
+        }
+    })
 }

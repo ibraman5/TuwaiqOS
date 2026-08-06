@@ -93,6 +93,7 @@ interrupts live rather than a purely polled CPU.
 | `tuwaiqfs.rs` | On-disk serialization (TuwaiqFS v2) |
 | `ata.rs` | Primary master PIO sector I/O |
 | `task.rs` | Preemptive scheduler: real TCBs, per-task stacks, context switch |
+| `usermode.rs` | Phase 4 Ring 3 foundation: user pages, `iretq` entry, demo payloads |
 | `loader.rs` / `programs/` | Built-in program registry |
 | `apps/` | notes, editor, monitor |
 | `net/` | Driver trait, loopback, HTTP stub |
@@ -101,14 +102,18 @@ interrupts live rather than a purely polled CPU.
 
 ## Interrupts (GDT / IDT / PIC / PIT)
 
-- **GDT/TSS** (`gdt.rs`): a minimal GDT (null, kernel code, TSS) plus two
-  dedicated Interrupt Stack Table entries -- one for `#DF` (double fault),
-  one for the keyboard IRQ, which never redirects control flow so a fixed
-  stack is safe for it. The timer IRQ deliberately does **not** use an IST
-  stack (see Scheduler below): as of Phase 3 it may perform a real context
-  switch, which only works if the interrupt frame lands on *the currently
-  running task's own stack* rather than a fixed physical one shared by
-  every tick regardless of which task was running.
+- **GDT/TSS** (`gdt.rs`): null, kernel code, TSS, and (Phase 4) a Ring 3
+  code and data segment, plus two dedicated Interrupt Stack Table entries
+  -- one for `#DF` (double fault), one for the keyboard IRQ, which never
+  redirects control flow so a fixed stack is safe for it. The timer IRQ
+  deliberately does **not** use an IST stack (see Scheduler below): as of
+  Phase 3 it may perform a real context switch, which only works if the
+  interrupt frame lands on *the currently running task's own stack* rather
+  than a fixed physical one shared by every tick regardless of which task
+  was running. The TSS is a plain mutable static rather than the
+  `lazy_static`-immutable pattern used elsewhere in this file, specifically
+  so its RSP0 field can be updated at runtime -- see Ring 3 foundation
+  below.
   Loading a new GDT does **not** reload `SS`/`DS`/`ES`/`FS`/`GS` -- the
   bootloader's own (now-stale) selector values are explicitly reloaded to
   null here, which is load-bearing: skipping it produces a GPF on every
@@ -243,6 +248,77 @@ execution state, not bookkeeping strings.
   interactively responsive -- and while `kill 3` genuinely stops it, not
   just relabels it -- is the verification this phase's own engineering
   rules require before it counts as done, not just a clean compile.
+
+## Ring 3 foundation (Phase 4, first milestone)
+
+`usermode.rs` proves the kernel can genuinely drop the CPU to CPL=3 and get
+back, and that a privileged instruction executed there traps safely instead
+of corrupting anything. It is deliberately *not* a process model: no ELF
+loader into user memory, no per-process address space, no syscall ABI --
+those are the rest of Phase 4. Two demo payloads, driven by the `usermode
+[enter|fault]` shell command, exercise the full mechanism:
+
+- **GDT/TSS**: `gdt.rs` adds `Descriptor::user_code_segment()` /
+  `user_data_segment()` entries (DPL=3; `add_entry` encodes that into the
+  returned selector's RPL automatically) and `gdt::set_kernel_stack`, which
+  writes the TSS's RSP0 -- the stack the CPU switches to on *any* interrupt
+  or exception that catches it running at CPL=3. Without this, a trap out
+  of Ring 3 would hand the CPU an invalid stack to build its interrupt
+  frame on; this is concretely what "kernel stacks stay under kernel
+  control through the TSS" means.
+- **Entry**: `usermode::enter_ring3` (hand-written asm, same style as
+  `task.rs`'s `context_switch`) builds the five-word `iretq` frame (SS,
+  RSP, RFLAGS, CS, RIP) by hand and executes `iretq` -- the only
+  instruction in this kernel that actually changes CPL. `RFLAGS` is a
+  literal `0x202`: `IF=1` (interrupts stay on in Ring 3 -- Phase 1-3
+  preemption keeps working) and `IOPL=00`, so I/O port instructions fault
+  from Ring 3 exactly like every other privileged instruction.
+- **Payloads**: two small `global_asm!` blocks, copied at runtime into a
+  dedicated page mapped `PRESENT | WRITABLE | USER_ACCESSIBLE` (the kernel
+  never executes them at their in-image address, only reads their bytes).
+  The "clean" payload runs a couple of harmless instructions then executes
+  `int 0x80`; the "fault" payload executes `cli`. Both get their own 4 KiB
+  user stack page, mapped the same way.
+- **The one gate back**: vector `0x80` is registered in the IDT with
+  DPL=3 (`interrupts.rs`) -- every other vector stays at the default DPL=0
+  and would itself fault a Ring 3 `int` attempt before the handler ever
+  ran. Its handler logs the trap's `CS`/`RIP` (the CPU stamps the *actual*
+  CPL onto `CS`'s low bits when building the frame -- this is the
+  hardware-produced proof CPL=3 was real, not just "a function named
+  enter_ring3 was called") and ends the demo task via `task::exit()`, the
+  same scheduler machinery that already correctly abandons a task's call
+  stack on ordinary exit.
+- **Privileged-instruction recovery**: `cli` at CPL=3 is rejected by the
+  CPU with a GPF purely as a hardware consequence of the privilege level --
+  nothing in this kernel special-cases *which* instruction faults. Before
+  this milestone, `general_protection_fault_handler` always halted forever
+  (a Ring 0 fault means something in trusted code is broken -- halting
+  before it corrupts more state is correct). It now checks the trapped
+  frame's `CS` RPL first: RPL=3 means the fault is a *Ring 3* program doing
+  something CPL=3 forbids, not a kernel bug, so the handler kills only that
+  task (`task::exit()`) and the kernel carries on -- the same distinction
+  every real OS makes between a kernel panic and a killed userspace
+  process. A Ring-0-origin GPF is completely unaffected: this branch was
+  unreachable before Phase 4 (nothing ran below CPL=0), so existing
+  behavior for every other fault path is unchanged.
+- **Why only one Ring-3-capable task at a time**: the TSS has exactly one
+  RSP0 slot. A full process model swaps it on every context switch, so
+  each task's trap always lands on its own stack under arbitrary
+  preemption -- real scheduler-integration work, out of scope here. Instead
+  each demo task calls `task::current_kernel_stack_top()` and
+  `gdt::set_kernel_stack` once, at its own start, and the shell command
+  that drives this module never has two such tasks in flight at once. This
+  is sound for exactly the reason it's simple: no other task (shell, idle,
+  heartbeat) ever runs Ring 3 code, so RSP0's value is simply never
+  consulted while any of them is current.
+- **Verified live in QEMU** (see the PR for full serial-log evidence): the
+  `int 0x80` handler logged `CS=0x2b` (GDT index 5, RPL=3) and
+  `SS=0x23` (index 4, RPL=3) on the clean-return trap; the `cli` demo
+  produced exactly one GPF, `error_code=0`, `code_segment=43` (0x2b,
+  RPL=3), `RIP` pointing exactly at the mapped fault payload's address --
+  then the full Phase 1-3 regression checklist, a reboot with filesystem
+  persistence, and the heartbeat counter all continued normally in the
+  same session afterward.
 
 ## Locking invariant
 

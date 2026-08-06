@@ -28,6 +28,7 @@ mod reboot;
 mod shell;
 mod task;
 mod tuwaiqfs;
+mod usermode;
 mod vga_buffer;
 
 use bootloader_api::config::{BootloaderConfig, Mapping};

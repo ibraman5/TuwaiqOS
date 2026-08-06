@@ -7,6 +7,7 @@
 //! handler on the already-overflowed stack would just triple-fault.
 
 use lazy_static::lazy_static;
+use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
@@ -44,30 +45,51 @@ fn new_stack() -> VirtAddr {
     stack_top!()
 }
 
-lazy_static! {
-    static ref TSS: TaskStateSegment = {
-        let mut tss = TaskStateSegment::new();
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = new_stack();
-        tss.interrupt_stack_table[IRQ_IST_INDEX as usize] = new_stack();
-        tss
-    };
-}
+/// Not a `lazy_static` like the rest of this file: `privilege_stack_table[0]`
+/// (RSP0 -- the stack the CPU loads when a Ring 3 -> Ring 0 privilege change
+/// happens on any interrupt or exception) must be updatable at *runtime*,
+/// once per Ring-3-capable task, via `set_kernel_stack` -- see that
+/// function's docs and `task::current_kernel_stack_top`. `lazy_static`'s
+/// generated wrapper only exposes `Deref`, not `DerefMut`, so a plain
+/// mutable static plus explicit `unsafe` field access (exactly like `PICS`
+/// in `interrupts.rs`, which is hardware-adjacent state for the same
+/// reason) is the straightforward correct tool here, not a workaround.
+static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
 struct Selectors {
     code_selector: SegmentSelector,
     tss_selector: SegmentSelector,
+    user_code_selector: SegmentSelector,
+    user_data_selector: SegmentSelector,
 }
 
 lazy_static! {
     static ref GDT: (GlobalDescriptorTable, Selectors) = {
         let mut gdt = GlobalDescriptorTable::new();
         let code_selector = gdt.add_entry(Descriptor::kernel_code_segment());
-        let tss_selector = gdt.add_entry(Descriptor::tss_segment(&TSS));
+        // Safety: by the time this runs, `init` below has already set both
+        // IST stack entries on `TSS` (it does so before the first access to
+        // `GDT`, which is what triggers this lazy closure) and nothing else
+        // ever holds a live `&mut TSS` concurrently on this single-core,
+        // single-threaded-at-boot kernel.
+        let tss_selector = gdt.add_entry(Descriptor::tss_segment(unsafe {
+            &*core::ptr::addr_of!(TSS)
+        }));
+        // Ring 3 segments (Phase 4 foundation): a code and data descriptor
+        // with DPL=3, required before any `iretq` can legally drop CPL to 3
+        // -- see `usermode::enter_ring3`. `add_entry` encodes the
+        // descriptor's own DPL into the returned selector's RPL bits
+        // automatically, so these two selectors already read as RPL=3
+        // without any extra `set_rpl` call.
+        let user_data_selector = gdt.add_entry(Descriptor::user_data_segment());
+        let user_code_selector = gdt.add_entry(Descriptor::user_code_segment());
         (
             gdt,
             Selectors {
                 code_selector,
                 tss_selector,
+                user_code_selector,
+                user_data_selector,
             },
         )
     };
@@ -79,6 +101,15 @@ pub fn init() {
     use x86_64::instructions::segmentation::{Segment, CS, DS, ES, FS, GS, SS};
     use x86_64::instructions::tables::load_tss;
     use x86_64::structures::gdt::SegmentSelector;
+
+    // Safety: runs once, before interrupts are enabled and before the
+    // first access to `GDT` below (whose lazy construction reads `TSS`),
+    // so this is the only live reference to `TSS` in existence right now.
+    unsafe {
+        let tss = &mut *core::ptr::addr_of_mut!(TSS);
+        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = new_stack();
+        tss.interrupt_stack_table[IRQ_IST_INDEX as usize] = new_stack();
+    }
 
     GDT.0.load();
     // Safety: code_selector/tss_selector come from entries this same
@@ -107,4 +138,50 @@ pub fn init() {
         GS::set_reg(SegmentSelector::NULL);
         load_tss(GDT.1.tss_selector);
     }
+}
+
+/// The Ring 3 code segment selector (RPL=3), for building the `iretq` frame
+/// that drops into user mode -- see `usermode::enter_ring3`.
+pub fn user_code_selector() -> SegmentSelector {
+    GDT.1.user_code_selector
+}
+
+/// The Ring 3 data segment selector (RPL=3), loaded into `SS` (and usable
+/// for `DS`/`ES`) by the same `iretq`. Ring 3 cannot run with a null `SS`
+/// the way Ring 0 can -- unlike the null `DS`/`ES`/`FS`/`GS` `init` leaves
+/// in place above, loading a null selector into `SS` while CPL=3 faults
+/// immediately, so user mode needs a real one.
+pub fn user_data_selector() -> SegmentSelector {
+    GDT.1.user_data_selector
+}
+
+/// Point the TSS's RSP0 (the stack the CPU switches to on any interrupt or
+/// exception that catches the CPU running at CPL=3) at `top`.
+///
+/// This is what "kernel stacks stay under kernel control through the TSS"
+/// means concretely: without it, RSP0 stays zeroed, and a trap out of Ring
+/// 3 would hand the CPU an invalid stack to build its interrupt frame on.
+///
+/// **Scope note (Phase 4 foundation, not the full process model):** RSP0 is
+/// a single, CPU-global field -- there is exactly one "the kernel stack for
+/// the next Ring 3 -> Ring 0 trap" at a time. A task that is about to run
+/// Ring 3 code must call this with its own kernel stack top (see
+/// `task::current_kernel_stack_top`) before doing so, and only one
+/// Ring-3-capable task may be in flight at a time; nothing in this phase
+/// swaps RSP0 automatically on every ordinary context switch the way a full
+/// per-process scheduler would. Kernel-only tasks (shell, idle, heartbeat)
+/// never trap from CPL=3, so RSP0's value is simply unused while any of
+/// them is current -- see `usermode.rs`'s module docs for the full
+/// reasoning.
+pub fn set_kernel_stack(top: VirtAddr) {
+    without_interrupts(|| {
+        // Safety: a `VirtAddr` write is a single aligned 8-byte store (so
+        // there is nothing for a concurrent reader to tear even without
+        // `without_interrupts`), and disabling interrupts here matches this
+        // codebase's locking invariant for any state a trap handler might
+        // also touch -- see ARCHITECTURE.md's "Locking invariant" section.
+        unsafe {
+            (*core::ptr::addr_of_mut!(TSS)).privilege_stack_table[0] = top;
+        }
+    });
 }

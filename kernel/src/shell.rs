@@ -20,6 +20,7 @@ use crate::net;
 use crate::paging;
 use crate::reboot;
 use crate::task;
+use crate::usermode;
 
 const MAX_LINE: usize = 128;
 const HISTORY_SIZE: usize = 16;
@@ -319,6 +320,7 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
         "notes" => handle_notes(mode, args),
         "editor" => handle_editor(mode, args),
         "monitor" => handle_monitor(boot_info, mode),
+        "usermode" => handle_usermode(mode, args),
         "ai" => handle_ai_command(mode, line, args),
         "ask" => handle_ask_command(mode, args),
         _ => {
@@ -398,6 +400,41 @@ fn handle_monitor(boot_info: &BootInfo, mode: ConsoleMode) {
             println(mode, reason);
         }
     }
+}
+
+/// Runs one of the two Phase 4 Ring 3 foundation demos (see `usermode.rs`)
+/// as its own task and waits for it to finish before returning, so the
+/// reported outcome reflects what genuinely happened rather than a fixed
+/// string -- the real evidence (CPL, RIP, trap path) is on the serial log,
+/// this just confirms the task actually reached a terminal state.
+fn handle_usermode(mode: ConsoleMode, args: &str) {
+    let sub = args.trim();
+    let (label, entry): (&str, fn()) = match sub {
+        "" | "enter" => ("usermode-enter", usermode::demo_clean_entry as fn()),
+        "fault" => ("usermode-fault", usermode::demo_fault_entry as fn()),
+        _ => {
+            println(mode, "Usage: usermode [enter|fault]");
+            return;
+        }
+    };
+
+    let id = task::spawn(label, entry);
+    loop {
+        match task::info(id) {
+            Ok(t) if t.state == task::TaskState::Terminated => break,
+            Ok(_) => task::yield_now(),
+            Err(_) => break,
+        }
+    }
+
+    print(mode, "Task ");
+    print_u64(mode, id as u64);
+    println(mode, " (");
+    print(mode, label);
+    println(
+        mode,
+        ") finished -- see serial log for Ring 3 entry/trap proof.",
+    );
 }
 
 fn handle_touch(mode: ConsoleMode, args: &str) {
@@ -635,6 +672,7 @@ fn print_help(mode: ConsoleMode) {
     println(mode, "  ls | pwd | touch | mkdir | cat | write");
     println(mode, "  ps | taskinfo | kill | yield | net status | ping");
     println(mode, "  run <program> | notes | editor");
+    println(mode, "  usermode [enter|fault]");
     println(mode, "  ai | ai status | ask <question>");
     println(mode, "");
     println(mode, "Tip: use Up/Down for history, Tab to complete.");
@@ -709,7 +747,8 @@ fn command_names() -> &'static [&'static str] {
     &[
         "help", "about", "version", "banner", "sysinfo", "monitor", "uptime", "reboot", "clear",
         "cls", "echo", "meminfo", "memtest", "ls", "pwd", "touch", "mkdir", "cat", "write", "ps",
-        "taskinfo", "kill", "yield", "net", "ping", "run", "notes", "editor", "ai", "ask",
+        "taskinfo", "kill", "yield", "net", "ping", "run", "notes", "editor", "usermode", "ai",
+        "ask",
     ]
 }
 
