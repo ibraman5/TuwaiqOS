@@ -321,6 +321,7 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
         "monitor" => handle_monitor(boot_info, mode),
         "runelf" => handle_runelf(mode, args),
         "isolate" => handle_isolate(mode, args),
+        "spawnfail" => handle_spawnfail(mode, args),
         "ai" => handle_ai_command(mode, line, args),
         "ask" => handle_ask_command(mode, args),
         _ => {
@@ -433,6 +434,14 @@ fn embedded_program(name: &str) -> Option<&'static [u8]> {
             env!("CARGO_MANIFEST_DIR"),
             "/../target/x86_64-unknown-none/release/bad_unmapped"
         ))),
+        "bad_ud2" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/bad_ud2"
+        ))),
+        "bad_divzero" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/bad_divzero"
+        ))),
         _ => None,
     }
 }
@@ -482,7 +491,7 @@ fn handle_runelf(mode: ConsoleMode, args: &str) {
     let Some(bytes) = embedded_program(name) else {
         println(
             mode,
-            "Usage: runelf <hello|bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped>",
+            "Usage: runelf <hello|bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped|bad_ud2|bad_divzero>",
         );
         return;
     };
@@ -533,7 +542,7 @@ fn handle_isolate(mode: ConsoleMode, args: &str) {
     else {
         println(
             mode,
-            "Usage: isolate [bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped]",
+            "Usage: isolate [bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped|bad_ud2|bad_divzero]",
         );
         return;
     };
@@ -605,6 +614,100 @@ fn handle_isolate(mode: ConsoleMode, args: &str) {
     println(mode, "Both finished:");
     print_process_result(mode, id_a);
     print_process_result(mode, id_b);
+}
+
+/// Deliberately malformed ELF bytes -- too small to even contain a full
+/// header (`elf.rs`'s very first bounds check) -- so every
+/// `task::spawn_user_process` call in `handle_spawnfail` below fails at
+/// the earliest possible point *after* `paging::new_address_space` has
+/// already allocated a real PML4 frame for it. This is exactly the
+/// scenario the address-space-cleanup fix targets: does that frame (and
+/// nothing else) come back, every single time, or does it leak.
+const MALFORMED_ELF: &[u8] = &[0x7f, b'E', b'L', b'F'];
+
+/// `spawnfail <count>` -- the Phase 4 frame-reclamation proof. Calls
+/// `task::spawn_user_process` with deliberately malformed ELF bytes
+/// `count` times in a row, each one expected to fail cleanly, and compares
+/// physical-frame accounting (`paging::frame_stats`) before and after: if
+/// every failed spawn's frames were genuinely reclaimed rather than
+/// leaked, "frames currently in use" (`allocated - free_in_pool`) is
+/// identical before and after, no matter how many attempts ran in
+/// between -- not a claim, a number printed from live allocator state.
+fn handle_spawnfail(mode: ConsoleMode, args: &str) {
+    let count: u32 = match args.trim().parse() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            println(mode, "Usage: spawnfail <count>");
+            return;
+        }
+    };
+
+    // One throwaway failed spawn first, *before* the measured loop, so the
+    // free list already holds a reusable frame (or several) before
+    // measurement starts. Without this warm-up, the very first measured
+    // iteration would be forced to bump fresh memory no matter what (the
+    // free list starts empty), making even a perfectly leak-free run look
+    // like it grew by one -- see `paging::BootInfoFrameAllocator::frames_bumped`'s
+    // docs for the full reasoning on why the bump cursor, not
+    // `allocated - free_in_pool`, is the metric that's actually immune to
+    // this: `allocated` counts every *call* to `allocate_frame`, including
+    // ones satisfied by reusing an already-freed frame, so it grows by one
+    // on every single iteration below regardless of whether anything
+    // leaked -- comparing it before/after would report a "leak" every
+    // time, even when frames are being perfectly recycled.
+    let _ = task::spawn_user_process("bad-elf-warmup", MALFORMED_ELF);
+
+    let Some(before) = paging::frame_stats() else {
+        println(mode, "Frame stats unavailable (paging not active)");
+        return;
+    };
+    print(mode, "Frame bump cursor before: ");
+    print_u64(mode, before.bumped as u64);
+    println(mode, "");
+
+    let mut failures = 0u32;
+    let mut unexpected_ok = 0u32;
+    for _ in 0..count {
+        match task::spawn_user_process("bad-elf", MALFORMED_ELF) {
+            Err(_) => failures += 1,
+            Ok(id) => {
+                // Should never happen -- MALFORMED_ELF is deliberately
+                // invalid -- but if it somehow did load, don't leave a
+                // live task behind uncounted; note it and move on.
+                unexpected_ok += 1;
+                let _ = task::kill(id);
+            }
+        }
+    }
+
+    let Some(after) = paging::frame_stats() else {
+        println(
+            mode,
+            "Frame stats unavailable after the loop (paging not active)",
+        );
+        return;
+    };
+    print(mode, "Frame bump cursor after ");
+    print_u64(mode, count as u64);
+    print(mode, " failed spawns: ");
+    print_u64(mode, after.bumped as u64);
+    println(mode, "");
+    print(mode, "  failed as expected: ");
+    print_u64(mode, failures as u64);
+    print(mode, ", unexpectedly loaded: ");
+    print_u64(mode, unexpected_ok as u64);
+    println(mode, "");
+
+    if after.bumped == before.bumped {
+        println(
+            mode,
+            "  Confirmed: bump cursor unchanged -- every failed spawn's frames were reclaimed and reused, no leak.",
+        );
+    } else {
+        print(mode, "  WARNING: bump cursor advanced by ");
+        print_u64(mode, (after.bumped - before.bumped) as u64);
+        println(mode, " fresh frames -- possible leak.");
+    }
 }
 
 fn handle_touch(mode: ConsoleMode, args: &str) {
@@ -884,9 +987,10 @@ fn print_help(mode: ConsoleMode) {
     println(mode, "  run <program> | notes | editor");
     println(
         mode,
-        "  runelf <hello|bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped>",
+        "  runelf <hello|bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped|bad_ud2|bad_divzero>",
     );
     println(mode, "  isolate [bad_program]");
+    println(mode, "  spawnfail <count>");
     println(mode, "  ai | ai status | ask <question>");
     println(mode, "");
     println(mode, "Tip: use Up/Down for history, Tab to complete.");
@@ -959,10 +1063,39 @@ fn print_sysinfo(boot_info: &BootInfo, mode: ConsoleMode) {
 
 fn command_names() -> &'static [&'static str] {
     &[
-        "help", "about", "version", "banner", "sysinfo", "monitor", "uptime", "reboot", "clear",
-        "cls", "echo", "meminfo", "memtest", "ls", "pwd", "touch", "mkdir", "cat", "write", "ps",
-        "taskinfo", "kill", "yield", "net", "ping", "run", "notes", "editor", "runelf", "isolate",
-        "ai", "ask",
+        "help",
+        "about",
+        "version",
+        "banner",
+        "sysinfo",
+        "monitor",
+        "uptime",
+        "reboot",
+        "clear",
+        "cls",
+        "echo",
+        "meminfo",
+        "memtest",
+        "ls",
+        "pwd",
+        "touch",
+        "mkdir",
+        "cat",
+        "write",
+        "ps",
+        "taskinfo",
+        "kill",
+        "yield",
+        "net",
+        "ping",
+        "run",
+        "notes",
+        "editor",
+        "runelf",
+        "isolate",
+        "spawnfail",
+        "ai",
+        "ask",
     ]
 }
 

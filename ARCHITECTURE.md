@@ -373,6 +373,35 @@ user process is simply a `Tcb` whose `process` field is `Some`.
   *non-current* task, its address space is provably already inactive (CR3
   can only ever equal the current task's own), so `kill` frees it
   immediately rather than waiting for a future switch.
+- **Spawn-failure cleanup**: `task::spawn_user_process` calls
+  `paging::new_address_space` first, then `build_user_tcb` (ELF load, stack
+  mapping, stack zeroing) and finally the scheduler push -- any one of
+  which can fail. Because the address space is never installed into a
+  `Tcb`, never reachable from the scheduler, and never scheduled until
+  `build_user_tcb` returns a complete, ready-to-run `Tcb`, it is provably
+  not the active CR3 at every failure point along the way -- so
+  `build_user_tcb` frees it immediately (via a small `try_or_free!` macro
+  wrapping each fallible step) rather than letting an early `?` return
+  silently drop it and leak every frame allocated so far. The one
+  remaining failure point (`with_scheduler` itself refusing the final
+  push, in practice unreachable since `task::init()` always runs first)
+  is handled the same way: the built `Tcb` is threaded through as an
+  `Option` so it's still available to reclaim its address space if the
+  push never happens. Verified with `spawnfail <count>` (`shell.rs`): N
+  repeated, deliberately-failing spawns (after one untimed warm-up spawn)
+  leave `paging::BootInfoFrameAllocator::frames_bumped()` -- the bump
+  cursor over never-before-touched physical memory -- completely
+  unchanged. That specific metric, not `frames_allocated() -
+  frames_in_free_pool()`, is what a leak test needs: `frames_allocated()`
+  counts every *call* to `allocate_frame`, including ones satisfied by
+  reusing an already-freed frame, so it grows by one on every iteration
+  regardless of whether anything actually leaked -- comparing it
+  before/after reports a false "leak" on every run, even a perfect one
+  (caught during this very verification pass: the first version of this
+  test used that comparison and reported a leak that wasn't real). The
+  bump cursor only advances when the free list is empty and a genuinely
+  new frame has to be handed out, so it's flat if and only if every
+  freed frame was actually returned to circulation.
 - **Known leak** (pre-existing, not introduced by Phase 4): a `Tcb` is
   never removed from the scheduler's task list once `Terminated` -- `kill`
   and the old Phase 3 code already had this property for kernel tasks. A
@@ -456,13 +485,25 @@ present -> `WRITABLE` kept, otherwise dropped once loading finishes.
 | `EXIT` syscall | `syscall::sys_exit` -> `task::exit_with_code` | Process terminates with the given code; kernel continues |
 | Privileged instruction at CPL=3 | GPF, `code_segment & 3 == 3` -> `task::exit_with_code(132)` | Only that process terminates; kernel continues |
 | Kernel-memory / unmapped access at CPL=3 | Page fault, `code_segment & 3 == 3` -> `task::exit_with_code(139)` | Only that process terminates; kernel continues |
+| Invalid opcode (`#UD`, e.g. `ud2`) at CPL=3 | `invalid_opcode_handler`, `code_segment & 3 == 3` -> `task::exit_with_code(132)` | Only that process terminates; kernel continues |
+| Divide error (`#DE`, divide/mod by zero) at CPL=3 | `divide_error_handler`, `code_segment & 3 == 3` -> `task::exit_with_code(136)` | Only that process terminates; kernel continues |
 | Invalid syscall number | `syscall::dispatch`'s `_` arm | `-1` returned; process keeps running |
 | Invalid user pointer to `WRITE` | `task::copy_from_current_user` returns `None` | `-1` returned; process keeps running |
-| Any fault at CPL=0 | Same handlers, `code_segment & 3 != 3` | Unconditional halt -- unchanged kernel-panic policy, never routed around |
+| Any fault at CPL=0 (including `#UD`/`#DE`) | Same handlers, `code_segment & 3 != 3` | Unconditional halt -- unchanged kernel-panic policy, never routed around |
 
-The exit codes (139/132) deliberately echo the Unix "128 + signal number"
-convention (SIGSEGV/SIGILL) purely as a recognizable value in `ps` output --
-this kernel has no real signal delivery.
+The exit codes (139/132/136) deliberately echo the Unix "128 + signal
+number" convention (SIGSEGV=11, SIGILL=4, SIGFPE=8) purely as a
+recognizable value in `ps` output -- this kernel has no real signal
+delivery. `#UD` shares `SIGILL`'s exit code with a Ring 3 `#GP`
+(privileged instruction): both are "the CPU refused to execute this
+instruction," the same category a real kernel would report identically.
+
+Every one of these five Ring-3-origin recovery paths follows the same
+CPU-verified pattern first established for `#GP`: the trapped `code_segment`'s
+low two bits are the CPL the faulting instruction actually executed at
+-- stamped there by the CPU itself when building the interrupt frame, not
+something the interrupted code could spoof -- so the RPL==3 check is
+hardware-verified evidence, not a heuristic.
 
 ### Known limitations
 
@@ -485,18 +526,26 @@ this kernel has no real signal delivery.
 ### Verification performed
 
 All of the following were exercised live in QEMU in a single session (see
-the Phase 4 completion PR for full serial-log/screenshot evidence):
+the Phase 4 completion PR, and its acceptance-review follow-up commit, for
+full serial-log/screenshot evidence):
 real ELF execution at CPL=3 with a full syscall round trip (`runelf hello`);
 an unknown syscall number safely rejected (`runelf bad_syscall`); an
 invalid user pointer safely rejected (`runelf bad_pointer`); direct kernel-memory
 access denied by hardware (`runelf bad_kernel`); unmapped-memory access
 faulting correctly (`runelf bad_unmapped`); a privileged instruction
-trapped and recovered (`runelf bad_privileged`); two concurrent processes
-with distinct, hardware-confirmed PML4 physical addresses running under
-real timer preemption with interleaved output (`isolate`); a faulting
-process leaving a concurrently running sibling and the kernel itself
-unaffected (`isolate bad_privileged`); the full Phase 1-3 regression
-checklist; and TuwaiqFS content surviving a full VM reset.
+trapped and recovered (`runelf bad_privileged`); an invalid opcode (`ud2`)
+trapped and recovered (`runelf bad_ud2`); a divide-by-zero trapped and
+recovered (`runelf bad_divzero`); two concurrent processes with distinct,
+hardware-confirmed PML4 physical addresses running under real timer
+preemption with interleaved output (`isolate`); a faulting process (one of
+`bad_privileged`/`bad_ud2`/`bad_divzero`) leaving a concurrently running
+sibling and the kernel itself unaffected (`isolate <bad_program>`);
+physical-frame accounting (`paging::frame_stats`) returning to its exact
+pre-loop baseline after 25 repeated deliberately-failing `spawn_user_process`
+calls (`spawnfail 25`), confirming the address-space-cleanup fix reclaims
+every frame on every failure path rather than leaking any of them; the
+full Phase 1-3 regression checklist; and TuwaiqFS content surviving a full
+VM reset.
 
 ## Locking invariant
 

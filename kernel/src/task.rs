@@ -842,9 +842,86 @@ const USER_STACK_PAGES: u64 = 4;
 /// physical-memory-offset mapping, so this is safe to call from whichever
 /// task (ordinarily the shell) initiates the spawn.
 pub fn spawn_user_process(name: &str, elf_bytes: &[u8]) -> Result<u32, &'static str> {
-    let mut address_space = paging::new_address_space()?;
+    let address_space = paging::new_address_space()?;
 
-    let loaded = elf::load(&mut address_space, elf_bytes)?;
+    // `address_space` is never installed into a `Tcb`, never reachable from
+    // the scheduler, and never scheduled until `build_user_tcb` returns a
+    // complete, ready-to-run `Tcb` -- so at every failure point *inside*
+    // `build_user_tcb`, it is provably not the active CR3, and freeing it
+    // immediately is always sound. See `build_user_tcb`'s own docs for why
+    // this matters: without this, every failed spawn (a truncated ELF, an
+    // out-of-memory stack mapping, ...) would silently leak every frame
+    // `new_address_space` and everything `build_user_tcb` had mapped so
+    // far -- the PML4 at minimum, every ELF segment page and stack page
+    // mapped before the failing step at worst.
+    let mut tcb = Some(build_user_tcb(name, elf_bytes, address_space)?);
+    let id = tcb.as_ref().expect("just constructed").id;
+
+    // The very last failure point: `with_scheduler` itself refusing (the
+    // scheduler not being initialized -- unreachable in practice, since
+    // `task::init()` always runs before any shell command could reach
+    // this, but handled for the same reason every other step is). `tcb`
+    // is an `Option` captured by the closure (by mutable reference, since
+    // the closure only ever calls `.take()`/reads it, never moves it
+    // outright) specifically so it's still available in this scope
+    // afterward on the error path, to reclaim its address space -- a
+    // closure that moved `tcb` in directly would make it unreachable here
+    // regardless of which branch inside actually ran.
+    let push_result: Result<(), &'static str> = with_scheduler(|slot| {
+        let sched = slot.as_mut().ok_or("scheduler not initialized")?;
+        sched
+            .tasks
+            .push(Box::new(tcb.take().expect("tcb not yet taken")));
+        Ok(())
+    });
+
+    match push_result {
+        Ok(()) => Ok(id),
+        Err(reason) => {
+            // Safety: the push above never ran (this is the `Err` branch,
+            // and `with_scheduler`'s closure only calls `tcb.take()` right
+            // before the push it's guarding), so `tcb` is still `Some`
+            // here, was never added to `sched.tasks`, and therefore never
+            // had any chance of being scheduled or having its address
+            // space loaded into CR3 -- freeing it is sound for the same
+            // reason it's sound inside `build_user_tcb`.
+            if let Some(mut tcb) = tcb {
+                if let Some(process) = tcb.process.as_mut() {
+                    if let Some(space) = process.address_space.take() {
+                        unsafe { paging::free_address_space(space) };
+                    }
+                }
+            }
+            Err(reason)
+        }
+    }
+}
+
+/// Build a complete, ready-to-run `Tcb` for a new user process: load the
+/// ELF, map and zero its stack, and wrap it all up -- freeing
+/// `address_space`'s frames before returning on *any* failure along the
+/// way, since nothing outside this function call has referenced it yet
+/// (see `spawn_user_process`'s docs on why that makes every early-return
+/// here safe to reclaim immediately rather than leaking).
+fn build_user_tcb(
+    name: &str,
+    elf_bytes: &[u8],
+    mut address_space: paging::AddressSpace,
+) -> Result<Tcb, &'static str> {
+    macro_rules! try_or_free {
+        ($expr:expr) => {
+            match $expr {
+                Ok(value) => value,
+                Err(reason) => {
+                    // Safety: see this function's own docs.
+                    unsafe { paging::free_address_space(address_space) };
+                    return Err(reason);
+                }
+            }
+        };
+    }
+
+    let loaded = try_or_free!(elf::load(&mut address_space, elf_bytes));
 
     let stack_top = paging::USER_SPACE_BASE + paging::USER_SPACE_SIZE - 0x1000;
     let stack_bottom = stack_top - USER_STACK_PAGES * 4096;
@@ -855,29 +932,28 @@ pub fn spawn_user_process(name: &str, elf_bytes: &[u8]) -> Result<u32, &'static 
     let mut page_addr = stack_bottom;
     while page_addr < stack_top {
         let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(page_addr));
-        paging::map_in_address_space(&mut address_space, page, stack_flags)?;
+        try_or_free!(paging::map_in_address_space(
+            &mut address_space,
+            page,
+            stack_flags
+        ));
         page_addr += 4096;
     }
     // Zero the freshly mapped stack -- same reasoning as `elf.rs`'s segment
     // loading: a reused physical frame must never expose a previous
     // process's leftover contents to this one.
-    paging::zero_bytes_in_address_space(
+    try_or_free!(paging::zero_bytes_in_address_space(
         &address_space,
         VirtAddr::new(stack_bottom),
         USER_STACK_PAGES * 4096,
-    )?;
+    ));
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let tcb = new_user_tcb(
+    Ok(new_user_tcb(
         id,
         name,
         address_space,
         loaded.entry_point.as_u64(),
         stack_top,
-    );
-    with_scheduler(|slot| {
-        let sched = slot.as_mut().ok_or("scheduler not initialized")?;
-        sched.tasks.push(Box::new(tcb));
-        Ok(id)
-    })
+    ))
 }

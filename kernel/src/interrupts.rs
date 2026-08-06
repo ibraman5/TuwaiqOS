@@ -26,13 +26,19 @@ use crate::{framebuffer_console, gdt, keyboard, syscall};
 const SYSCALL_VECTOR: u8 = 0x80;
 
 /// Exit codes `exit_with_code` records for a process the kernel terminates
-/// on its behalf after fault-isolation recovery (see `general_protection_fault_handler`
-/// / `page_fault_handler` below) -- deliberately echoing the traditional
-/// Unix "128 + signal number" convention (`SIGSEGV`=11, `SIGILL`=4) purely
-/// as a recognizable, self-documenting value in `ps`/`taskinfo` output, not
-/// because this kernel has real Unix signals.
+/// on its behalf after fault-isolation recovery (see
+/// `general_protection_fault_handler` / `page_fault_handler` /
+/// `invalid_opcode_handler` / `divide_error_handler` below) -- deliberately
+/// echoing the traditional Unix "128 + signal number" convention
+/// (`SIGSEGV`=11, `SIGILL`=4, `SIGFPE`=8) purely as a recognizable,
+/// self-documenting value in `ps`/`taskinfo` output, not because this
+/// kernel has real Unix signals. `#UD` (invalid opcode) shares `SIGILL`
+/// with a Ring 3 `#GP` (privileged instruction) -- both are "the CPU
+/// refused to execute this instruction," the same category a real kernel
+/// would report identically.
 const EXIT_CODE_SEGV: i32 = 139;
 const EXIT_CODE_ILL: i32 = 132;
+const EXIT_CODE_FPE: i32 = 136;
 
 /// Legacy PICs are remapped so hardware IRQs 0-15 land at vectors 32-47,
 /// clear of the CPU's own exception vectors 0-31.
@@ -325,6 +331,23 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
+
+    // Same reasoning as the GPF/page-fault handlers: a Ring-3-origin #UD
+    // (an undefined or unsupported instruction, e.g. `ud2`, executed by a
+    // user program) is that program's own bug, not a kernel one -- kill
+    // only the offending process and let the kernel and every other
+    // process carry on. A Ring-0-origin #UD is a genuine kernel bug
+    // (corrupted code, a real toolchain/codegen problem) and keeps the
+    // unconditional halt below, unchanged.
+    if stack_frame.code_segment & 0b11 == 3 {
+        serial_println!(
+            "usermode: invalid opcode trapped safely from CPL=3 (RIP={:?}) -- \
+             terminating the offending process, kernel continues",
+            stack_frame.instruction_pointer
+        );
+        crate::task::exit_with_code(EXIT_CODE_ILL);
+    }
+
     report_fault("invalid opcode");
     loop {
         x86_64::instructions::hlt();
@@ -333,6 +356,21 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
 
 extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
     serial_println!("EXCEPTION: DIVIDE ERROR\n{:#?}", stack_frame);
+
+    // Same reasoning as the other Ring-3-origin recovery paths: a division
+    // by zero (or a quotient overflow) in a user program's own code is
+    // that program's bug, not the kernel's -- kill only the offending
+    // process. A Ring-0-origin divide error is a genuine kernel bug and
+    // keeps the unconditional halt below, unchanged.
+    if stack_frame.code_segment & 0b11 == 3 {
+        serial_println!(
+            "usermode: divide error trapped safely from CPL=3 (RIP={:?}) -- \
+             terminating the offending process, kernel continues",
+            stack_frame.instruction_pointer
+        );
+        crate::task::exit_with_code(EXIT_CODE_FPE);
+    }
+
     report_fault("divide error");
     loop {
         x86_64::instructions::hlt();

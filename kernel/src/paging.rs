@@ -127,7 +127,11 @@ impl BootInfoFrameAllocator {
 
     /// Total frames handed out over this allocator's lifetime (including
     /// ones later freed and re-handed-out) -- a monotonically increasing
-    /// counter, distinct from currently-in-use frames.
+    /// counter, distinct from currently-in-use frames. Because a reused
+    /// frame increments this exactly like a fresh one, `frames_allocated()
+    /// - frames_in_free_pool()` is *not* a valid "frames currently in use"
+    /// metric whenever any reuse has happened -- see `frames_bumped()` for
+    /// the one that actually is.
     pub fn frames_allocated(&self) -> usize {
         self.allocated_count
     }
@@ -135,6 +139,22 @@ impl BootInfoFrameAllocator {
     /// Frames that were freed and are waiting to be reused.
     pub fn frames_in_free_pool(&self) -> usize {
         self.freed.len()
+    }
+
+    /// How far the bump cursor over *fresh* memory has advanced --
+    /// distinct from `frames_allocated()`, which also counts every reused
+    /// frame. This only ever grows when `allocate_frame` finds the free
+    /// list empty and has to hand out memory it has never given out
+    /// before; a frame recycled through `deallocate_frame` and reused via
+    /// the free list never touches it. This is the metric a leak test
+    /// should compare before/after a batch of allocate+free cycles: if
+    /// nothing leaked, every one of those frees left something in the free
+    /// list for the next allocation to reuse, so this stays flat no matter
+    /// how many cycles ran; if something leaked, the free list runs dry
+    /// and this grows once per leaked frame (see `shell.rs`'s
+    /// `spawnfail` command).
+    pub fn frames_bumped(&self) -> usize {
+        self.next
     }
 }
 
@@ -293,6 +313,10 @@ pub fn is_active() -> bool {
 pub struct FrameStats {
     pub allocated: usize,
     pub free_in_pool: usize,
+    /// See `BootInfoFrameAllocator::frames_bumped` -- the correct metric
+    /// for "did anything just leak," immune to `allocated`'s
+    /// double-counting of reused frames.
+    pub bumped: usize,
 }
 
 pub fn frame_stats() -> Option<FrameStats> {
@@ -300,6 +324,7 @@ pub fn frame_stats() -> Option<FrameStats> {
         frame_allocator_slot.as_ref().map(|allocator| FrameStats {
             allocated: allocator.frames_allocated(),
             free_in_pool: allocator.frames_in_free_pool(),
+            bumped: allocator.frames_bumped(),
         })
     })
 }
