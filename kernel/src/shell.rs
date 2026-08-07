@@ -3,6 +3,7 @@
 //! Features: command history, arrow-key recall, tab completion, and the
 //! `tuwaiq@os:~$` prompt.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -322,6 +323,8 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
         "runelf" => handle_runelf(mode, args),
         "isolate" => handle_isolate(mode, args),
         "spawnfail" => handle_spawnfail(mode, args),
+        "reap" => handle_reap(mode, args),
+        "desktop" => handle_desktop(mode),
         "ai" => handle_ai_command(mode, line, args),
         "ask" => handle_ask_command(mode, args),
         _ => {
@@ -442,6 +445,26 @@ fn embedded_program(name: &str) -> Option<&'static [u8]> {
             env!("CARGO_MANIFEST_DIR"),
             "/../target/x86_64-unknown-none/release/bad_divzero"
         ))),
+        "bad_mmap" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/bad_mmap"
+        ))),
+        "bad_munmap" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/bad_munmap"
+        ))),
+        "bad_display" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/bad_display"
+        ))),
+        "bad_input" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/bad_input"
+        ))),
+        "desktop" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/desktop"
+        ))),
         _ => None,
     }
 }
@@ -491,7 +514,8 @@ fn handle_runelf(mode: ConsoleMode, args: &str) {
     let Some(bytes) = embedded_program(name) else {
         println(
             mode,
-            "Usage: runelf <hello|bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped|bad_ud2|bad_divzero>",
+            "Usage: runelf <hello|bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped|\
+             bad_ud2|bad_divzero|bad_mmap|bad_munmap|bad_display|bad_input|desktop>",
         );
         return;
     };
@@ -707,6 +731,134 @@ fn handle_spawnfail(mode: ConsoleMode, args: &str) {
         print(mode, "  WARNING: bump cursor advanced by ");
         print_u64(mode, (after.bumped - before.bumped) as u64);
         println(mode, " fresh frames -- possible leak.");
+    }
+}
+
+/// `reap <count>` -- the Phase 5 process-lifecycle-cleanup proof
+/// (Milestone 1). Spawns and waits for `count` short-lived `hello`
+/// processes back to back, each one left `Terminated` but not yet reclaimed
+/// (the normal grace-period behavior -- see `task::REAP_GRACE_TICKS`), then
+/// force-reaps everything at once (`task::reap_now`) and compares both the
+/// live task count and the frame allocator's bump cursor before/after: if
+/// terminated TCBs and their address spaces are genuinely reclaimed rather
+/// than leaking, the task count returns to its starting value and the bump
+/// cursor -- the one metric immune to frame reuse, see `spawnfail`'s docs
+/// for why -- stops growing once the free list holds enough recycled frames
+/// to cover one process's footprint.
+fn handle_reap(mode: ConsoleMode, args: &str) {
+    let count: u32 = match args.trim().parse() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            println(mode, "Usage: reap <count>");
+            return;
+        }
+    };
+
+    let Some(bytes) = embedded_program("hello") else {
+        println(mode, "embedded 'hello' program missing");
+        return;
+    };
+
+    // Warm-up: one full spawn/wait/reap cycle before measurement starts --
+    // see `handle_spawnfail`'s docs for why an unwarmed bump cursor always
+    // looks like growth on the very first iteration.
+    if let Ok(id) = task::spawn_user_process("reap-warmup", bytes) {
+        wait_for_terminated(id);
+    }
+    task::reap_now();
+
+    let tasks_before = task::task_count();
+    let frames_before = paging::frame_stats().map(|s| s.bumped).unwrap_or(0);
+
+    for i in 0..count {
+        let name = format!("reap-{}", i);
+        match task::spawn_user_process(&name, bytes) {
+            Ok(id) => wait_for_terminated(id),
+            Err(reason) => {
+                print(mode, "Process load error: ");
+                println(mode, reason);
+                return;
+            }
+        }
+    }
+
+    let tasks_pre_reap = task::task_count();
+    task::reap_now();
+    let tasks_after = task::task_count();
+    let frames_after = paging::frame_stats().map(|s| s.bumped).unwrap_or(0);
+
+    print(mode, "Live tasks before: ");
+    print_u64(mode, tasks_before as u64);
+    println(mode, "");
+    print(mode, "Live tasks after ");
+    print_u64(mode, count as u64);
+    print(
+        mode,
+        " spawn/exit cycles (pre-reap, grace period still held): ",
+    );
+    print_u64(mode, tasks_pre_reap as u64);
+    println(mode, "");
+    print(mode, "Live tasks after forced reap: ");
+    print_u64(mode, tasks_after as u64);
+    println(mode, "");
+    print(mode, "Frame bump cursor before: ");
+    print_u64(mode, frames_before as u64);
+    println(mode, "");
+    print(mode, "Frame bump cursor after: ");
+    print_u64(mode, frames_after as u64);
+    println(mode, "");
+
+    if tasks_after == tasks_before {
+        println(
+            mode,
+            "  Confirmed: task count returned to baseline -- no leaked TCBs.",
+        );
+    } else {
+        println(
+            mode,
+            "  WARNING: task count did not return to baseline -- possible TCB leak.",
+        );
+    }
+    if frames_after == frames_before {
+        println(
+            mode,
+            "  Confirmed: frame bump cursor unchanged -- address spaces fully reclaimed and reused.",
+        );
+    } else {
+        print(mode, "  WARNING: frame bump cursor advanced by ");
+        print_u64(mode, frames_after.saturating_sub(frames_before) as u64);
+        println(mode, " fresh frames -- possible leak.");
+    }
+}
+
+/// `desktop` -- launches the first real Tuwaiq Desktop (Phase 5, Milestones
+/// 6-8) as a genuine Ring 3 ELF process through exactly the same
+/// `task::spawn_user_process` path `runelf` uses -- no Ring 0 shortcut.
+/// Blocks until the desktop process exits (normally or via a fault trapped
+/// by `interrupts.rs`), then reports its final state, so restarting it is
+/// just running `desktop` again.
+fn handle_desktop(mode: ConsoleMode) {
+    let Some(bytes) = embedded_program("desktop") else {
+        println(
+            mode,
+            "desktop: embedded program not available in this build",
+        );
+        return;
+    };
+
+    match task::spawn_user_process("desktop", bytes) {
+        Ok(id) => {
+            print(mode, "Launching Tuwaiq Desktop as pid ");
+            print_u64(mode, id as u64);
+            println(mode, "...");
+            wait_for_terminated(id);
+            print(mode, "Desktop exited: ");
+            print_process_result(mode, id);
+        }
+        Err(reason) => {
+            print(mode, "Desktop load error: ");
+            println(mode, reason);
+        }
     }
 }
 
@@ -987,10 +1139,16 @@ fn print_help(mode: ConsoleMode) {
     println(mode, "  run <program> | notes | editor");
     println(
         mode,
-        "  runelf <hello|bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped|bad_ud2|bad_divzero>",
+        "  runelf <hello|bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped|bad_ud2|",
+    );
+    println(
+        mode,
+        "         bad_divzero|bad_mmap|bad_munmap|bad_display|bad_input|desktop>",
     );
     println(mode, "  isolate [bad_program]");
     println(mode, "  spawnfail <count>");
+    println(mode, "  reap <count>");
+    println(mode, "  desktop");
     println(mode, "  ai | ai status | ask <question>");
     println(mode, "");
     println(mode, "Tip: use Up/Down for history, Tab to complete.");
@@ -1094,6 +1252,8 @@ fn command_names() -> &'static [&'static str] {
         "runelf",
         "isolate",
         "spawnfail",
+        "reap",
+        "desktop",
         "ai",
         "ask",
     ]

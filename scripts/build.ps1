@@ -15,7 +15,7 @@ Write-Host "=== TuwaiqOS build ===" -ForegroundColor Cyan
 Write-Host "Toolchain: $env:RUSTUP_TOOLCHAIN"
 
 Write-Host ""
-Write-Host "[1/3] Building userland test ELF programs (hello + bad_*)..." -ForegroundColor Yellow
+Write-Host "[1/3] Building userland ELF programs (hello + bad_* + desktop)..." -ForegroundColor Yellow
 # Standalone crate, own [workspace] -- see userland/hello/Cargo.toml. Must
 # build before the kernel: kernel/src/shell.rs embeds its six binaries via
 # include_bytes!. Shares this script's CARGO_TARGET_DIR so the embedded
@@ -34,7 +34,10 @@ try {
     Pop-Location
 }
 
-$UserlandBins = @("hello", "bad_syscall", "bad_pointer", "bad_privileged", "bad_kernel", "bad_unmapped")
+$UserlandBins = @(
+    "hello", "bad_syscall", "bad_pointer", "bad_privileged", "bad_kernel", "bad_unmapped",
+    "bad_ud2", "bad_divzero", "bad_mmap", "bad_munmap", "bad_display", "bad_input", "desktop"
+)
 foreach ($bin in $UserlandBins) {
     $path = Join-Path $ProjectRoot "target\x86_64-unknown-none\release\$bin"
     if (-not (Test-Path $path)) {

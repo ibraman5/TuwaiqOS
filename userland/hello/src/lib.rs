@@ -13,6 +13,12 @@ pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_YIELD: u64 = 2;
 pub const SYS_GETPID: u64 = 3;
+pub const SYS_MMAP: u64 = 4;
+pub const SYS_MUNMAP: u64 = 5;
+pub const SYS_DISPLAY_INFO: u64 = 6;
+pub const SYS_DISPLAY_PRESENT: u64 = 7;
+pub const SYS_INPUT_POLL: u64 = 8;
+pub const SYS_UPTIME_TICKS: u64 = 9;
 
 /// # Safety
 /// Caller is responsible for `num`/`a1`/`a2`/`a3` meaning what the
