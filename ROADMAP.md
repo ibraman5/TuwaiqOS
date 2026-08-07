@@ -70,14 +70,51 @@
 - [ ] Real NIC driver (e1000 / virtio-net)
 - [ ] AI Bridge HTTP client wired to gateway
 - [ ] `cd` command and path-aware completion
+- [x] Process lifecycle cleanup: terminated `Tcb`s and their kernel stacks
+      are now genuinely reaped (grace-period reaping, `reap <count>` proves
+      task count and physical-frame bump cursor both stabilize across
+      repeated spawn/exit cycles) -- closes the leak Phase 4 documented and
+      deferred.
+- [x] Userspace anonymous memory: `SYS_MMAP`/`SYS_MUNMAP`, a minimal
+      TuwaiqOS-specific ABI (bump-allocated arena inside each process's own
+      address space, no caller-supplied address, so "map kernel memory" or
+      "map another process's memory" are not expressible requests).
+- [x] Kernel display abstraction + validated present syscall
+      (`SYS_DISPLAY_INFO`/`SYS_DISPLAY_PRESENT`): userspace renders into its
+      own `mmap`'d buffer, the kernel copies it into the real framebuffer
+      only after full pointer/length/mapping validation.
+- [x] Real PS/2 mouse driver (IRQ12 via the slave-PIC cascade line) with
+      packet resync, signed relative motion, absolute screen-clamped
+      cursor position, and button-edge detection.
+- [x] Unified keyboard+mouse input queue and `SYS_INPUT_POLL`, additive to
+      (not a replacement for) the existing keyboard queue the text shell
+      depends on.
+- [x] **First Tuwaiq Desktop**: a real Ring 3 ELF64 process (`desktop`
+      shell command, same `spawn_user_process` path as every other
+      `runelf`-launched program) with a small userspace window model
+      (fixed-capacity, z-order, drag, close), a system bar with a live
+      clock, a working mouse cursor, a launcher button, and visible
+      keyboard echo. Software-rendered, no GPU. See `ARCHITECTURE.md`'s
+      "Phase 5" section for the complete design, ABI additions, security
+      boundaries, and known limitations (bump-only mmap arena, no
+      `KeyUp` events, fixed `MAX_WINDOWS = 4`, still launched from an
+      embedded ELF rather than the filesystem).
 
 ## v0.7 — planned
 
 - [ ] Filesystem-backed executable loading (`elf.rs` already parses real
-      ELF64 bytes; only six build-time-embedded binaries are loadable today)
+      ELF64 bytes; the desktop and every test program are still loaded
+      from build-time-embedded binaries, not the filesystem)
 - [ ] Dynamic linking / relocations (current loader is `ET_EXEC`-only)
-- [ ] Broader syscall surface (filesystem, IPC, memory-mapping) as real
-      use cases justify each one
+- [ ] Broader syscall surface (filesystem, IPC) as real use cases justify
+      each one
+- [ ] `KeyUp` events (keyboard scancode decoder doesn't track per-key
+      release state yet, only Shift)
+- [ ] A free-list-backed `mmap` arena (current one is bump-only; a
+      `munmap`'d range's virtual addresses aren't reused within the same
+      process)
+- [ ] Dirty-rectangle redraw for the desktop compositor (currently redraws
+      the full backbuffer every frame)
 - [ ] FAT32 read-only partition support
 - [ ] VirtualBox/VMware optimized drivers
 - [ ] Package manager for built-in apps
