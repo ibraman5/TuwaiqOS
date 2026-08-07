@@ -69,6 +69,10 @@ pub fn on_scancode(scancode: u8) {
     if EXTENDED_PENDING.swap(false, Ordering::Relaxed) {
         if let Some(event) = translate_extended(scancode) {
             push(event);
+            // Additive fan-out into the Phase 5 unified input queue -- see
+            // `input.rs`'s module docs for why this cannot regress this
+            // (unchanged) shell-facing queue/path.
+            crate::input::push_key_event(event);
         }
         return;
     }
@@ -80,6 +84,7 @@ pub fn on_scancode(scancode: u8) {
 
     if let Some(event) = translate_scancode(scancode) {
         push(event);
+        crate::input::push_key_event(event);
     }
 }
 

@@ -13,15 +13,18 @@ mod ai_bridge;
 mod allocator;
 mod apps;
 mod ata;
+mod display;
 mod elf;
 mod font8x8;
 mod framebuffer_console;
 mod fs;
 mod gdt;
+mod input;
 mod interrupts;
 mod keyboard;
 mod loader;
 mod memory;
+mod mouse;
 mod net;
 mod paging;
 mod programs;
@@ -71,6 +74,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // before anything relies on real interrupts, real ticks, or
     // interrupt-driven keyboard input.
     interrupts::init();
+
+    // Programs the PS/2 auxiliary device, then unmasks its IRQ line only
+    // once that's done (see `interrupts::enable_mouse`'s docs for why that
+    // ordering matters).
+    mouse::init();
+    interrupts::enable_mouse();
 
     ata::init();
     fs::init();

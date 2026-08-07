@@ -294,6 +294,27 @@ fn framebuffer_info() -> Option<FrameBufferInfo> {
     unsafe { FB_INFO }
 }
 
+/// Public accessor for `display.rs` (Phase 5): the same info the text
+/// console already uses internally for its own glyph placement, exposed
+/// read-only so `display::info()` doesn't need to duplicate framebuffer
+/// bookkeeping the console already owns.
+pub fn raw_info() -> Option<FrameBufferInfo> {
+    framebuffer_info()
+}
+
+/// Public accessor for `display.rs` (Phase 5): direct, whole-buffer access
+/// to the real framebuffer, bypassing the glyph-drawing text-console path
+/// entirely -- what `display::present` copies a validated userspace
+/// pixel buffer into. Once a desktop process starts presenting frames, its
+/// content simply overwrites whatever the text console last drew, the same
+/// way a real OS's GUI takes over the screen from a boot console; nothing
+/// about the console's own `CURSOR_X`/`CURSOR_Y` state needs to change for
+/// that -- it's simply stale until `clear_screen()` resets it, which the
+/// shell does after a desktop process exits.
+pub fn raw_buffer_mut() -> Option<&'static mut [u8]> {
+    framebuffer_info().map(framebuffer_slice)
+}
+
 fn with_console<F>(f: F)
 where
     F: FnOnce(FrameBufferInfo),
