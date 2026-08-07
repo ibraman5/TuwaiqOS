@@ -343,6 +343,22 @@ const fn pml4_index(addr: u64) -> usize {
 pub const USER_SPACE_BASE: u64 = 0x_7000_0000_0000;
 pub const USER_SPACE_SIZE: u64 = 0x_4000_0000;
 
+/// Phase 5: base of the per-process anonymous-memory (`SYS_MMAP`) arena --
+/// 256 MiB into the user region, comfortably clear of any ELF's own
+/// `PT_LOAD` segments (which start at `USER_SPACE_BASE` and grow upward;
+/// every ELF this project loads, including the desktop, is a few hundred
+/// KiB at most) without needing to track each process's actual highest
+/// loaded address.
+pub const USER_MMAP_BASE: u64 = USER_SPACE_BASE + 0x_1000_0000;
+
+/// Upper bound of the `SYS_MMAP` arena -- 1 MiB below the top of the user
+/// region, which leaves a large guard gap below where
+/// `task::spawn_user_process` maps the process's stack (the stack itself
+/// occupies only the top ~20 KiB: `USER_SPACE_BASE + USER_SPACE_SIZE -
+/// 0x1000` down to `- 0x5000`, see `task::USER_STACK_PAGES`). `SYS_MMAP`
+/// rejects any request that would grow the arena's bump pointer past this.
+pub const USER_MMAP_LIMIT: u64 = USER_SPACE_BASE + USER_SPACE_SIZE - 0x_0010_0000;
+
 /// The one PML4 slot every process's private page-table subtree lives
 /// under. `new_address_space` leaves exactly this index empty when it
 /// clones the kernel's other 511 entries, and `map_in_address_space`
@@ -574,11 +590,24 @@ pub fn update_flags_in_address_space(
 /// Walk `[start, start+len)` in `space`'s own mapped memory one page-chunk
 /// at a time, handing `f` a kernel-writable pointer (via the
 /// physical-memory-offset mapping) and a length for each chunk. Every byte
-/// touched must already be mapped `WRITABLE` in `space` -- this is the
-/// shared primitive behind `write_bytes_in_address_space` and
-/// `zero_bytes_in_address_space`, used by the ELF loader to populate a
-/// freshly mapped segment regardless of whether `space` is the currently
-/// active CR3.
+/// touched must already be mapped `WRITABLE | USER_ACCESSIBLE` in `space`
+/// -- this is the shared primitive behind `write_bytes_in_address_space`
+/// and `zero_bytes_in_address_space`, used by the ELF loader and
+/// `task::spawn_user_process` to populate freshly mapped segments/stacks
+/// (always already `USER_ACCESSIBLE` by the time either calls this) *and*,
+/// as of Phase 5, by syscalls that write kernel-computed data into a
+/// caller-supplied destination pointer (`DISPLAY_INFO`, `INPUT_POLL`).
+///
+/// Requiring `USER_ACCESSIBLE` here, not just `WRITABLE`, is load-bearing
+/// for that second use: most kernel memory (the heap, in particular) is
+/// `WRITABLE` but never `USER_ACCESSIBLE`, so a `WRITABLE`-only check would
+/// let a syscall write into arbitrary kernel memory the moment a Ring 3
+/// caller supplied a kernel address as the destination -- exactly the
+/// "never trust Ring 3 pointers" boundary this project's syscalls exist to
+/// enforce. Every existing caller's destination is already
+/// `USER_ACCESSIBLE` by construction (kernel-computed addresses inside a
+/// range the caller itself just mapped that way), so this is a pure
+/// hardening with no effect on any legitimate existing use.
 fn for_each_mapped_chunk(
     space: &AddressSpace,
     start: VirtAddr,
@@ -594,14 +623,18 @@ fn for_each_mapped_chunk(
         if !flags.contains(PageTableFlags::WRITABLE) {
             return Err("destination page not writable");
         }
+        if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+            return Err("destination page not user-accessible");
+        }
         let page_offset = addr.as_u64() % 4096;
         let chunk_len = (4096 - page_offset).min(len - written);
         let dst_ptr: *mut u8 = (phys_offset + phys.as_u64()).as_mut_ptr();
-        // Safety: `phys` was just resolved from a `PRESENT | WRITABLE`
-        // mapping in `space`'s own tables (checked above), and the
-        // physical-memory offset mapping covers all usable RAM -- `dst_ptr`
-        // is valid and writable for exactly `chunk_len` bytes starting
-        // there, which is bounded to stay within this one 4 KiB frame.
+        // Safety: `phys` was just resolved from a `PRESENT | WRITABLE |
+        // USER_ACCESSIBLE` mapping in `space`'s own tables (checked above),
+        // and the physical-memory offset mapping covers all usable RAM --
+        // `dst_ptr` is valid and writable for exactly `chunk_len` bytes
+        // starting there, which is bounded to stay within this one 4 KiB
+        // frame.
         f(dst_ptr, chunk_len as usize);
         written += chunk_len;
     }
@@ -696,6 +729,113 @@ pub fn read_bytes_from_address_space(
         read += chunk_len;
     }
     Some(out)
+}
+
+/// Like `read_bytes_from_address_space`, but copies directly into a
+/// caller-supplied `dst` instead of allocating a new `Vec` -- used by
+/// `display::present` (Phase 5) to copy a validated user framebuffer
+/// straight into the real one without an unnecessary intermediate heap
+/// allocation on every frame. Same validation as the `Vec`-returning
+/// version: every page touched must be `PRESENT | USER_ACCESSIBLE`, and
+/// `src + dst.len()` must not overflow.
+pub fn read_bytes_from_address_space_into(
+    space: &AddressSpace,
+    src: VirtAddr,
+    dst: &mut [u8],
+) -> bool {
+    let Some(phys_offset) = physical_memory_offset() else {
+        return false;
+    };
+    let len = dst.len() as u64;
+    if src.as_u64().checked_add(len).is_none() {
+        return false;
+    }
+
+    let mut read = 0u64;
+    while read < len {
+        let addr = src + read;
+        let Some((phys, flags)) = translate_in_address_space(space, addr) else {
+            return false;
+        };
+        if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+            return false;
+        }
+        let page_offset = addr.as_u64() % 4096;
+        let chunk_len = (4096 - page_offset).min(len - read);
+        let src_ptr: *const u8 = (phys_offset + phys.as_u64()).as_ptr();
+        // Safety: `phys` was just resolved from a `PRESENT | USER_ACCESSIBLE`
+        // mapping in `space`'s own tables (checked above); `dst[read..]` has
+        // at least `chunk_len` bytes remaining since the loop never exceeds
+        // `dst.len()` total (checked via the overflow guard above and the
+        // `read < len` condition); the physical-memory offset mapping
+        // covers all usable RAM.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                src_ptr,
+                dst[read as usize..].as_mut_ptr(),
+                chunk_len as usize,
+            );
+        }
+        read += chunk_len;
+    }
+    true
+}
+
+/// Unmap one page from `space`'s private address space and return its
+/// physical frame to the global allocator -- the real reclamation half of
+/// `SYS_MUNMAP` (Phase 5): the page stops translating at all (a subsequent
+/// access faults, exactly like touching memory that was never mapped), and
+/// the frame becomes available for reuse by any future allocation, not
+/// just cosmetically removed from `space`'s own bookkeeping.
+///
+/// Safe to call whether or not `space` is the active CR3, for the same
+/// `MapperFlush`/TLB reasoning as `map_in_address_space`: if `space` isn't
+/// currently loaded, the `invlpg` this issues targets whatever address
+/// space *is* loaded, which is architecturally harmless (at worst it
+/// evicts one unrelated, easily-refetched TLB entry). `SYS_MUNMAP`'s own
+/// call site only ever unmaps from the *current* process's own space,
+/// which is always the active CR3 during its own syscall, so the flush is
+/// exactly correct there.
+///
+/// Refuses anything outside `USER_REGION_PML4_INDEX`, same as
+/// `map_in_address_space` -- independent defense in depth beyond whatever
+/// range check the caller (`task::munmap_in_current_process`) already did.
+pub fn unmap_in_address_space(
+    space: &mut AddressSpace,
+    page: Page<Size4KiB>,
+) -> Result<(), &'static str> {
+    if pml4_index(page.start_address().as_u64()) != USER_REGION_PML4_INDEX {
+        return Err("refusing to unmap outside the process's private address-space region");
+    }
+    let phys_offset = physical_memory_offset().ok_or("physical memory offset not set")?;
+    // Safety: `space.pml4_frame` is a valid level-4 table for as long as
+    // `space` exists.
+    let mut mapper = unsafe { mapper_for(space.pml4_frame, phys_offset) };
+    let (frame, flush) = mapper
+        .unmap(page)
+        .map_err(|_| "unmap failed: page not mapped")?;
+    flush.flush();
+
+    // `owned_frames` no longer owns this one -- remove it so
+    // `free_address_space` (process exit) doesn't try to deallocate an
+    // already-deallocated frame later.
+    if let Some(pos) = space.owned_frames.iter().position(|f| *f == frame) {
+        space.owned_frames.remove(pos);
+    }
+
+    with_paging(|_, frame_allocator_slot| {
+        if let Some(frame_allocator) = frame_allocator_slot.as_mut() {
+            // Safety: `frame` was just unmapped from `space` (confirmed by
+            // `mapper.unmap` succeeding above) and removed from
+            // `owned_frames`, so it is neither still translated by any live
+            // mapping in `space` nor double-tracked -- exactly the contract
+            // `deallocate_frame` requires.
+            unsafe {
+                frame_allocator.deallocate_frame(frame);
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Load `frame` as the active CR3. Called on *every* scheduler switch

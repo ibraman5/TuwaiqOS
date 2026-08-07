@@ -63,6 +63,16 @@ const INITIAL_FRAME_SIZE: usize = 7 * 8;
 /// `interrupts.rs` -- so 5 ticks is a 50 ms time slice).
 const TIME_SLICE_TICKS: u64 = 5;
 
+/// How long a `Terminated` task's `Tcb` (and its 32 KiB kernel stack) stays
+/// reachable via `ps`/`taskinfo`/`task::info` before automatic reaping
+/// removes it -- 500 ticks (5 s at the PIT's 100 Hz) is generously longer
+/// than the few-microsecond gap between `shell.rs`'s `wait_for_terminated`
+/// returning and its immediate follow-up `task::info` read, so ordinary
+/// shell diagnostics never race a reap, while still being short enough
+/// that a kernel left running keeps reclaiming promptly rather than
+/// accumulating terminated `Tcb`s forever. See `Scheduler::reap_terminated`.
+const REAP_GRACE_TICKS: u64 = 500;
+
 /// Lifecycle state of a kernel task.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskState {
@@ -149,6 +159,15 @@ struct Tcb {
     /// kernel-only tasks (shell, idle, heartbeat), which run entirely at
     /// Ring 0 under the shared kernel address space.
     process: Option<ProcessState>,
+    /// Absolute tick count (see `interrupts::ticks`) at which this task
+    /// became `Terminated`, or 0 if it never has. Read by
+    /// `Scheduler::reap_terminated` to enforce `REAP_GRACE_TICKS` -- long
+    /// enough that `ps`/`taskinfo`/the immediate post-`wait_for_terminated`
+    /// read in `runelf`/`isolate` always still find the task, short enough
+    /// that a kernel left running keeps reclaiming `Tcb`s (and their 32 KiB
+    /// kernel stacks) promptly rather than accumulating them forever -- see
+    /// `ARCHITECTURE.md`'s Phase 5 section for the full reasoning.
+    terminated_at_tick: u64,
 }
 
 /// A user process's private state: its own address space and, once it has
@@ -164,6 +183,14 @@ struct ProcessState {
     entry_point: u64,
     user_stack_top: u64,
     exit_code: Option<i32>,
+    /// Bump pointer for this process's own anonymous-memory arena (`SYS_MMAP`
+    /// -- see `mmap_in_current_process`), starting at `paging::USER_MMAP_BASE`
+    /// and only ever moving up. No free-list/reuse in this minimal design --
+    /// `SYS_MUNMAP` genuinely unmaps and reclaims the underlying physical
+    /// frames, but the virtual address range it freed is not reused by a
+    /// later `SYS_MMAP` call within the same process (documented limitation,
+    /// see `ARCHITECTURE.md`).
+    mmap_next: u64,
 }
 
 struct Scheduler {
@@ -193,9 +220,67 @@ struct SwitchPlan {
 }
 
 impl Scheduler {
+    /// Remove every `Terminated` task that is *not* the currently running
+    /// one and has been `Terminated` for at least `REAP_GRACE_TICKS` (or,
+    /// if `force` is set, remove every such task regardless of how long
+    /// ago it terminated -- see `task::reap_now`, used by the `reap` shell
+    /// command and by tests that need deterministic, immediate reclamation
+    /// rather than waiting out the grace period).
+    ///
+    /// Never touches `self.current`: freeing a task's `Tcb` frees its 32 KiB
+    /// kernel stack too (an ordinary `Drop`, not special-cased), and that
+    /// stack is exactly what the CPU is physically executing on top of for
+    /// as long as that task remains current -- reaping it would be a
+    /// genuine use-after-free the instant this function, or anything it
+    /// calls, touched the stack again. Restricting reaping to non-current
+    /// tasks makes that impossible by construction, the same way
+    /// `schedule()` already restricts *address-space* reclamation to
+    /// "provably not the active CR3."
+    ///
+    /// A reaped task's address space is expected to already be `None` here
+    /// (freed synchronously by `kill()`, or by a prior `schedule()` call's
+    /// own post-switch reclaim when this same task was the one being
+    /// switched away from -- see both functions' docs); if one is somehow
+    /// still present this frees it too, defensively, which is sound for the
+    /// identical reason reaping the `Tcb` itself is: a task this function
+    /// is willing to remove is never the current one, so its address space
+    /// can never be the active CR3.
+    fn reap_terminated(&mut self, force: bool) {
+        let now = crate::interrupts::ticks();
+        let current_id = self.tasks[self.current].id;
+
+        let should_reap = |t: &Tcb| -> bool {
+            t.id != current_id
+                && t.state == TaskState::Terminated
+                && (force || now.saturating_sub(t.terminated_at_tick) >= REAP_GRACE_TICKS)
+        };
+
+        for tcb in self.tasks.iter_mut() {
+            if !should_reap(tcb) {
+                continue;
+            }
+            if let Some(process) = tcb.process.as_mut() {
+                if let Some(space) = process.address_space.take() {
+                    // Safety: `should_reap` confirmed `tcb.id != current_id`,
+                    // so this address space cannot be the active CR3.
+                    unsafe { paging::free_address_space(space) };
+                }
+            }
+        }
+
+        self.tasks.retain(|t| !should_reap(t));
+        self.current = self
+            .tasks
+            .iter()
+            .position(|t| t.id == current_id)
+            .expect("current task vanished during reap");
+    }
+
     /// Decide whether a switch is needed and, if so, everything about it
     /// -- but do not perform any of it (see `SwitchPlan`'s docs).
     fn prepare_switch(&mut self) -> Option<SwitchPlan> {
+        self.reap_terminated(false);
+
         let n = self.tasks.len();
         if n < 2 {
             return None;
@@ -389,6 +474,7 @@ pub fn init() {
         wake_at_tick: 0,
         kernel_stack_top: 0,
         process: None,
+        terminated_at_tick: 0,
     };
     let idle = new_tcb(2, "idle", idle_entry);
 
@@ -443,6 +529,7 @@ fn new_tcb(id: u32, name: &str, entry: fn()) -> Tcb {
         wake_at_tick: 0,
         kernel_stack_top: aligned_top as u64,
         process: None,
+        terminated_at_tick: 0,
     }
 }
 
@@ -492,7 +579,9 @@ fn new_user_tcb(
             entry_point,
             user_stack_top,
             exit_code: None,
+            mmap_next: paging::USER_MMAP_BASE,
         }),
+        terminated_at_tick: 0,
     }
 }
 
@@ -644,6 +733,7 @@ pub fn exit_with_code(code: i32) -> ! {
         if let Some(sched) = slot.as_mut() {
             let idx = sched.current;
             sched.tasks[idx].state = TaskState::Terminated;
+            sched.tasks[idx].terminated_at_tick = crate::interrupts::ticks();
             if let Some(process) = sched.tasks[idx].process.as_mut() {
                 process.exit_code = Some(code);
             }
@@ -679,6 +769,15 @@ pub fn list() -> Result<Vec<Task>, &'static str> {
         let sched = slot.as_ref().ok_or("scheduler not initialized")?;
         Ok(sched.tasks.iter().map(|t| snapshot(t)).collect())
     })
+}
+
+/// Number of `Tcb`s currently in the scheduler's task list -- including
+/// `Terminated` ones still inside their reap grace period. Diagnostic/test
+/// use (`stress` shell command, reap tests): proves the count genuinely
+/// shrinks back down after a batch of spawn/exit/reap cycles rather than
+/// growing without bound.
+pub fn task_count() -> usize {
+    with_scheduler(|slot| slot.as_ref().map(|s| s.tasks.len()).unwrap_or(0))
 }
 
 /// Detailed information about one task.
@@ -717,6 +816,7 @@ pub fn kill(id: u32) -> Result<(), &'static str> {
         match sched.tasks.iter_mut().find(|t| t.id == id) {
             Some(task) => {
                 task.state = TaskState::Terminated;
+                task.terminated_at_tick = crate::interrupts::ticks();
                 if is_current {
                     Ok(None)
                 } else {
@@ -738,6 +838,24 @@ pub fn kill(id: u32) -> Result<(), &'static str> {
 
 pub fn state_label(state: TaskState) -> &'static str {
     state.label()
+}
+
+/// Immediately reap every `Terminated` non-current task, ignoring
+/// `REAP_GRACE_TICKS` -- the `reap` shell command's implementation, and the
+/// deterministic hook stress tests use (`spawn`/wait/`kill` a batch of
+/// processes, call this once, then compare `paging::frame_stats()`/task
+/// count against a recorded baseline) instead of needing to either wait out
+/// the real grace period or depend on wall-clock timing for a repeatable
+/// result. Organic reaping (`Scheduler::prepare_switch`, every scheduler
+/// decision) already does the same thing automatically once a task has
+/// been `Terminated` long enough; this only changes *when* it happens, not
+/// *what* happens or *how* it's made safe.
+pub fn reap_now() {
+    with_scheduler(|slot| {
+        if let Some(sched) = slot.as_mut() {
+            sched.reap_terminated(true);
+        }
+    });
 }
 
 pub fn privilege_label(privilege: Privilege) -> &'static str {
@@ -781,6 +899,198 @@ pub fn copy_from_current_user(addr: u64, len: usize) -> Option<Vec<u8>> {
             .address_space
             .as_ref()?;
         paging::read_bytes_from_address_space(space, VirtAddr::new(addr), len)
+    })
+}
+
+/// Copy `data` into the *currently running* task's own user memory at
+/// `addr` -- the write-direction counterpart to `copy_from_current_user`,
+/// used by syscalls that hand kernel-computed data back to userspace
+/// through a caller-supplied destination pointer (`DISPLAY_INFO`,
+/// `INPUT_POLL`). Goes through `paging::write_bytes_in_address_space`,
+/// which (as of Phase 5) requires both `WRITABLE` and `USER_ACCESSIBLE` on
+/// every page touched -- a destination that resolves to kernel memory
+/// (`WRITABLE` but never `USER_ACCESSIBLE`) is rejected, not silently
+/// written through. Returns `false` if the current task isn't a user
+/// process or if any byte in range fails validation.
+pub fn copy_to_current_user(addr: u64, data: &[u8]) -> bool {
+    with_scheduler(|slot| {
+        let sched = slot.as_ref()?;
+        let space = sched.tasks[sched.current]
+            .process
+            .as_ref()?
+            .address_space
+            .as_ref()?;
+        paging::write_bytes_in_address_space(space, VirtAddr::new(addr), data).ok()
+    })
+    .is_some()
+}
+
+/// Read-only access to the currently running task's own address space, for
+/// syscalls that need to hand it to a `paging::` function taking `&AddressSpace`
+/// directly (`display::present`) rather than going through one of the
+/// `copy_*_current_user` wrappers above. Runs the whole closure `f` inside
+/// `with_scheduler` so the reference stays valid and no other execution
+/// context can observe or mutate the scheduler state mid-call -- `f` must
+/// not itself try to re-enter the scheduler (call `with_scheduler`/anything
+/// built on it) or it will deadlock against itself, same caveat as every
+/// other `with_scheduler` closure in this module.
+pub fn with_current_address_space<R>(f: impl FnOnce(&paging::AddressSpace) -> R) -> Option<R> {
+    with_scheduler(|slot| {
+        let sched = slot.as_ref()?;
+        let space = sched.tasks[sched.current]
+            .process
+            .as_ref()?
+            .address_space
+            .as_ref()?;
+        Some(f(space))
+    })
+}
+
+/// Round `len` up to a whole number of 4 KiB pages -- shared by
+/// `mmap_in_current_process` and anywhere else that needs to turn a byte
+/// count into a page count. `None` on overflow (an absurd `len` close to
+/// `u64::MAX`), never a silently wrapped/truncated result.
+fn page_count_for(len: u64) -> Option<u64> {
+    if len == 0 {
+        return None;
+    }
+    len.checked_add(0xFFF)
+        .map(|rounded| (rounded & !0xFFF) / 4096)
+}
+
+/// Upper bound on a single `SYS_MMAP` request -- generous for the
+/// desktop's own needs (a 1280x720x4-byte back-buffer is ~3.5 MiB) while
+/// still bounding how much any one syscall can make the kernel map on a
+/// caller's behalf.
+pub const MAX_MMAP_LEN: u64 = 64 * 1024 * 1024;
+
+/// `SYS_MMAP`'s implementation: grow the *currently running* user
+/// process's own anonymous-memory arena by `len` bytes (rounded up to
+/// whole pages) and return the new region's starting address, or `None` on
+/// any failure (not a user process, `len` is zero/absurd, the arena is
+/// exhausted, or the underlying mapping failed -- e.g. out of physical
+/// frames).
+///
+/// Every mapped page is `PRESENT | USER_ACCESSIBLE`, `NO_EXECUTE`
+/// unconditionally (this ABI has no concept of executable anonymous
+/// memory -- see `ARCHITECTURE.md`), and `WRITABLE` only if `writable` is
+/// set; the freshly mapped range is zeroed before the address is handed
+/// back, so a process can never observe another process's (or its own
+/// prior mapping's) leftover physical-memory contents. Bounded to
+/// `paging::USER_MMAP_BASE..USER_MMAP_LIMIT` -- independently re-checked by
+/// `paging::map_in_address_space` itself (defense in depth, same pattern
+/// as the ELF loader), so this can never reach kernel memory or another
+/// process's address space no matter what this function does or doesn't
+/// check.
+///
+/// **Known limitation**: a partially-successful mapping (some pages
+/// mapped, a later one fails -- e.g. the allocator runs out of frames
+/// partway through a large request) is not rolled back page-by-page; the
+/// successfully mapped pages remain mapped (tracked in the process's own
+/// `AddressSpace::owned_frames`, so they are still correctly freed whenever
+/// the process eventually exits) but are not returned to the caller and
+/// cannot be reused by a later `SYS_MMAP` call in this minimal, no-free-list
+/// bump allocator. Documented rather than silently accepted -- see
+/// `ARCHITECTURE.md`'s Phase 5 known limitations.
+pub fn mmap_in_current_process(len: u64, writable: bool) -> Option<u64> {
+    if len == 0 || len > MAX_MMAP_LEN {
+        return None;
+    }
+    let pages = page_count_for(len)?;
+    let region_len = pages.checked_mul(4096)?;
+
+    with_scheduler(|slot| {
+        let sched = slot.as_mut()?;
+        let process = sched.tasks[sched.current].process.as_mut()?;
+        let space = process.address_space.as_mut()?;
+
+        let start = process.mmap_next;
+        let end = start.checked_add(region_len)?;
+        if end > paging::USER_MMAP_LIMIT {
+            return None;
+        }
+
+        let mut flags =
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
+        if writable {
+            flags |= PageTableFlags::WRITABLE;
+        } else {
+            // Zeroing below needs a WRITABLE mapping regardless of what the
+            // caller ultimately wants; map writable now, narrow to the
+            // requested (read-only) permissions once the zero-fill is done
+            // -- identical two-step "populate, then lock down" pattern
+            // `elf.rs` already uses for segment permissions.
+            flags |= PageTableFlags::WRITABLE;
+        }
+
+        let mut page_addr = start;
+        while page_addr < end {
+            let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(page_addr));
+            paging::map_in_address_space(space, page, flags).ok()?;
+            page_addr += 4096;
+        }
+
+        paging::zero_bytes_in_address_space(space, VirtAddr::new(start), region_len).ok()?;
+
+        if !writable {
+            let final_flags = PageTableFlags::PRESENT
+                | PageTableFlags::USER_ACCESSIBLE
+                | PageTableFlags::NO_EXECUTE;
+            let mut page_addr = start;
+            while page_addr < end {
+                let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(page_addr));
+                paging::update_flags_in_address_space(space, page, final_flags).ok()?;
+                page_addr += 4096;
+            }
+        }
+
+        process.mmap_next = end;
+        Some(start)
+    })
+}
+
+/// `SYS_MUNMAP`'s implementation: unmap `[ptr, ptr+len)` from the
+/// *currently running* user process's own address space and return the
+/// underlying physical frames to the global allocator. Both `ptr` and
+/// `len` must be exact multiples of 4 KiB (no partial-page unmaps -- every
+/// `SYS_MMAP` region already starts and ends on a page boundary, so a
+/// well-behaved caller never needs anything else), and the entire range
+/// must fall within `[paging::USER_MMAP_BASE, mmap_next)` -- the process's
+/// own mmap arena, and never past how far it has actually grown -- which
+/// rules out ever unmapping the ELF's own segments or the user stack (both
+/// live outside the mmap arena entirely) by construction, not by a
+/// case-by-case check.
+pub fn munmap_in_current_process(ptr: u64, len: u64) -> bool {
+    if len == 0 || ptr % 4096 != 0 || len % 4096 != 0 {
+        return false;
+    }
+    let Some(end) = ptr.checked_add(len) else {
+        return false;
+    };
+
+    with_scheduler(|slot| {
+        let Some(sched) = slot.as_mut() else {
+            return false;
+        };
+        let Some(process) = sched.tasks[sched.current].process.as_mut() else {
+            return false;
+        };
+        if ptr < paging::USER_MMAP_BASE || end > process.mmap_next {
+            return false;
+        }
+        let Some(space) = process.address_space.as_mut() else {
+            return false;
+        };
+
+        let mut page_addr = ptr;
+        while page_addr < end {
+            let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(page_addr));
+            if paging::unmap_in_address_space(space, page).is_err() {
+                return false;
+            }
+            page_addr += 4096;
+        }
+        true
     })
 }
 
