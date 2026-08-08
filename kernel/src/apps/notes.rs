@@ -19,6 +19,8 @@ pub fn handle(sub: &str, args: &str) -> Result<Vec<String>, &'static str> {
     let sub = sub.trim();
     match sub {
         "create" => create(args),
+        "set" => set(args),
+        "delete" => delete(args),
         "list" => list(),
         "show" => show(args),
         "" => Ok(usage_lines()),
@@ -28,7 +30,7 @@ pub fn handle(sub: &str, args: &str) -> Result<Vec<String>, &'static str> {
 
 fn create(name: &str) -> Result<Vec<String>, &'static str> {
     let name = name.trim();
-    if name.is_empty() {
+    if !valid_note_name(name) {
         return Err("usage: notes create <name>");
     }
     if vfs::kind("/", NOTES_DIR).is_err() {
@@ -37,6 +39,36 @@ fn create(name: &str) -> Result<Vec<String>, &'static str> {
     vfs::write_file("/", &note_path(name), b"")?;
     let mut lines = Vec::new();
     lines.push(format_message("Created note: ", name));
+    Ok(lines)
+}
+
+fn set(args: &str) -> Result<Vec<String>, &'static str> {
+    let args = args.trim();
+    let split = args
+        .find(char::is_whitespace)
+        .ok_or("usage: notes set <name> <text>")?;
+    let name = &args[..split];
+    let text = args[split..].trim();
+    if !valid_note_name(name) || text.is_empty() {
+        return Err("usage: notes set <name> <text>");
+    }
+    if vfs::kind("/", NOTES_DIR).is_err() {
+        vfs::create_dir("/", NOTES_DIR)?;
+    }
+    vfs::write_file("/", &note_path(name), text.as_bytes())?;
+    let mut lines = Vec::new();
+    lines.push(format_message("Saved note: ", name));
+    Ok(lines)
+}
+
+fn delete(name: &str) -> Result<Vec<String>, &'static str> {
+    let name = name.trim();
+    if !valid_note_name(name) {
+        return Err("usage: notes delete <name>");
+    }
+    vfs::remove("/", &note_path(name))?;
+    let mut lines = Vec::new();
+    lines.push(format_message("Deleted note: ", name));
     Ok(lines)
 }
 
@@ -59,7 +91,7 @@ fn list() -> Result<Vec<String>, &'static str> {
 
 fn show(name: &str) -> Result<Vec<String>, &'static str> {
     let name = name.trim();
-    if name.is_empty() {
+    if !valid_note_name(name) {
         return Err("usage: notes show <name>");
     }
     let bytes = vfs::read_file("/", &note_path(name))?;
@@ -74,9 +106,20 @@ fn usage_lines() -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(String::from("Notes commands:"));
     lines.push(String::from("  notes create <name>"));
+    lines.push(String::from("  notes set <name> <text>"));
+    lines.push(String::from("  notes delete <name>"));
     lines.push(String::from("  notes list"));
     lines.push(String::from("  notes show <name>"));
     lines
+}
+
+fn valid_note_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= vfs::NAME_MAX
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\'])
+        && !name.bytes().any(|byte| byte == 0 || byte < 0x20)
 }
 
 fn format_message(prefix: &str, name: &str) -> String {
