@@ -8,6 +8,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 
@@ -29,6 +31,29 @@ struct FileSystem {
 /// syscalls. Every access therefore uses the same interrupt-safe lock.
 /// Expensive ATA I/O is never performed while this lock is held.
 static FS: Mutex<Option<Arc<FileSystem>>> = Mutex::new(None);
+
+/// Serializes filesystem mutation without spinning on a single CPU. A writer
+/// may be preempted while serializing or waiting for ATA, so another writer
+/// must fail with "filesystem busy" rather than spin and prevent the owner
+/// from being scheduled again.
+static WRITER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct WriterGuard;
+
+impl WriterGuard {
+    fn acquire() -> Result<Self, &'static str> {
+        WRITER_ACTIVE
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map(|_| Self)
+            .map_err(|_| "filesystem busy")
+    }
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        WRITER_ACTIVE.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryKind {
@@ -112,11 +137,12 @@ fn mutate_and_persist<F>(f: F) -> Result<(), &'static str>
 where
     F: FnOnce(&mut FileSystem) -> Result<(), &'static str>,
 {
-    // Phase 6 exposes no Ring-3 mutation syscall, so shell commands are the
-    // sole serialized writer. Clone only the root Arc while locked, then copy
-    // tree structure/Arc references, mutate, and serialize with interrupts
-    // enabled. Publish it only after disk persistence succeeds: an ATA error
-    // leaves the prior in-memory tree untouched.
+    let _writer = WriterGuard::acquire()?;
+    // Clone only the root Arc while locked, then copy tree structure/Arc
+    // references, mutate, serialize, and perform ATA I/O with interrupts
+    // enabled. Publish only after persistence succeeds: an ATA error leaves
+    // the prior in-memory tree untouched. The non-spinning writer guard keeps
+    // concurrent Ring-3 mutations from losing updates.
     let snapshot = interrupts::without_interrupts(|| {
         let guard = FS.lock();
         guard
@@ -260,6 +286,34 @@ impl FileSystem {
         }
         Ok(())
     }
+
+    fn remove_at(&mut self, path: &str) -> Result<(), &'static str> {
+        let (parent, name) = Self::parent_and_name(path)?;
+        let children = self.children_at_mut(&parent)?;
+        let index = children
+            .iter()
+            .position(|(existing, _)| existing == &name)
+            .ok_or("entry not found")?;
+        if matches!(&children[index].1, Entry::Dir { children } if !children.is_empty()) {
+            return Err("directory not empty");
+        }
+        children.remove(index);
+        Ok(())
+    }
+
+    fn metadata_at(&self, path: &str) -> Result<EntryMetadata, &'static str> {
+        let parts = split_absolute_path(path)?;
+        match self.entry_at(&parts)? {
+            Entry::File { content } => Ok(EntryMetadata {
+                kind: EntryKind::File,
+                size: content.len(),
+            }),
+            Entry::Dir { children } => Ok(EntryMetadata {
+                kind: EntryKind::Directory,
+                size: children.len(),
+            }),
+        }
+    }
 }
 
 fn split_absolute_path(path: &str) -> Result<Vec<String>, &'static str> {
@@ -319,7 +373,23 @@ pub fn write_at(path: &str, bytes: &[u8]) -> Result<(), &'static str> {
     mutate_and_persist(|fs| fs.write_at(path, bytes))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EntryMetadata {
+    pub kind: EntryKind,
+    /// File length in bytes, or immediate child count for a directory.
+    pub size: usize,
+}
+
+pub fn metadata_at(path: &str) -> Result<EntryMetadata, &'static str> {
+    with_fs(|fs| fs.metadata_at(path))
+}
+
+pub fn remove_at(path: &str) -> Result<(), &'static str> {
+    mutate_and_persist(|fs| fs.remove_at(path))
+}
+
 pub fn sync_to_disk() -> Result<(), &'static str> {
+    let _writer = WriterGuard::acquire()?;
     let root = with_fs(|fs| Ok(fs.root.clone()))?;
     tuwaiqfs::sync_tree(&to_fs_node(&root))
 }

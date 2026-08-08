@@ -2,8 +2,8 @@
 //!
 //! The VFS owns path semantics and mount dispatch. TuwaiqFS remains the
 //! concrete backend at `/`; callers never receive backend nodes or mutate its
-//! internal tree directly. The first milestone intentionally exposes only
-//! read-only file handles to Ring 3.
+//! internal tree directly. Mutation is transactional at the in-memory VFS
+//! boundary: a candidate tree is published only after persistence succeeds.
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -37,6 +37,8 @@ trait VfsBackend {
     fn create_file(&self, absolute_path: &str) -> Result<(), &'static str>;
     fn create_dir(&self, absolute_path: &str) -> Result<(), &'static str>;
     fn write(&self, absolute_path: &str, bytes: &[u8]) -> Result<(), &'static str>;
+    fn remove(&self, absolute_path: &str) -> Result<(), &'static str>;
+    fn metadata(&self, absolute_path: &str) -> Result<NodeMetadata, &'static str>;
     fn sync(&self) -> Result<(), &'static str>;
 }
 
@@ -68,6 +70,21 @@ impl VfsBackend for TuwaiqRoot {
 
     fn write(&self, absolute_path: &str, bytes: &[u8]) -> Result<(), &'static str> {
         fs::write_at(absolute_path, bytes)
+    }
+
+    fn remove(&self, absolute_path: &str) -> Result<(), &'static str> {
+        fs::remove_at(absolute_path)
+    }
+
+    fn metadata(&self, absolute_path: &str) -> Result<NodeMetadata, &'static str> {
+        let metadata = fs::metadata_at(absolute_path)?;
+        Ok(NodeMetadata {
+            kind: match metadata.kind {
+                fs::EntryKind::File => NodeKind::File,
+                fs::EntryKind::Directory => NodeKind::Directory,
+            },
+            size: metadata.size,
+        })
     }
 
     fn sync(&self) -> Result<(), &'static str> {
@@ -189,6 +206,23 @@ pub fn create_dir(cwd: &str, path: &str) -> Result<(), &'static str> {
 pub fn write_file(cwd: &str, path: &str, bytes: &[u8]) -> Result<(), &'static str> {
     let absolute = normalize(cwd, path)?;
     ROOT_BACKEND.write(&absolute, bytes)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeMetadata {
+    pub kind: NodeKind,
+    /// File length in bytes, or immediate child count for a directory.
+    pub size: usize,
+}
+
+pub fn metadata(cwd: &str, path: &str) -> Result<NodeMetadata, &'static str> {
+    let absolute = normalize(cwd, path)?;
+    ROOT_BACKEND.metadata(&absolute)
+}
+
+pub fn remove(cwd: &str, path: &str) -> Result<(), &'static str> {
+    let absolute = normalize(cwd, path)?;
+    ROOT_BACKEND.remove(&absolute)
 }
 
 pub fn sync() -> Result<(), &'static str> {

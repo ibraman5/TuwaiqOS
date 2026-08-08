@@ -25,6 +25,11 @@ pub const SYS_OPEN: u64 = 12;
 pub const SYS_READ: u64 = 13;
 pub const SYS_CLOSE: u64 = 14;
 pub const SYS_SPAWN: u64 = 15;
+pub const SYS_PUT_FILE: u64 = 16;
+pub const SYS_REMOVE: u64 = 17;
+pub const SYS_MKDIR: u64 = 18;
+pub const SYS_READDIR: u64 = 19;
+pub const SYS_STAT: u64 = 20;
 
 /// # Safety
 /// Caller is responsible for `num`/`a1`/`a2`/`a3` meaning what the

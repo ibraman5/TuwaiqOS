@@ -1064,12 +1064,33 @@ pub fn current_task_id() -> Option<u32> {
     })
 }
 
+pub fn current_process_name() -> Option<String> {
+    let (bytes, len) = with_scheduler(|slot| {
+        let sched = slot.as_ref()?;
+        let task = &sched.tasks[sched.current];
+        task.process.as_ref()?;
+        if task.name.len() > crate::vfs::NAME_MAX {
+            return None;
+        }
+        let mut bytes = [0u8; crate::vfs::NAME_MAX];
+        bytes[..task.name.len()].copy_from_slice(task.name.as_bytes());
+        Some((bytes, task.name.len()))
+    })?;
+    try_owned_string(core::str::from_utf8(&bytes[..len]).ok()?).ok()
+}
+
 pub fn current_working_directory() -> Option<String> {
-    with_scheduler(|slot| {
+    let (bytes, len) = with_scheduler(|slot| {
         let sched = slot.as_ref()?;
         let cwd = &sched.tasks[sched.current].process.as_ref()?.cwd;
-        try_owned_string(cwd).ok()
-    })
+        if cwd.len() > crate::vfs::PATH_MAX {
+            return None;
+        }
+        let mut bytes = [0u8; crate::vfs::PATH_MAX];
+        bytes[..cwd.len()].copy_from_slice(cwd.as_bytes());
+        Some((bytes, cwd.len()))
+    })?;
+    try_owned_string(core::str::from_utf8(&bytes[..len]).ok()?).ok()
 }
 
 pub fn set_current_working_directory(cwd: String) -> bool {
@@ -1187,6 +1208,9 @@ fn current_process_entry() -> Option<(u64, u64)> {
 /// ever reads memory a Ring 3 program pointed it at: never a raw pointer
 /// dereference of a user-supplied address.
 pub fn copy_from_current_user(addr: u64, len: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).ok()?;
+    out.resize(len, 0);
     with_scheduler(|slot| {
         let user_addr = VirtAddr::try_new(addr).ok()?;
         if user_addr.as_u64() != addr {
@@ -1198,8 +1222,9 @@ pub fn copy_from_current_user(addr: u64, len: usize) -> Option<Vec<u8>> {
             .as_ref()?
             .address_space
             .as_ref()?;
-        paging::read_bytes_from_address_space(space, user_addr, len)
-    })
+        paging::read_bytes_from_address_space_into(space, user_addr, &mut out).ok()
+    })?;
+    Some(out)
 }
 
 /// Copy `data` into the *currently running* task's own user memory at

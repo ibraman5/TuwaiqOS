@@ -30,6 +30,11 @@
 //! |13 | READ           | `handle, out_ptr, out_len`     | bytes read, or `-1`          |
 //! |14 | CLOSE          | `handle`                       | `0`, or `-1`                 |
 //! |15 | SPAWN          | `path_ptr, path_len`           | child pid, or `-1`           |
+//! |16 | PUT_FILE       | `path_ptr, path_len, spec_ptr` | `0`, or `-1`                 |
+//! |17 | REMOVE         | `path_ptr, path_len`           | `0`, or `-1`                 |
+//! |18 | MKDIR          | `path_ptr, path_len`           | `0`, or `-1`                 |
+//! |19 | READDIR        | `path_ptr, path_len, spec_ptr` | bytes listed, or `-1`        |
+//! |20 | STAT           | `path_ptr, path_len, out_ptr`  | `0`, or `-1`                 |
 //!
 //! (Phase 5 -- see `ARCHITECTURE.md`'s "Phase 5: userland runtime and the
 //! first graphical desktop" section for the design behind 4-9.)
@@ -83,6 +88,11 @@ const SYS_OPEN: u64 = 12;
 const SYS_READ: u64 = 13;
 const SYS_CLOSE: u64 = 14;
 const SYS_SPAWN: u64 = 15;
+const SYS_PUT_FILE: u64 = 16;
+const SYS_REMOVE: u64 = 17;
+const SYS_MKDIR: u64 = 18;
+const SYS_READDIR: u64 = 19;
+const SYS_STAT: u64 = 20;
 
 /// Upper bound on a single `WRITE`'s length -- generous for this ABI's
 /// only real use (a handful of short diagnostic lines from `hello_user`),
@@ -90,6 +100,8 @@ const SYS_SPAWN: u64 = 15;
 /// a caller's behalf regardless of what `len` claims.
 const MAX_WRITE_LEN: usize = 4096;
 const MAX_FILE_IO_LEN: usize = 4096;
+const BUFFER_SPEC_LEN: usize = 16;
+const STAT_RECORD_LEN: usize = 16;
 
 /// The 15 general-purpose registers `syscall_entry` saves, in the exact
 /// order they land in memory (lowest address first) given the push order
@@ -205,6 +217,11 @@ fn dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_READ => sys_read(a1, a2, a3),
         SYS_CLOSE => sys_close(a1),
         SYS_SPAWN => sys_spawn(a1, a2),
+        SYS_PUT_FILE => sys_put_file(a1, a2, a3),
+        SYS_REMOVE => sys_remove(a1, a2),
+        SYS_MKDIR => sys_mkdir(a1, a2),
+        SYS_READDIR => sys_readdir(a1, a2, a3),
+        SYS_STAT => sys_stat(a1, a2, a3),
         _ => {
             // Exactly the "unknown syscall numbers must fail safely"
             // requirement: logged for visibility, a plain error return,
@@ -540,4 +557,157 @@ fn sys_spawn(path_ptr: u64, path_len: u64) -> i64 {
     task::spawn_user_process_with_cwd(name, &bytes, &cwd)
         .map(i64::from)
         .unwrap_or(-1)
+}
+
+/// Decode `{ pointer: u64, length: u64 }` from user memory. The descriptor
+/// itself and the complete pointed-to range are both validated by each
+/// caller before filesystem state is observed or changed.
+fn copy_user_buffer_spec(spec_ptr: u64) -> Option<(u64, usize)> {
+    let bytes = task::copy_from_current_user(spec_ptr, BUFFER_SPEC_LEN)?;
+    let pointer = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+    let length = usize::try_from(u64::from_le_bytes(bytes[8..16].try_into().ok()?)).ok()?;
+    if length > MAX_FILE_IO_LEN {
+        return None;
+    }
+    Some((pointer, length))
+}
+
+/// Resolve a mutation target and confine it to this executable's private
+/// `/data/<process-name>` namespace. Trusted installation provisions that
+/// root; Ring 3 cannot replace `/apps`, mutate a peer's data, or target the
+/// filesystem root while the Phase 8 capability system is still future.
+fn private_mutation_path(path: &str, allow_data_root: bool) -> Option<alloc::string::String> {
+    let cwd = task::current_working_directory()?;
+    let absolute = crate::vfs::normalize(&cwd, path).ok()?;
+    let name = task::current_process_name()?;
+    let mut root = alloc::string::String::new();
+    root.try_reserve_exact(6usize.checked_add(name.len())?)
+        .ok()?;
+    root.push_str("/data/");
+    root.push_str(&name);
+    if crate::vfs::normalize("/", &root).ok().as_ref() != Some(&root) {
+        return None;
+    }
+    let child = absolute
+        .strip_prefix(&root)
+        .is_some_and(|suffix| suffix.starts_with('/'));
+    if child || allow_data_root && absolute == root {
+        Some(absolute)
+    } else {
+        None
+    }
+}
+
+/// Atomically create or replace one private data file. This is deliberately
+/// a whole-file operation for the initial mutable ABI: pointer validation and
+/// copying finish before persistence starts, and the VFS publishes either the
+/// complete replacement or the previous tree.
+fn sys_put_file(path_ptr: u64, path_len: u64, spec_ptr: u64) -> i64 {
+    let Some(path) = copy_user_path(path_ptr, path_len) else {
+        return -1;
+    };
+    let Some((data_ptr, data_len)) = copy_user_buffer_spec(spec_ptr) else {
+        return -1;
+    };
+    let Some(bytes) = task::copy_from_current_user(data_ptr, data_len) else {
+        return -1;
+    };
+    let Some(absolute) = private_mutation_path(&path, false) else {
+        return -1;
+    };
+    crate::vfs::write_file("/", &absolute, &bytes)
+        .map(|_| 0)
+        .unwrap_or(-1)
+}
+
+fn sys_remove(path_ptr: u64, path_len: u64) -> i64 {
+    let Some(path) = copy_user_path(path_ptr, path_len) else {
+        return -1;
+    };
+    let Some(absolute) = private_mutation_path(&path, false) else {
+        return -1;
+    };
+    crate::vfs::remove("/", &absolute).map(|_| 0).unwrap_or(-1)
+}
+
+fn sys_mkdir(path_ptr: u64, path_len: u64) -> i64 {
+    let Some(path) = copy_user_path(path_ptr, path_len) else {
+        return -1;
+    };
+    let Some(absolute) = private_mutation_path(&path, true) else {
+        return -1;
+    };
+    crate::vfs::create_dir("/", &absolute)
+        .map(|_| 0)
+        .unwrap_or(-1)
+}
+
+fn sys_readdir(path_ptr: u64, path_len: u64, spec_ptr: u64) -> i64 {
+    let Some(path) = copy_user_path(path_ptr, path_len) else {
+        return -1;
+    };
+    let Some((out_ptr, out_len)) = copy_user_buffer_spec(spec_ptr) else {
+        return -1;
+    };
+    if !task::validate_current_user_range(out_ptr, out_len, true) {
+        return -1;
+    }
+    let Some(cwd) = task::current_working_directory() else {
+        return -1;
+    };
+    let Ok(entries) = crate::vfs::list_dir(&cwd, &path) else {
+        return -1;
+    };
+    let mut encoded = alloc::vec::Vec::new();
+    if encoded.try_reserve_exact(out_len).is_err() {
+        return -1;
+    }
+    for entry in entries {
+        let Some(required) = encoded
+            .len()
+            .checked_add(entry.len())
+            .and_then(|length| length.checked_add(1))
+        else {
+            return -1;
+        };
+        if required > out_len {
+            return -1;
+        }
+        encoded.extend_from_slice(entry.as_bytes());
+        encoded.push(b'\n');
+    }
+    if !encoded.is_empty() && !task::copy_to_current_user(out_ptr, &encoded) {
+        return -1;
+    }
+    encoded.len() as i64
+}
+
+fn sys_stat(path_ptr: u64, path_len: u64, out_ptr: u64) -> i64 {
+    let Some(path) = copy_user_path(path_ptr, path_len) else {
+        return -1;
+    };
+    if !task::validate_current_user_range(out_ptr, STAT_RECORD_LEN, true) {
+        return -1;
+    }
+    let Some(cwd) = task::current_working_directory() else {
+        return -1;
+    };
+    let Ok(metadata) = crate::vfs::metadata(&cwd, &path) else {
+        return -1;
+    };
+    let Ok(size) = u64::try_from(metadata.size) else {
+        return -1;
+    };
+    let mut record = [0u8; STAT_RECORD_LEN];
+    let kind = match metadata.kind {
+        crate::vfs::NodeKind::File => 1u64,
+        crate::vfs::NodeKind::Directory => 2u64,
+    };
+    record[0..8].copy_from_slice(&kind.to_le_bytes());
+    record[8..16].copy_from_slice(&size.to_le_bytes());
+    if task::copy_to_current_user(out_ptr, &record) {
+        0
+    } else {
+        -1
+    }
 }

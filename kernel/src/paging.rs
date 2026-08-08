@@ -923,50 +923,37 @@ pub fn zero_bytes_in_address_space(
     })
 }
 
-/// Read `len` bytes from `space`'s own mapped memory starting at `src`.
-///
-/// This is the other half of user-pointer validation alongside
-/// `translate_in_address_space` (which this is built on): `syscall.rs`'s
-/// `WRITE` syscall calls this instead of ever dereferencing a Ring 3
-/// pointer directly under the live CR3, precisely so a bad `ptr`/`len`
-/// pair from user code becomes a clean `None` here -- never a Ring 0 page
-/// fault from kernel code blindly trusting a user-supplied address (the
-/// classic "unvalidated user pointer" kernel vulnerability class).
-///
-/// Every page touched must be `PRESENT | USER_ACCESSIBLE` (not necessarily
-/// `WRITABLE` -- reading a process's own read-only code/rodata through
-/// this path is legitimate). Returns `None`, without reading anything, if
-/// any page in range is unmapped, not user-accessible, or if `src + len`
-/// overflows.
-pub fn read_bytes_from_address_space(
+/// Copy into caller-owned kernel storage without allocating. Syscall paths
+/// reserve their bounded destination before taking the scheduler lock, then
+/// use this helper while the current address-space reference is protected.
+pub fn read_bytes_from_address_space_into(
     space: &AddressSpace,
     src: VirtAddr,
-    len: usize,
-) -> Option<Vec<u8>> {
-    let phys_offset = physical_memory_offset()?;
-    validate_user_range(space, src.as_u64(), len, false).ok()?;
+    out: &mut [u8],
+) -> Result<(), &'static str> {
+    let phys_offset = physical_memory_offset().ok_or("physical memory offset not set")?;
+    validate_user_range(space, src.as_u64(), out.len(), false)?;
 
-    let mut out = Vec::with_capacity(len);
     let mut read = 0u64;
-    while read < len as u64 {
+    while read < out.len() as u64 {
         let addr = src + read;
-        let (phys, flags) = translate_in_address_space(space, addr)?;
+        let (phys, flags) =
+            translate_in_address_space(space, addr).ok_or("source page not mapped")?;
         if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
-            return None;
+            return Err("source page not user-accessible");
         }
         let page_offset = addr.as_u64() % 4096;
-        let chunk_len = (4096 - page_offset).min(len as u64 - read);
+        let chunk_len = (4096 - page_offset).min(out.len() as u64 - read) as usize;
         let src_ptr: *const u8 = (phys_offset + phys.as_u64()).as_ptr();
-        // Safety: `phys` was just resolved from a `PRESENT | USER_ACCESSIBLE`
-        // mapping in `space`'s own tables (checked above), and the
-        // physical-memory offset mapping covers all usable RAM -- valid for
-        // exactly `chunk_len` bytes, bounded to stay within this one frame.
+        // Safety: validation above covers the complete source. This chunk is
+        // bounded to one present user-accessible frame and `out` is an
+        // exclusive kernel slice of at least `chunk_len` remaining bytes.
         unsafe {
-            out.extend_from_slice(core::slice::from_raw_parts(src_ptr, chunk_len as usize));
+            core::ptr::copy_nonoverlapping(src_ptr, out.as_mut_ptr().add(read as usize), chunk_len);
         }
-        read += chunk_len;
+        read += chunk_len as u64;
     }
-    Some(out)
+    Ok(())
 }
 
 /// Frame allocator used only while rolling back an interrupted batch
