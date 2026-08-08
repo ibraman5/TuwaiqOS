@@ -25,6 +25,7 @@ const PIXEL_FORMAT_UNKNOWN: u32 = 3;
 static PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
 static PRESENT_TOTAL_CYCLES: AtomicU64 = AtomicU64::new(0);
 static PRESENT_MAX_CYCLES: AtomicU64 = AtomicU64::new(0);
+const PRESENT_COPY_CHUNK: usize = 64 * 1024;
 
 /// Fixed 20-byte wire format for `SYS_DISPLAY_INFO` -- five little-endian
 /// `u32`s, in this exact order. `stride` is in *pixels*, not bytes (matches
@@ -103,9 +104,11 @@ pub fn framebuffer_checksum() -> Option<u64> {
 ///   USER_ACCESSIBLE`, using the same checked full-range validator as the
 ///   other pointer-bearing syscalls.
 ///
-/// Once preflight succeeds, the caller's CR3 is still active and immutable
-/// for this single-threaded process, so one contiguous copy updates the
-/// disjoint kernel framebuffer without a redundant second page-table walk.
+/// Once preflight succeeds, the caller's mapping is immutable for this
+/// single-threaded process. The copy proceeds in bounded chunks with an IRQ
+/// delivery window between chunks; a preempted task resumes under its own CR3
+/// before copying the next chunk. The syscall layer permits only the foreground
+/// process to present, so another process cannot interleave a competing frame.
 ///
 /// A process's own `SYS_MMAP`'d buffer is never the real framebuffer and
 /// is never touched by any *other* process's address space (Phase 4's
@@ -120,47 +123,85 @@ pub fn present(user_ptr: u64, user_len: usize) -> Result<(), &'static str> {
     }
     let user_addr = paging::checked_user_virt_addr(user_ptr)?;
 
-    // `RDTSC` is diagnostic only: it measures the copy cost without adding a
-    // timer interrupt, lock, allocation, or scheduler-policy dependency.
-    let started = unsafe { core::arch::x86_64::_rdtsc() };
-    let ok = crate::task::with_current_address_space(|space| {
-        // Full-range preflight happens before even borrowing the mutable
-        // framebuffer slice. The process's CR3 remains active throughout this
-        // non-preemptible syscall and a process has one userspace thread, so
-        // the mapping cannot change between validation and the copy.
-        if paging::validate_user_range(space, user_ptr, user_len, false).is_err() {
-            return false;
-        }
-        let Some(fb_buffer) = crate::framebuffer_console::raw_buffer_mut() else {
-            return false;
-        };
-        // Safety: the complete source was just validated PRESENT and
-        // USER_ACCESSIBLE in the active caller's address space. The source is
-        // a private user-region range and the destination is the disjoint
-        // kernel-owned framebuffer slice, both valid for exactly `user_len`.
-        // One contiguous copy avoids a second per-page page-table walk while
-        // preserving the all-validation-before-mutation contract.
+    // `RDTSC` is diagnostic only. Account active validation/copy critical
+    // sections, excluding time another task may run in an inter-chunk window.
+    let validation_started = unsafe { core::arch::x86_64::_rdtsc() };
+    if !crate::task::validate_current_user_range(user_ptr, user_len, false) {
+        return Err("invalid source buffer");
+    }
+    let validation_cycles =
+        unsafe { core::arch::x86_64::_rdtsc() }.saturating_sub(validation_started);
+
+    let fb_buffer = crate::framebuffer_console::raw_buffer_mut().ok_or("display not active")?;
+    let destination = fb_buffer.as_mut_ptr();
+    // End the slice borrow before opening any interrupt window. The raw
+    // framebuffer pointer is stable for the machine's lifetime.
+    let _ = fb_buffer;
+    // Safety: the complete source was just validated PRESENT and
+    // USER_ACCESSIBLE in the caller's address space. The source and the
+    // disjoint kernel framebuffer are valid for exactly `user_len` bytes.
+    let (copy_total_cycles, copy_max_cycles) =
+        unsafe { copy_framebuffer_bytes_batched(user_addr.as_ptr::<u8>(), destination, user_len) };
+
+    let total_cycles = validation_cycles.saturating_add(copy_total_cycles);
+    let max_cycles = validation_cycles.max(copy_max_cycles);
+    PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
+    PRESENT_TOTAL_CYCLES.fetch_add(total_cycles, Ordering::Relaxed);
+    update_max(&PRESENT_MAX_CYCLES, max_cycles);
+    Ok(())
+}
+
+/// Copy one already-validated, non-overlapping frame in bounded critical
+/// sections. Each chunk uses the x86 string engine; an `sti; nop; cli` window
+/// between chunks lets a pending timer/input IRQ run without extending any
+/// single interrupt-disabled copy across the full frame.
+///
+/// # Safety
+///
+/// `source` and `destination` must be valid for `len` bytes and must not
+/// overlap. The caller establishes those conditions immediately above.
+unsafe fn copy_framebuffer_bytes_batched(
+    source: *const u8,
+    destination: *mut u8,
+    len: usize,
+) -> (u64, u64) {
+    let mut copied = 0usize;
+    let mut total_cycles = 0u64;
+    let mut max_cycles = 0u64;
+    while copied < len {
+        let chunk_len = PRESENT_COPY_CHUNK.min(len - copied);
+        let qwords = chunk_len / core::mem::size_of::<u64>();
+        let tail = chunk_len % core::mem::size_of::<u64>();
+        let started = unsafe { core::arch::x86_64::_rdtsc() };
+        // Safety: the caller validated the whole frame and this chunk is
+        // bounded within it. CLD makes forward progress explicit.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                user_addr.as_ptr::<u8>(),
-                fb_buffer.as_mut_ptr(),
-                user_len,
+            core::arch::asm!(
+                "cld",
+                "rep movsq",
+                "mov rcx, rdx",
+                "rep movsb",
+                inout("rsi") source.add(copied) => _,
+                inout("rdi") destination.add(copied) => _,
+                inout("rcx") qwords => _,
+                in("rdx") tail,
+                options(nostack),
             );
         }
-        true
-    });
+        let cycles = unsafe { core::arch::x86_64::_rdtsc() }.saturating_sub(started);
+        total_cycles = total_cycles.saturating_add(cycles);
+        max_cycles = max_cycles.max(cycles);
+        copied += chunk_len;
 
-    match ok {
-        Some(true) => {
-            let cycles = unsafe { core::arch::x86_64::_rdtsc() }.saturating_sub(started);
-            PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
-            PRESENT_TOTAL_CYCLES.fetch_add(cycles, Ordering::Relaxed);
-            update_max(&PRESENT_MAX_CYCLES, cycles);
-            Ok(())
+        if copied < len {
+            // Safety: DISPLAY_PRESENT enters through an interrupt gate with IF
+            // clear and holds no scheduler/display lock here. If a pending IRQ
+            // preempts us after STI, the scheduler restores this task's CR3
+            // before the NOP/CLI continuation executes.
+            unsafe { core::arch::asm!("sti", "nop", "cli", options(nostack)) };
         }
-        Some(false) => Err("invalid source buffer"),
-        None => Err("current task is not a user process"),
     }
+    (total_cycles, max_cycles)
 }
 
 #[derive(Clone, Copy)]

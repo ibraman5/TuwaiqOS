@@ -703,13 +703,14 @@ owned into a controlled interface for Ring 3:
   exact, so a mismatched buffer is always rejected rather than silently
   truncated or read out of bounds); every page of the caller's buffer must
   be mapped `PRESENT | USER_ACCESSIBLE` in the caller's own address space.
-  A full-range preflight completes before the mutable physical framebuffer is
-  borrowed. The caller's CR3 remains active and its one userspace thread
-  cannot change mappings during this non-preemptible syscall; only then does
-  one contiguous copy update the disjoint kernel framebuffer. A bad later page
-  therefore changes zero framebuffer bytes. Avoiding both an intermediate
-  multi-megabyte `Vec` and a redundant second page-table walk keeps the
-  validated full-frame copy below one scheduler quantum in acceptance.
+  Only the foreground process may present. A full-range preflight completes
+  before the physical framebuffer is touched, so a bad later page changes zero
+  framebuffer bytes. The validated frame then copies in 64 KiB chunks with an
+  IRQ delivery window between chunks. The single-threaded caller cannot change
+  its mapping while suspended, its CR3 is restored before it resumes, and no
+  competing process can interleave a present. Avoiding both an intermediate
+  multi-megabyte `Vec` and a redundant second page-table walk keeps each
+  validation/copy critical section bounded without changing scheduler policy.
 - **Negative tests** (`bad_display.rs`): kernel, noncanonical, cross-page,
   unmapped, partially mapped, and wrong-sized buffers are rejected. The shell
   compares full-framebuffer checksums before/after the hostile process to prove
@@ -835,7 +836,9 @@ memory; fail with `-1`, never a kernel fault, on anything invalid.
 - `SYS_DISPLAY_PRESENT` requires an *exact* buffer-length match and a full
   per-page `PRESENT | USER_ACCESSIBLE` validation of the entire source
   range before copying anything -- an oversized, undersized, or partially
-  unmapped buffer is rejected outright.
+  unmapped buffer is rejected outright. Only the foreground process may
+  present, and validated copying opens interrupt windows between bounded
+  64 KiB chunks.
 - Every raw Ring 3 pointer goes through `VirtAddr::try_new`, private-user-range
   bounds, checked arithmetic, and complete page permission validation.
   `SYS_DISPLAY_INFO`/`SYS_INPUT_POLL` additionally require writable pages.
@@ -944,9 +947,12 @@ Measured dirty-candidate results before the final clean-commit rerun were:
   9.288 s while PIT advanced during both large syscalls. Critical sections
   averaged 21 milli-ticks (~0.21 ms); the observed QEMU/host tail was 5194
   milli-ticks (~51.9 ms), under the 100 ms hard gate;
-- after removing the redundant second page-table walk, full-frame present
-  measured 2821 milli-ticks (~28.2 ms) worst case, below one 50 ms scheduler
-  quantum. The desktop avoids presents entirely while idle;
+- after full-range preflight, full-frame present copies in 64 KiB batches with
+  interrupt windows between them. Only the foreground process may present, so
+  another process cannot interleave a competing frame. The acceptance gate
+  measures the longest validation/copy critical section against one 50 ms
+  scheduler quantum; the focused remeasurement was 1414 milli-ticks
+  (~14.1 ms). The desktop avoids presents entirely while idle;
 - the kernel build retained the pre-existing 9 warnings and added zero new
   warnings. Rust formatting and `git diff --check` are final gates.
 

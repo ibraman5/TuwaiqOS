@@ -338,6 +338,16 @@ fn sys_display_info(out_ptr: u64, out_len: u64) -> i64 {
 /// size match, checked arithmetic, per-page `PRESENT | USER_ACCESSIBLE`
 /// validation of the entire source range before a single byte is copied).
 fn sys_display_present(ptr: u64, len: u64) -> i64 {
+    let Some(caller_pid) = task::current_task_id() else {
+        return -1;
+    };
+    if crate::keyboard::foreground_process_id() != Some(caller_pid) {
+        crate::serial_println!(
+            "syscall: DISPLAY_PRESENT rejected -- pid {} is not foreground owner",
+            caller_pid
+        );
+        return -1;
+    }
     let Ok(len) = usize::try_from(len) else {
         return -1;
     };

@@ -1246,27 +1246,6 @@ pub fn validate_current_user_range(addr: u64, len: usize, writable: bool) -> boo
     .is_some()
 }
 
-/// Read-only access to the currently running task's own address space, for
-/// syscalls that need to hand it to a `paging::` function taking `&AddressSpace`
-/// directly (`display::present`) rather than going through one of the
-/// `copy_*_current_user` wrappers above. Runs the whole closure `f` inside
-/// `with_scheduler` so the reference stays valid and no other execution
-/// context can observe or mutate the scheduler state mid-call -- `f` must
-/// not itself try to re-enter the scheduler (call `with_scheduler`/anything
-/// built on it) or it will deadlock against itself, same caveat as every
-/// other `with_scheduler` closure in this module.
-pub fn with_current_address_space<R>(f: impl FnOnce(&paging::AddressSpace) -> R) -> Option<R> {
-    with_scheduler(|slot| {
-        let sched = slot.as_ref()?;
-        let space = sched.tasks[sched.current]
-            .process
-            .as_ref()?
-            .address_space
-            .as_ref()?;
-        Some(f(space))
-    })
-}
-
 /// Round `len` up to a whole number of 4 KiB pages -- shared by
 /// `mmap_in_current_process` and anywhere else that needs to turn a byte
 /// count into a page count. `None` on overflow (an absurd `len` close to

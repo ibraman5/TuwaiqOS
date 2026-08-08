@@ -1048,9 +1048,16 @@ fn handle_display_atomicity_test(mode: ConsoleMode) {
         return;
     };
 
-    let result = match task::spawn_user_process("bad_display", bytes) {
+    let spawn: Result<u32, &'static str> =
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let id = task::spawn_user_process("bad_display", bytes)?;
+            acquire_desktop_foreground(id);
+            Ok(id)
+        });
+    let result = match spawn {
         Ok(id) => {
             wait_for_terminated(id);
+            let _ = release_desktop_foreground(id);
             let checksum_after = crate::display::framebuffer_checksum();
             Some((id, checksum_after))
         }
