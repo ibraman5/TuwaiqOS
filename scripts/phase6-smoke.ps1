@@ -160,7 +160,7 @@ try {
     $MonitorWriter.AutoFlush = $true
 
     [void](Wait-Regex 'task heartbeat: beat #1(?:\r?\n|$)' 0 90)
-    [void](Wait-Regex 'vfs: mounted TuwaiqFS v2 at /' 0 5)
+    [void](Wait-Regex 'vfs: mounted TuwaiqFS v3 at /' 0 5)
     Add-Pass "boot and root mount" "kernel reached scheduler with TuwaiqFS mounted at /"
 
     $segment = Invoke-Command "vfstest" @('vfs: PASS', 'file-api: PASS') 120
