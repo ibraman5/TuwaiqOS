@@ -20,6 +20,7 @@ enum Entry {
     Dir { children: Vec<(String, Entry)> },
 }
 
+#[derive(Clone)]
 struct FileSystem {
     root: Entry,
 }
@@ -27,7 +28,7 @@ struct FileSystem {
 /// The in-memory tree is reachable from the shell and from preempted Ring-3
 /// syscalls. Every access therefore uses the same interrupt-safe lock.
 /// Expensive ATA I/O is never performed while this lock is held.
-static FS: Mutex<Option<FileSystem>> = Mutex::new(None);
+static FS: Mutex<Option<Arc<FileSystem>>> = Mutex::new(None);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryKind {
@@ -59,8 +60,9 @@ pub fn init() {
         },
     };
 
+    let root = Arc::new(FileSystem { root });
     interrupts::without_interrupts(|| {
-        *FS.lock() = Some(FileSystem { root });
+        *FS.lock() = Some(root);
     });
 }
 
@@ -96,11 +98,14 @@ fn with_fs<F, R>(f: F) -> Result<R, &'static str>
 where
     F: FnOnce(&FileSystem) -> Result<R, &'static str>,
 {
-    interrupts::without_interrupts(|| {
+    let snapshot = interrupts::without_interrupts(|| {
         let guard = FS.lock();
-        let fs = guard.as_ref().ok_or("filesystem not initialized")?;
-        f(fs)
-    })
+        guard
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or("filesystem not initialized")
+    })?;
+    f(&snapshot)
 }
 
 fn mutate_and_persist<F>(f: F) -> Result<(), &'static str>
@@ -108,23 +113,27 @@ where
     F: FnOnce(&mut FileSystem) -> Result<(), &'static str>,
 {
     // Phase 6 exposes no Ring-3 mutation syscall, so shell commands are the
-    // sole serialized writer. Clone only tree structure and Arc references
-    // while locked, then mutate and serialize the candidate with interrupts
+    // sole serialized writer. Clone only the root Arc while locked, then copy
+    // tree structure/Arc references, mutate, and serialize with interrupts
     // enabled. Publish it only after disk persistence succeeds: an ATA error
     // leaves the prior in-memory tree untouched.
-    let mut candidate = interrupts::without_interrupts(|| {
+    let snapshot = interrupts::without_interrupts(|| {
         let guard = FS.lock();
-        let fs = guard.as_ref().ok_or("filesystem not initialized")?;
-        Ok(FileSystem {
-            root: fs.root.clone(),
-        })
+        guard
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or("filesystem not initialized")
     })?;
+    let mut candidate = (*snapshot).clone();
     f(&mut candidate)?;
     tuwaiqfs::sync_tree(&to_fs_node(&candidate.root))?;
+    let published = Arc::new(candidate);
     interrupts::without_interrupts(|| {
         let mut guard = FS.lock();
-        let fs = guard.as_mut().ok_or("filesystem not initialized")?;
-        fs.root = candidate.root;
+        if guard.is_none() {
+            return Err("filesystem not initialized");
+        }
+        *guard = Some(published);
         Ok(())
     })
 }

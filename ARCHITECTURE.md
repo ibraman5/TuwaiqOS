@@ -995,12 +995,14 @@ private TuwaiqFS backend -> validated v2 serialization -> ATA PIO
   invalid UTF-8 path names. It caps metadata at 1,024 records and uses fallible
   parser growth. It never clamps an oversized length or accepts a valid prefix
   of a corrupt blob as a complete tree.
-- A shell mutation clones a lightweight candidate tree (file bodies are shared
-  immutable buffers), mutates and persists that candidate with interrupts
-  enabled, and publishes it under the VFS lock only after ATA success. An I/O
-  failure therefore leaves the prior in-memory namespace visible. The v2
-  single-copy disk format is not yet crash-transactional; journal/recovery
-  work remains in Phase 6.
+- Readers clone one immutable `Arc` tree snapshot inside the interrupt-safe
+  lock, then perform traversal and output allocation after interrupts are
+  restored. A shell mutation clones a lightweight candidate tree from that
+  snapshot (file bodies remain shared immutable buffers), mutates and persists
+  it with interrupts enabled, and publishes an already-built snapshot under
+  the VFS lock only after ATA success. An I/O failure therefore leaves the
+  prior in-memory namespace visible. The v2 single-copy disk format is not yet
+  crash-transactional; journal/recovery work remains in Phase 6.
 
 ### Current Ring 3 file/process ABI
 
@@ -1118,10 +1120,10 @@ The 2026-08-08 focused run actually demonstrated:
   scheduled, followed by normal desktop exit and a second warmed concurrent
   cycle;
 - exact warmed resource reuse: VFS test tasks `3->3`, live frames `1029->1029`,
-  frame bump `1045->1045`, heap `94264->94264`; assistant lifecycle tasks
-  `3->3`, frames `1029->1029`, bump `1045->1045`, heap `116336->116336`;
+  frame bump `1045->1045`, heap `94304->94304`; assistant lifecycle tasks
+  `3->3`, frames `1029->1029`, bump `1045->1045`, heap `116376->116376`;
   concurrent desktop/AI returned tasks `3->3`, frames `1029->1029`, bump
-  `1735->1735`, and heap `137192->137192` after its full warm cycle;
+  `1735->1735`, and heap `137232->137232` after its full warm cycle;
 - no kernel panic, kernel page fault, double fault, unexpected QEMU exit, or
   new compiler warning (the existing nine warnings remain).
 
