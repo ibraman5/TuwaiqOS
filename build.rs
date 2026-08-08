@@ -34,6 +34,7 @@ fn run() -> Result<(), String> {
 
     let kernel_elf = locate_kernel_elf(&manifest_dir, &target_dir, &profile)
         .ok_or_else(|| kernel_not_found_message(&manifest_dir, &target_dir, &profile))?;
+    println!("cargo:rerun-if-changed={}", kernel_elf.display());
 
     let image_dir = target_dir.join(&profile);
     let image = image_dir.join(IMAGE_NAME);
@@ -124,7 +125,10 @@ fn print_build_environment() {
     print_kv_optional("CARGO_MANIFEST_DIR", option_env("CARGO_MANIFEST_DIR"));
     print_kv_optional("CARGO_TARGET_DIR", option_env("CARGO_TARGET_DIR"));
 
-    if let Ok(output) = Command::new("rustup").args(["show", "active-toolchain"]).output() {
+    if let Ok(output) = Command::new("rustup")
+        .args(["show", "active-toolchain"])
+        .output()
+    {
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !text.is_empty() {
             println!("active_toolchain : {text}");
@@ -140,8 +144,12 @@ fn print_build_environment() {
 }
 
 fn verify_kernel_elf(path: &Path) -> Result<(), String> {
-    let metadata = fs::metadata(path)
-        .map_err(|e| format!("kernel ELF does not exist or is unreadable:\n  {}\n  {e}", path.display()))?;
+    let metadata = fs::metadata(path).map_err(|e| {
+        format!(
+            "kernel ELF does not exist or is unreadable:\n  {}\n  {e}",
+            path.display()
+        )
+    })?;
 
     if !metadata.is_file() {
         return Err(format!("kernel path is not a file:\n  {}", path.display()));
@@ -173,11 +181,9 @@ fn verify_llvm_objcopy() -> Result<(), String> {
                 println!("llvm-objcopy : {}", path.display());
                 Ok(())
             }
-            None => Err(
-                "llvm-objcopy not found in llvm-tools-preview.\n  \
+            None => Err("llvm-objcopy not found in llvm-tools-preview.\n  \
                  Run: rustup component add llvm-tools-preview --toolchain nightly-2026-06-01"
-                    .to_string(),
-            ),
+                .to_string()),
         },
         Err(err) => Err(format!(
             "failed to initialize llvm-tools:\n  {err:?}\n  \
@@ -210,7 +216,11 @@ fn locate_kernel_elf(manifest_dir: &Path, target_dir: &Path, profile: &str) -> O
 
     print_section("Kernel ELF search");
     for candidate in &candidates {
-        let status = if candidate.exists() { "FOUND" } else { "missing" };
+        let status = if candidate.exists() {
+            "FOUND"
+        } else {
+            "missing"
+        };
         println!("  [{status}] {}", candidate.display());
     }
 

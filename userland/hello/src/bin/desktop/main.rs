@@ -60,6 +60,12 @@ const LAUNCHER_X: i32 = 8;
 const LAUNCHER_Y: i32 = 4;
 const LAUNCHER_W: i32 = 96;
 const LAUNCHER_H: i32 = 20;
+const AI_LAUNCHER_X: i32 = 112;
+const AI_LAUNCHER_Y: i32 = 4;
+const AI_LAUNCHER_W: i32 = 176;
+const AI_LAUNCHER_H: i32 = 20;
+const AI_EXECUTABLE: &[u8] = b"/apps/tuwaiq-ai";
+const AI_WINDOW_TITLE: &[u8] = b"Tuwaiq AI - Preview";
 
 /// Rolling log of recently typed printable characters -- the desktop's
 /// visible proof that keyboard input actually reaches it (Milestone 6's
@@ -74,6 +80,9 @@ struct DesktopState {
     key_log: [u8; KEY_LOG_LEN],
     key_log_len: usize,
     next_panel: u32,
+    /// -2 = never requested, -1 = executable unavailable/rejected, >= 0 =
+    /// filesystem-backed assistant-service pid returned by SYS_SPAWN.
+    ai_service_pid: i64,
 }
 
 extern "C" fn rust_main() -> ! {
@@ -118,6 +127,7 @@ extern "C" fn rust_main() -> ! {
         key_log: [0; KEY_LOG_LEN],
         key_log_len: 0,
         next_panel: 1,
+        ai_service_pid: -2,
     };
 
     state.wm.spawn(120, 90, 340, 180, b"Welcome to TuwaiqOS");
@@ -233,6 +243,18 @@ fn on_left_button(state: &mut DesktopState, pressed: bool) {
         return;
     }
 
+    if point_in_rect(
+        state.cursor_x,
+        state.cursor_y,
+        AI_LAUNCHER_X,
+        AI_LAUNCHER_Y,
+        AI_LAUNCHER_W,
+        AI_LAUNCHER_H,
+    ) {
+        spawn_ai_preview(state);
+        return;
+    }
+
     match state.wm.handle_press(state.cursor_x, state.cursor_y) {
         PressAction::Closed { window_index } => emit_close_marker(window_index),
         PressAction::Raised { window_index } => {
@@ -312,6 +334,19 @@ fn spawn_panel(state: &mut DesktopState) {
     }
 }
 
+fn spawn_ai_preview(state: &mut DesktopState) {
+    let _ = state.wm.spawn(180, 100, 460, 220, AI_WINDOW_TITLE);
+    state.ai_service_pid = sys::spawn(AI_EXECUTABLE).map(i64::from).unwrap_or(-1);
+    if state.ai_service_pid >= 0 {
+        hello_user::write(b"desktop: Tuwaiq AI Preview service launched pid=");
+        let mut digits = [0u8; 20];
+        hello_user::write(u64_to_decimal(state.ai_service_pid as u64, &mut digits));
+        hello_user::write(b"\n");
+    } else {
+        hello_user::write(b"desktop: Tuwaiq AI Preview executable unavailable\n");
+    }
+}
+
 fn point_in_rect(px: i32, py: i32, x: i32, y: i32, w: i32, h: i32) -> bool {
     px >= x && px < x + w && py >= y && py < y + h
 }
@@ -329,7 +364,7 @@ fn redraw(canvas: &mut Canvas, state: &DesktopState, clock_second: u64) {
         if !window.visible {
             continue;
         }
-        draw_window(canvas, &window);
+        draw_window(canvas, &window, state.ai_service_pid);
     }
 
     if state.key_log_len > 0 {
@@ -375,6 +410,15 @@ fn draw_system_bar(canvas: &mut Canvas, width: i32, seconds: u64) {
         COLOR_LAUNCHER.1,
         COLOR_LAUNCHER.2,
     );
+    canvas.fill_rect(
+        AI_LAUNCHER_X,
+        AI_LAUNCHER_Y,
+        AI_LAUNCHER_W,
+        AI_LAUNCHER_H,
+        COLOR_LAUNCHER.0,
+        COLOR_LAUNCHER.1,
+        COLOR_LAUNCHER.2,
+    );
     canvas.draw_text(
         b"+ Launch",
         LAUNCHER_X + 6,
@@ -383,10 +427,18 @@ fn draw_system_bar(canvas: &mut Canvas, width: i32, seconds: u64) {
         COLOR_TEXT.1,
         COLOR_TEXT.2,
     );
+    canvas.draw_text(
+        b"Tuwaiq AI - Preview",
+        AI_LAUNCHER_X + 6,
+        AI_LAUNCHER_Y + 6,
+        COLOR_TEXT.0,
+        COLOR_TEXT.1,
+        COLOR_TEXT.2,
+    );
 
     canvas.draw_text(
         b"TuwaiqOS",
-        LAUNCHER_X + LAUNCHER_W + 20,
+        AI_LAUNCHER_X + AI_LAUNCHER_W + 20,
         LAUNCHER_Y + 6,
         COLOR_TEXT.0,
         COLOR_TEXT.1,
@@ -395,7 +447,7 @@ fn draw_system_bar(canvas: &mut Canvas, width: i32, seconds: u64) {
 
     canvas.draw_text(
         b"Esc: Exit",
-        LAUNCHER_X + LAUNCHER_W + 120,
+        AI_LAUNCHER_X + AI_LAUNCHER_W + 120,
         LAUNCHER_Y + 6,
         COLOR_TEXT_DIM.0,
         COLOR_TEXT_DIM.1,
@@ -424,7 +476,7 @@ fn draw_system_bar(canvas: &mut Canvas, width: i32, seconds: u64) {
     );
 }
 
-fn draw_window(canvas: &mut Canvas, window: &window::Window) {
+fn draw_window(canvas: &mut Canvas, window: &window::Window, ai_service_pid: i64) {
     canvas.fill_rect(
         window.x,
         window.y,
@@ -469,18 +521,76 @@ fn draw_window(canvas: &mut Canvas, window: &window::Window) {
         COLOR_CLOSE.1,
         COLOR_CLOSE.2,
     );
+    if window.title_bytes() == AI_WINDOW_TITLE {
+        draw_ai_preview(canvas, window, ai_service_pid);
+    } else {
+        canvas.draw_text(
+            b"Type to see keys echoed at the bottom of the screen.",
+            window.x + 10,
+            window.y + TITLE_BAR_HEIGHT + 16,
+            COLOR_TEXT_DIM.0,
+            COLOR_TEXT_DIM.1,
+            COLOR_TEXT_DIM.2,
+        );
+        canvas.draw_text(
+            b"Drag this title bar to move the window.",
+            window.x + 10,
+            window.y + TITLE_BAR_HEIGHT + 34,
+            COLOR_TEXT_DIM.0,
+            COLOR_TEXT_DIM.1,
+            COLOR_TEXT_DIM.2,
+        );
+    }
+}
+
+fn draw_ai_preview(canvas: &mut Canvas, window: &window::Window, pid: i64) {
+    let x = window.x + 10;
+    let mut y = window.y + TITLE_BAR_HEIGHT + 16;
     canvas.draw_text(
-        b"Type to see keys echoed at the bottom of the screen.",
-        window.x + 10,
-        window.y + TITLE_BAR_HEIGHT + 16,
+        b"Assistant UI: Ring 3 desktop",
+        x,
+        y,
+        COLOR_TEXT.0,
+        COLOR_TEXT.1,
+        COLOR_TEXT.2,
+    );
+    y += 18;
+    let status = if pid >= 0 {
+        b"Assistant service: launched from /apps" as &[u8]
+    } else {
+        b"Assistant service: unavailable (install required)" as &[u8]
+    };
+    canvas.draw_text(
+        status,
+        x,
+        y,
         COLOR_TEXT_DIM.0,
         COLOR_TEXT_DIM.1,
         COLOR_TEXT_DIM.2,
     );
+    y += 18;
     canvas.draw_text(
-        b"Drag this title bar to move the window.",
-        window.x + 10,
-        window.y + TITLE_BAR_HEIGHT + 34,
+        b"Local model: unavailable",
+        x,
+        y,
+        COLOR_TEXT_DIM.0,
+        COLOR_TEXT_DIM.1,
+        COLOR_TEXT_DIM.2,
+    );
+    y += 18;
+    canvas.draw_text(
+        b"No inference is simulated. No network or telemetry.",
+        x,
+        y,
+        COLOR_TEXT_DIM.0,
+        COLOR_TEXT_DIM.1,
+        COLOR_TEXT_DIM.2,
+    );
+    y += 18;
+    canvas.draw_text(
+        b"IPC, permissions, tools and audit: future phases",
+        x,
+        y,
         COLOR_TEXT_DIM.0,
         COLOR_TEXT_DIM.1,
         COLOR_TEXT_DIM.2,

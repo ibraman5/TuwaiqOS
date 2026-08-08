@@ -12,7 +12,6 @@ use bootloader_api::{info::MemoryRegionKind, BootInfo};
 use crate::ai_bridge;
 use crate::allocator;
 use crate::apps::{editor, monitor, notes};
-use crate::fs;
 use crate::interrupts;
 use crate::keyboard::{poll_key, KeyEvent};
 use crate::loader;
@@ -21,6 +20,7 @@ use crate::net;
 use crate::paging;
 use crate::reboot;
 use crate::task;
+use crate::vfs;
 
 // Diagnostics compile the exact userspace window-policy source rather than
 // maintaining a lookalike kernel test model. It is never used for rendering
@@ -214,7 +214,7 @@ fn tab_complete(mode: ConsoleMode, line: &mut [u8], len: usize) -> usize {
             }
         }
     }
-    if let Ok(files) = fs::completion_candidates(token) {
+    if let Ok(files) = vfs::completion_candidates(token) {
         for file in files {
             if file.starts_with(token) {
                 matches.push(file);
@@ -267,7 +267,7 @@ fn apply_completion(
 
 fn print_dynamic_prompt(mode: ConsoleMode) {
     let mut prompt = String::from("tuwaiq@os:");
-    match fs::pwd() {
+    match vfs::shell_pwd() {
         Ok(path) if path == "/" => prompt.push_str("~"),
         Ok(path) => prompt.push_str(&path),
         Err(_) => prompt.push('~'),
@@ -311,11 +311,16 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
                 println(mode, reason);
             }
         },
-        "pwd" => match fs::pwd() {
+        "pwd" => match vfs::shell_pwd() {
             Ok(path) => println(mode, &path),
             Err(reason) => print_fs_error(mode, reason),
         },
-        "ls" => match fs::ls() {
+        "cd" => handle_cd(mode, args),
+        "ls" => match vfs::shell_list(if args.trim().is_empty() {
+            None
+        } else {
+            Some(args.trim())
+        }) {
             Ok(entries) => print_entries(mode, entries),
             Err(reason) => print_fs_error(mode, reason),
         },
@@ -337,6 +342,11 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
         "editor" => handle_editor(mode, args),
         "monitor" => handle_monitor(boot_info, mode),
         "runelf" => handle_runelf(mode, args),
+        "runfs" => handle_runfs(mode, args),
+        "installapp" => handle_install_app(mode, args),
+        "vfstest" => handle_vfs_test(mode),
+        "aipreviewtest" => handle_ai_preview_test(mode),
+        "desktopaitest" => handle_desktop_ai_test(mode),
         "isolate" => handle_isolate(mode, args),
         "spawnfail" => handle_spawnfail(mode, args),
         "reap" => handle_reap(mode, args),
@@ -517,6 +527,18 @@ fn embedded_program(name: &str) -> Option<&'static [u8]> {
             env!("CARGO_MANIFEST_DIR"),
             "/../target/x86_64-unknown-none/release/desktop_peer"
         ))),
+        "file_api_test" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/file_api_test"
+        ))),
+        "tuwaiq_ai" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/tuwaiq_ai"
+        ))),
+        "tuwaiq_ai_fault" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/tuwaiq_ai_fault"
+        ))),
         _ => None,
     }
 }
@@ -542,6 +564,9 @@ fn embedded_program_names() -> &'static [&'static str] {
         "mmap_partial_failure",
         "desktop",
         "desktop_peer",
+        "file_api_test",
+        "tuwaiq_ai",
+        "tuwaiq_ai_fault",
     ]
 }
 
@@ -583,6 +608,338 @@ fn print_process_result(mode: ConsoleMode, id: u32) {
             println(mode, reason);
         }
     }
+}
+
+fn ensure_apps_directory() -> Result<(), &'static str> {
+    match vfs::kind("/", "/apps") {
+        Ok(vfs::NodeKind::Directory) => Ok(()),
+        Ok(vfs::NodeKind::File) => Err("/apps is not a directory"),
+        Err(_) => vfs::create_dir("/", "/apps"),
+    }
+}
+
+fn install_app(name: &str) -> Result<&'static str, &'static str> {
+    let (embedded_name, target) = match name {
+        "hello" => ("hello", "/apps/hello"),
+        "file-api-test" => ("file_api_test", "/apps/file-api-test"),
+        "tuwaiq-ai" => ("tuwaiq_ai", "/apps/tuwaiq-ai"),
+        "tuwaiq-ai-fault" => ("tuwaiq_ai_fault", "/apps/tuwaiq-ai-fault"),
+        _ => return Err("unknown provisionable application"),
+    };
+    let bytes = embedded_program(embedded_name).ok_or("embedded bootstrap image missing")?;
+    ensure_apps_directory()?;
+    vfs::write_file("/", target, bytes)?;
+    Ok(target)
+}
+
+fn handle_install_app(mode: ConsoleMode, args: &str) {
+    let name = args.trim();
+    if name.is_empty() {
+        println(
+            mode,
+            "Usage: installapp <hello|file-api-test|tuwaiq-ai|tuwaiq-ai-fault>",
+        );
+        return;
+    }
+    match install_app(name) {
+        Ok(path) => {
+            print(mode, "Installed bootstrap application at ");
+            println(mode, path);
+        }
+        Err(reason) => print_fs_error(mode, reason),
+    }
+}
+
+fn spawn_from_vfs(path: &str, cwd: &str) -> Result<u32, &'static str> {
+    let absolute = vfs::normalize(cwd, path)?;
+    let bytes = vfs::read_file("/", &absolute)?;
+    if bytes.is_empty() || bytes.len() > vfs::MAX_EXECUTABLE_SIZE {
+        return Err("invalid executable file size");
+    }
+    task::spawn_user_process_with_cwd(vfs::basename(&absolute), &bytes, cwd)
+}
+
+fn handle_runfs(mode: ConsoleMode, args: &str) {
+    let path = args.trim();
+    if path.is_empty() {
+        println(mode, "Usage: runfs <path>");
+        return;
+    }
+    let Ok(cwd) = vfs::shell_pwd() else {
+        print_fs_error(mode, "VFS not initialized");
+        return;
+    };
+    match spawn_from_vfs(path, &cwd) {
+        Ok(id) => {
+            print(mode, "Spawned filesystem ELF pid ");
+            print_u64(mode, id as u64);
+            println(mode, "");
+            wait_for_terminated(id);
+            print_process_result(mode, id);
+        }
+        Err(reason) => {
+            print(mode, "Filesystem process load error: ");
+            println(mode, reason);
+        }
+    }
+}
+
+fn handle_vfs_test(mode: ConsoleMode) {
+    if let Err(reason) = vfs::self_test() {
+        print(mode, "vfs: FAIL path semantics: ");
+        println(mode, reason);
+        return;
+    }
+    match vfs::kind("/", "/phase6-test") {
+        Ok(vfs::NodeKind::Directory) => {}
+        Ok(vfs::NodeKind::File) => {
+            println(mode, "vfs: FAIL /phase6-test is a file");
+            return;
+        }
+        Err(_) => {
+            if let Err(reason) = vfs::create_dir("/", "/phase6-test") {
+                print_fs_error(mode, reason);
+                return;
+            }
+        }
+    }
+    if let Err(reason) = vfs::write_file("/", "/phase6-test/data.txt", b"phase6-data") {
+        print_fs_error(mode, reason);
+        return;
+    }
+    let path = match install_app("file-api-test") {
+        Ok(path) => path,
+        Err(reason) => {
+            print_fs_error(mode, reason);
+            return;
+        }
+    };
+    let warmup = match spawn_from_vfs(path, "/phase6-test") {
+        Ok(id) => id,
+        Err(reason) => {
+            print(mode, "vfs: FAIL filesystem-backed warmup: ");
+            println(mode, reason);
+            return;
+        }
+    };
+    wait_for_terminated(warmup);
+    if task::info(warmup).ok().and_then(|info| info.exit_code) != Some(0) {
+        println(mode, "vfs: FAIL warmup exit");
+        return;
+    }
+    task::reap_now();
+    let before = desktop_lifecycle_stats();
+    let id = match spawn_from_vfs(path, "/phase6-test") {
+        Ok(id) => id,
+        Err(reason) => {
+            print(mode, "vfs: FAIL filesystem-backed spawn: ");
+            println(mode, reason);
+            return;
+        }
+    };
+    wait_for_terminated(id);
+    let exit = task::info(id).ok().and_then(|info| info.exit_code);
+    task::reap_now();
+    let after = desktop_lifecycle_stats();
+    let resources_ok = before.tasks == after.tasks
+        && before.frame_bump == after.frame_bump
+        && before.live_frames == after.live_frames
+        && before.heap_used == after.heap_used;
+    println(
+        mode,
+        &format!(
+            "vfs: {} normalized-paths per-process-cwd read-handles filesystem-elf exit-cleanup exit_code={} tasks={}->{} frames={}->{} bump={}->{} heap={}->{}",
+            if exit == Some(0) && resources_ok { "PASS" } else { "FAIL" },
+            exit.map(i64::from).unwrap_or(-1),
+            before.tasks,
+            after.tasks,
+            before.live_frames,
+            after.live_frames,
+            before.frame_bump,
+            after.frame_bump,
+            before.heap_used,
+            after.heap_used
+        ),
+    );
+}
+
+fn run_vfs_process_to_exit(path: &str, expected: i32) -> Result<bool, &'static str> {
+    let id = spawn_from_vfs(path, "/")?;
+    wait_for_terminated(id);
+    Ok(task::info(id).ok().and_then(|info| info.exit_code) == Some(expected))
+}
+
+fn handle_ai_preview_test(mode: ConsoleMode) {
+    let good = match install_app("tuwaiq-ai") {
+        Ok(path) => path,
+        Err(reason) => {
+            print_fs_error(mode, reason);
+            return;
+        }
+    };
+    let fault = match install_app("tuwaiq-ai-fault") {
+        Ok(path) => path,
+        Err(reason) => {
+            print_fs_error(mode, reason);
+            return;
+        }
+    };
+
+    // Warm every measured process/fault shape before taking a leak baseline.
+    // The first CPL3 exception path grows small reusable formatter/allocator
+    // state, so warming only the successful provider makes that one-time
+    // allocation look like a per-cycle leak.
+    if run_vfs_process_to_exit(good, 0) != Ok(true)
+        || run_vfs_process_to_exit(fault, 132) != Ok(true)
+        || run_vfs_process_to_exit(good, 0) != Ok(true)
+    {
+        println(mode, "ai-preview: FAIL warmup");
+        return;
+    }
+    task::reap_now();
+    let before = desktop_lifecycle_stats();
+    let behavior_ok = run_vfs_process_to_exit(good, 0) == Ok(true)
+        && run_vfs_process_to_exit(fault, 132) == Ok(true)
+        && run_vfs_process_to_exit(good, 0) == Ok(true);
+    task::reap_now();
+    let after = desktop_lifecycle_stats();
+    let resources_ok = before.tasks == after.tasks
+        && before.frame_bump == after.frame_bump
+        && before.live_frames == after.live_frames
+        && before.heap_used == after.heap_used;
+    println(
+        mode,
+        &format!(
+            "ai-preview: {} ring3 lifecycle crash-isolation relaunch resources tasks={}->{} frames={}->{} bump={}->{} heap={}->{}",
+            if behavior_ok && resources_ok { "PASS" } else { "FAIL" },
+            before.tasks,
+            after.tasks,
+            before.live_frames,
+            after.live_frames,
+            before.frame_bump,
+            after.frame_bump,
+            before.heap_used,
+            after.heap_used
+        ),
+    );
+}
+
+fn handle_desktop_ai_test(mode: ConsoleMode) {
+    if let Err(reason) = install_app("tuwaiq-ai") {
+        print_fs_error(mode, reason);
+        return;
+    }
+    let Some(desktop) = embedded_program("desktop") else {
+        println(mode, "desktop AI preview: FAIL embedded desktop missing");
+        return;
+    };
+
+    // Warm the complete concurrent shape, not merely each process in
+    // isolation. Its first peak may grow reusable frame/allocator pools.
+    if run_desktop_ai_cycle(desktop, false).is_err() {
+        println(mode, "desktop AI preview: FAIL warmup");
+        return;
+    }
+    task::reap_now();
+    let before = desktop_lifecycle_stats();
+    let Ok(cycle) = run_desktop_ai_cycle(desktop, true) else {
+        println(mode, "desktop AI preview: FAIL measured cycle");
+        return;
+    };
+    task::reap_now();
+    let after = desktop_lifecycle_stats();
+    let resources_ok = before.tasks == after.tasks
+        && before.frame_bump == after.frame_bump
+        && before.live_frames == after.live_frames
+        && before.heap_used == after.heap_used;
+    println(
+        mode,
+        &format!(
+            "desktop AI preview: {} click={} service_exit={:?} desktop_exit={:?} dropped={} tasks={}->{} frames={}->{} bump={}->{} heap={}->{}",
+            if cycle.click_ok
+                && cycle.service_exit == Some(0)
+                && cycle.desktop_exit == Some(0)
+                && cycle.dropped_events == 0
+                && resources_ok
+            {
+                "PASS"
+            } else {
+                "FAIL"
+            },
+            cycle.click_ok,
+            cycle.service_exit,
+            cycle.desktop_exit,
+            cycle.dropped_events,
+            before.tasks,
+            after.tasks,
+            before.live_frames,
+            after.live_frames,
+            before.frame_bump,
+            after.frame_bump,
+            before.heap_used,
+            after.heap_used
+        ),
+    );
+}
+
+struct DesktopAiCycle {
+    click_ok: bool,
+    service_exit: Option<i32>,
+    desktop_exit: Option<i32>,
+    dropped_events: u64,
+}
+
+fn run_desktop_ai_cycle(
+    desktop: &'static [u8],
+    expose_evidence_window: bool,
+) -> Result<DesktopAiCycle, &'static str> {
+    let presents_before = crate::display::present_telemetry().count;
+    let desktop_id = spawn_foreground_process("desktop-ai-preview", desktop)?;
+    if !wait_for_desktop_present(desktop_id, presents_before, 500) {
+        let _ = task::kill(desktop_id);
+        let _ = release_desktop_foreground(desktop_id);
+        task::reap_now();
+        return Err("desktop first present timed out");
+    }
+
+    let click = x86_64::instructions::interrupts::without_interrupts(|| {
+        inject_mouse_to(160, 12, 0)?;
+        crate::mouse::inject_screen_packet(0, 0, 1)?;
+        crate::mouse::inject_screen_packet(0, 0, 0)
+    });
+    let deadline = interrupts::ticks().saturating_add(500);
+    let mut service_exit = None;
+    while interrupts::ticks() < deadline {
+        service_exit = task::list().ok().and_then(|tasks| {
+            tasks
+                .into_iter()
+                .find(|entry| entry.name == "tuwaiq-ai")
+                .and_then(|entry| entry.exit_code)
+        });
+        if service_exit.is_some() {
+            break;
+        }
+        task::yield_now();
+    }
+    if expose_evidence_window {
+        crate::serial_println!(
+            "desktop-ai-preview: window visible service_exit={:?}",
+            service_exit
+        );
+        // Keep the real preview visible long enough for the project-side
+        // harness to capture it before requesting normal desktop exit.
+        task::sleep_ticks(200);
+    }
+    crate::input::push_key_event(KeyEvent::Escape);
+    wait_for_terminated(desktop_id);
+    let desktop_exit = task::info(desktop_id).ok().and_then(|info| info.exit_code);
+    let telemetry = release_desktop_foreground(desktop_id);
+    Ok(DesktopAiCycle {
+        click_ok: click.is_ok(),
+        service_exit,
+        desktop_exit,
+        dropped_events: telemetry.dropped_events,
+    })
 }
 
 /// `runelf <name>` -- loads one of the embedded ELF64 test programs as a
@@ -1443,7 +1800,14 @@ fn inject_mouse_to(x: i32, y: i32, buttons: u8) -> Result<(), &'static str> {
         let dx = (x - current_x).clamp(-255, 255);
         let dy = (y - current_y).clamp(-255, 255);
         if dx == 0 && dy == 0 {
-            return crate::mouse::inject_screen_packet(0, 0, buttons);
+            // A fresh desktop initializes its private cursor at screen
+            // center. If the global decoder is already at the requested
+            // target from a prior cycle, a zero-delta packet emits no move
+            // event and button edges would be interpreted at that stale
+            // private coordinate. An away-and-back pair traverses the real
+            // packet decoder/queue and deterministically synchronizes it.
+            crate::mouse::inject_screen_packet(1, 0, buttons)?;
+            return crate::mouse::inject_screen_packet(-1, 0, buttons);
         }
         crate::mouse::inject_screen_packet(dx as i16, dy as i16, buttons)?;
     }
@@ -1815,13 +2179,25 @@ fn handle_mouse_test(mode: ConsoleMode) {
     }
 }
 
+fn handle_cd(mode: ConsoleMode, args: &str) {
+    let path = args.trim();
+    if path.is_empty() {
+        println(mode, "Usage: cd <path>");
+        return;
+    }
+    match vfs::shell_chdir(path) {
+        Ok(_) => {}
+        Err(reason) => print_fs_error(mode, reason),
+    }
+}
+
 fn handle_touch(mode: ConsoleMode, args: &str) {
     let name = args.trim();
     if name.is_empty() {
         println(mode, "Usage: touch <name>");
         return;
     }
-    match fs::touch(name) {
+    match vfs::shell_create_file(name) {
         Ok(()) => {
             print(mode, "Created file: ");
             println(mode, name);
@@ -1836,7 +2212,7 @@ fn handle_mkdir(mode: ConsoleMode, args: &str) {
         println(mode, "Usage: mkdir <name>");
         return;
     }
-    match fs::mkdir(name) {
+    match vfs::shell_create_dir(name) {
         Ok(()) => {
             print(mode, "Created directory: ");
             println(mode, name);
@@ -1851,7 +2227,7 @@ fn handle_cat(mode: ConsoleMode, args: &str) {
         println(mode, "Usage: cat <name>");
         return;
     }
-    match fs::cat(name) {
+    match vfs::shell_read(name) {
         Ok(content) => println(mode, &content),
         Err(reason) => print_fs_error(mode, reason),
     }
@@ -1862,7 +2238,7 @@ fn handle_write(mode: ConsoleMode, args: &str) {
         println(mode, "Usage: write <name> <text>");
         return;
     };
-    match fs::write(name, text) {
+    match vfs::shell_write(name, text) {
         Ok(()) => {
             print(mode, "Wrote to: ");
             println(mode, name);
@@ -2087,7 +2463,10 @@ fn print_help(mode: ConsoleMode) {
     );
     println(mode, "  uptime | reboot | clear | cls | echo <text>");
     println(mode, "  meminfo | memtest");
-    println(mode, "  ls | pwd | touch | mkdir | cat | write");
+    println(
+        mode,
+        "  ls [path] | pwd | cd <path> | touch | mkdir | cat | write",
+    );
     println(mode, "  ps | taskinfo | kill | yield | net status | ping");
     println(mode, "  run <program> | notes | editor");
     println(
@@ -2102,6 +2481,8 @@ fn print_help(mode: ConsoleMode) {
         mode,
         "         mmap_nx_fault|post_unmap_fault|mmap_exhaustion|mmap_partial_failure|desktop|desktop_peer>",
     );
+    println(mode, "  installapp <name> | runfs <path> | vfstest");
+    println(mode, "  aipreviewtest | desktopaitest");
     println(mode, "  isolate [bad_program]");
     println(mode, "  spawnfail <count>");
     println(mode, "  reap <count>");
@@ -2165,7 +2546,7 @@ fn print_sysinfo(boot_info: &BootInfo, mode: ConsoleMode) {
         println(mode, "inactive (static-array heap fallback)");
     }
     print(mode, "  Filesystem: ");
-    println(mode, fs::label());
+    println(mode, crate::fs::label());
     println(
         mode,
         "  Tasks: preemptive scheduler (round-robin, 50ms slices)",
@@ -2201,6 +2582,7 @@ fn command_names() -> &'static [&'static str] {
         "memtest",
         "ls",
         "pwd",
+        "cd",
         "touch",
         "mkdir",
         "cat",
@@ -2215,6 +2597,11 @@ fn command_names() -> &'static [&'static str] {
         "notes",
         "editor",
         "runelf",
+        "runfs",
+        "installapp",
+        "vfstest",
+        "aipreviewtest",
+        "desktopaitest",
         "isolate",
         "spawnfail",
         "reap",

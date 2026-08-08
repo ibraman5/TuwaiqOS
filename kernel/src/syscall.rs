@@ -24,6 +24,12 @@
 //! | 7 | DISPLAY_PRESENT| `ptr: *u8, len: usize`        | `0`, or `-1`                 |
 //! | 8 | INPUT_POLL     | `out_ptr: *mut u8, out_len`   | `1` (event written)/`0`/`-1` |
 //! | 9 | UPTIME_TICKS   | --                             | PIT ticks since boot         |
+//! |10 | CHDIR          | `path_ptr, path_len`           | `0`, or `-1`                 |
+//! |11 | GETCWD         | `out_ptr, out_len`             | path bytes, or `-1`          |
+//! |12 | OPEN           | `path_ptr, path_len`           | read handle, or `-1`         |
+//! |13 | READ           | `handle, out_ptr, out_len`     | bytes read, or `-1`          |
+//! |14 | CLOSE          | `handle`                       | `0`, or `-1`                 |
+//! |15 | SPAWN          | `path_ptr, path_len`           | child pid, or `-1`           |
 //!
 //! (Phase 5 -- see `ARCHITECTURE.md`'s "Phase 5: userland runtime and the
 //! first graphical desktop" section for the design behind 4-9.)
@@ -50,7 +56,8 @@
 //!
 //! ## Pointer validation
 //!
-//! `WRITE`, `MUNMAP`, `DISPLAY_INFO`, `DISPLAY_PRESENT`, and `INPUT_POLL`
+//! `WRITE`, `MUNMAP`, `DISPLAY_INFO`, `DISPLAY_PRESENT`, `INPUT_POLL`, and
+//! the Phase 6 path/file calls
 //! accept Ring-3-supplied addresses. Every raw address is converted with the
 //! fallible `VirtAddr::try_new` path, constrained to the private user region,
 //! checked for range overflow, and walked through the calling process's own
@@ -70,12 +77,19 @@ const SYS_DISPLAY_INFO: u64 = 6;
 const SYS_DISPLAY_PRESENT: u64 = 7;
 const SYS_INPUT_POLL: u64 = 8;
 const SYS_UPTIME_TICKS: u64 = 9;
+const SYS_CHDIR: u64 = 10;
+const SYS_GETCWD: u64 = 11;
+const SYS_OPEN: u64 = 12;
+const SYS_READ: u64 = 13;
+const SYS_CLOSE: u64 = 14;
+const SYS_SPAWN: u64 = 15;
 
 /// Upper bound on a single `WRITE`'s length -- generous for this ABI's
 /// only real use (a handful of short diagnostic lines from `hello_user`),
 /// and a firm cap on how much a single syscall can make the kernel copy on
 /// a caller's behalf regardless of what `len` claims.
 const MAX_WRITE_LEN: usize = 4096;
+const MAX_FILE_IO_LEN: usize = 4096;
 
 /// The 15 general-purpose registers `syscall_entry` saves, in the exact
 /// order they land in memory (lowest address first) given the push order
@@ -173,7 +187,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
 /// dispatch signature (matching the ABI's documented three-argument shape)
 /// rather than dropped, so adding a syscall that needs it later doesn't
 /// require threading a new parameter through here.
-fn dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> i64 {
+fn dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     match num {
         SYS_EXIT => sys_exit(a1 as i32),
         SYS_WRITE => sys_write(a1, a2),
@@ -185,6 +199,12 @@ fn dispatch(num: u64, a1: u64, a2: u64, _a3: u64) -> i64 {
         SYS_DISPLAY_PRESENT => sys_display_present(a1, a2),
         SYS_INPUT_POLL => sys_input_poll(a1, a2),
         SYS_UPTIME_TICKS => sys_uptime_ticks(),
+        SYS_CHDIR => sys_chdir(a1, a2),
+        SYS_GETCWD => sys_getcwd(a1, a2),
+        SYS_OPEN => sys_open(a1, a2),
+        SYS_READ => sys_read(a1, a2, a3),
+        SYS_CLOSE => sys_close(a1),
+        SYS_SPAWN => sys_spawn(a1, a2),
         _ => {
             // Exactly the "unknown syscall numbers must fail safely"
             // requirement: logged for visibility, a plain error return,
@@ -389,4 +409,125 @@ fn sys_input_poll(out_ptr: u64, out_len: u64) -> i64 {
 
 fn sys_uptime_ticks() -> i64 {
     crate::interrupts::ticks() as i64
+}
+
+fn copy_user_path(ptr: u64, len: u64) -> Option<alloc::string::String> {
+    let len = usize::try_from(len).ok()?;
+    if len == 0 || len > crate::vfs::PATH_MAX {
+        return None;
+    }
+    let bytes = task::copy_from_current_user(ptr, len)?;
+    let path = core::str::from_utf8(&bytes).ok()?;
+    Some(alloc::string::String::from(path))
+}
+
+fn sys_chdir(path_ptr: u64, path_len: u64) -> i64 {
+    let Some(path) = copy_user_path(path_ptr, path_len) else {
+        return -1;
+    };
+    let Some(cwd) = task::current_working_directory() else {
+        return -1;
+    };
+    let Ok(target) = crate::vfs::normalize(&cwd, &path) else {
+        return -1;
+    };
+    if crate::vfs::kind("/", &target) != Ok(crate::vfs::NodeKind::Directory) {
+        return -1;
+    }
+    if task::set_current_working_directory(target) {
+        0
+    } else {
+        -1
+    }
+}
+
+fn sys_getcwd(out_ptr: u64, out_len: u64) -> i64 {
+    let Some(cwd) = task::current_working_directory() else {
+        return -1;
+    };
+    let Ok(out_len) = usize::try_from(out_len) else {
+        return -1;
+    };
+    if out_len < cwd.len() || !task::copy_to_current_user(out_ptr, cwd.as_bytes()) {
+        return -1;
+    }
+    cwd.len() as i64
+}
+
+fn sys_open(path_ptr: u64, path_len: u64) -> i64 {
+    let Some(path) = copy_user_path(path_ptr, path_len) else {
+        return -1;
+    };
+    let Some(cwd) = task::current_working_directory() else {
+        return -1;
+    };
+    let Ok(bytes) = crate::vfs::read_file(&cwd, &path) else {
+        return -1;
+    };
+    task::open_file_for_current_process(bytes)
+        .map(i64::from)
+        .unwrap_or(-1)
+}
+
+fn sys_read(handle: u64, out_ptr: u64, out_len: u64) -> i64 {
+    let Ok(handle) = u32::try_from(handle) else {
+        return -1;
+    };
+    let Ok(out_len) = usize::try_from(out_len) else {
+        return -1;
+    };
+    if out_len > MAX_FILE_IO_LEN {
+        return -1;
+    }
+    // Validate the complete caller-requested destination before observing or
+    // advancing the file description. This also validates zero-length
+    // pointers; a rejected copy consumes no file data.
+    if !task::validate_current_user_range(out_ptr, out_len, true) {
+        return -1;
+    }
+    let Some((data, start, end)) = task::peek_file_for_current_process(handle, out_len) else {
+        return -1;
+    };
+    let bytes = &data[start..end];
+    if !bytes.is_empty() && !task::copy_to_current_user(out_ptr, bytes) {
+        return -1;
+    }
+    if !task::advance_file_for_current_process(handle, bytes.len()) {
+        return -1;
+    }
+    bytes.len() as i64
+}
+
+fn sys_close(handle: u64) -> i64 {
+    let Ok(handle) = u32::try_from(handle) else {
+        return -1;
+    };
+    if task::close_file_for_current_process(handle) {
+        0
+    } else {
+        -1
+    }
+}
+
+fn sys_spawn(path_ptr: u64, path_len: u64) -> i64 {
+    let Some(path) = copy_user_path(path_ptr, path_len) else {
+        return -1;
+    };
+    let Some(cwd) = task::current_working_directory() else {
+        return -1;
+    };
+    let Ok(absolute) = crate::vfs::normalize(&cwd, &path) else {
+        return -1;
+    };
+    let Ok(bytes) = crate::vfs::read_file("/", &absolute) else {
+        return -1;
+    };
+    if bytes.is_empty() || bytes.len() > crate::vfs::MAX_EXECUTABLE_SIZE {
+        return -1;
+    }
+
+    let name = crate::vfs::basename(&absolute);
+    task::spawn_user_process_with_cwd(name, &bytes, &cwd)
+        .map(i64::from)
+        .unwrap_or(-1)
 }

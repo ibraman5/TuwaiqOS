@@ -7,7 +7,7 @@
 
 use hello_user::{
     syscall, SYS_DISPLAY_INFO, SYS_DISPLAY_PRESENT, SYS_EXIT, SYS_INPUT_POLL, SYS_MMAP, SYS_MUNMAP,
-    SYS_UPTIME_TICKS, SYS_YIELD,
+    SYS_SPAWN, SYS_UPTIME_TICKS, SYS_YIELD,
 };
 
 pub const KEY_ESCAPE: u8 = 0x1B;
@@ -113,6 +113,13 @@ pub fn yield_now() {
     unsafe {
         syscall(SYS_YIELD, 0, 0, 0);
     }
+}
+
+/// Launch a filesystem-backed Ring-3 process. This preview uses it only for
+/// `/apps/tuwaiq-ai`; the kernel still validates and parses the path and ELF.
+pub fn spawn(path: &[u8]) -> Option<u32> {
+    let result = unsafe { syscall(SYS_SPAWN, path.as_ptr() as u64, path.len() as u64, 0) };
+    u32::try_from(result).ok()
 }
 
 pub fn exit(code: i64) -> ! {

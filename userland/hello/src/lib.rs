@@ -19,6 +19,12 @@ pub const SYS_DISPLAY_INFO: u64 = 6;
 pub const SYS_DISPLAY_PRESENT: u64 = 7;
 pub const SYS_INPUT_POLL: u64 = 8;
 pub const SYS_UPTIME_TICKS: u64 = 9;
+pub const SYS_CHDIR: u64 = 10;
+pub const SYS_GETCWD: u64 = 11;
+pub const SYS_OPEN: u64 = 12;
+pub const SYS_READ: u64 = 13;
+pub const SYS_CLOSE: u64 = 14;
+pub const SYS_SPAWN: u64 = 15;
 
 /// # Safety
 /// Caller is responsible for `num`/`a1`/`a2`/`a3` meaning what the

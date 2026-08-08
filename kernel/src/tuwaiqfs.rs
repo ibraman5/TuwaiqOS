@@ -40,8 +40,14 @@ pub const SUPERBLOCK_LBA: u32 = 8192;
 pub const METADATA_LBA: u32 = 8465;
 pub const METADATA_SECTORS: u32 = 248;
 pub const MAX_METADATA_BYTES: usize = (METADATA_SECTORS * 512) as usize;
-pub const MAX_FILE_SIZE: usize = 2048;
+/// The v2 record format stores file length as a little-endian `u16`.
+/// Keeping the limit at that format boundary preserves compatibility with
+/// every existing v2 volume while allowing native ELF files to be stored.
+pub const MAX_FILE_SIZE: usize = u16::MAX as usize;
 pub const VERSION: u32 = 2;
+/// Bounds parser-owned node allocations independently of metadata byte size.
+/// Existing volumes produced by TuwaiqOS remain far below this limit.
+const MAX_NODE_COUNT: usize = 1024;
 
 const MAGIC: [u8; 8] = *b"TQFSv2\0\0";
 const TREE_MAGIC: [u8; 4] = *b"TREE";
@@ -51,7 +57,7 @@ const SB_METADATA_LEN_OFFSET: usize = 20;
 
 /// Serialized node loaded from or written to disk.
 pub enum FsNode {
-    File { content: String },
+    File { content: Vec<u8> },
     Dir { children: Vec<(String, FsNode)> },
 }
 
@@ -66,7 +72,17 @@ pub fn mount() -> Result<FsNode, &'static str> {
         return Ok(empty_root());
     }
 
+    let version = u32::from_le_bytes(superblock[8..12].try_into().unwrap());
+    let metadata_lba = u32::from_le_bytes(superblock[12..16].try_into().unwrap());
+    let metadata_sectors = u32::from_le_bytes(superblock[16..20].try_into().unwrap());
+    if version != VERSION || metadata_lba != METADATA_LBA || metadata_sectors != METADATA_SECTORS {
+        return Err("invalid TuwaiqFS superblock geometry or version");
+    }
+
     let metadata_len = read_metadata_len(&superblock);
+    if metadata_len > MAX_METADATA_BYTES {
+        return Err("TuwaiqFS metadata length exceeds reserved region");
+    }
     crate::serial_println!(
         "tuwaiqfs: mounting existing tree, {} bytes of metadata",
         metadata_len
@@ -173,7 +189,7 @@ fn write_record(
     out: &mut Vec<u8>,
     kind: u8,
     path: &str,
-    content: Option<&String>,
+    content: Option<&[u8]>,
 ) -> Result<(), &'static str> {
     let path_bytes = path.as_bytes();
     if path_bytes.is_empty() || path_bytes.len() > 120 {
@@ -183,8 +199,7 @@ fn write_record(
     out.push(path_bytes.len() as u8);
     out.extend_from_slice(path_bytes);
     if kind == 1 {
-        let text = content.ok_or("missing file content")?;
-        let bytes = text.as_bytes();
+        let bytes = content.ok_or("missing file content")?;
         if bytes.len() > MAX_FILE_SIZE {
             return Err("file too large");
         }
@@ -198,20 +213,26 @@ fn write_record(
 fn deserialize_tree(data: &[u8]) -> Result<FsNode, &'static str> {
     let mut root = empty_root();
     let mut offset = 0;
+    let mut node_count = 0usize;
 
     while offset < data.len() {
+        node_count = node_count.checked_add(1).ok_or("node count overflow")?;
+        if node_count > MAX_NODE_COUNT {
+            return Err("too many metadata records");
+        }
         if offset + 2 > data.len() {
-            break;
+            return Err("truncated record header");
         }
         let kind = data[offset];
         let path_len = data[offset + 1] as usize;
         offset += 2;
 
         if offset + path_len > data.len() {
-            break;
+            return Err("truncated record path");
         }
         let path = core::str::from_utf8(&data[offset..offset + path_len])
             .map_err(|_| "invalid path in metadata")?;
+        validate_metadata_path(path)?;
         offset += path_len;
 
         let node = if kind == 1 {
@@ -223,12 +244,13 @@ fn deserialize_tree(data: &[u8]) -> Result<FsNode, &'static str> {
             if offset + content_len > data.len() {
                 return Err("truncated file content");
             }
-            let content = core::str::from_utf8(&data[offset..offset + content_len])
-                .map_err(|_| "invalid utf-8 in file")?;
+            let mut content = Vec::new();
+            content
+                .try_reserve_exact(content_len)
+                .map_err(|_| "file content allocation failed")?;
+            content.extend_from_slice(&data[offset..offset + content_len]);
             offset += content_len;
-            FsNode::File {
-                content: String::from(content),
-            }
+            FsNode::File { content }
         } else if kind == 2 {
             FsNode::Dir {
                 children: Vec::new(),
@@ -244,7 +266,11 @@ fn deserialize_tree(data: &[u8]) -> Result<FsNode, &'static str> {
 }
 
 fn insert_at_path(root: &mut FsNode, path: &str, node: FsNode) -> Result<(), &'static str> {
-    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let mut parts = Vec::new();
+    parts
+        .try_reserve_exact(path.bytes().filter(|byte| *byte == b'/').count() + 1)
+        .map_err(|_| "metadata path allocation failed")?;
+    parts.extend(path.split('/').filter(|part| !part.is_empty()));
     if parts.is_empty() {
         return Ok(());
     }
@@ -255,26 +281,53 @@ fn insert_at_path(root: &mut FsNode, path: &str, node: FsNode) -> Result<(), &'s
         match current {
             FsNode::Dir { children } => {
                 if is_last {
-                    if let Some(pos) = children.iter().position(|(n, _)| n == part) {
-                        children[pos].1 = node;
-                    } else {
-                        children.push((String::from(*part), node));
+                    if children.iter().any(|(name, _)| name == part) {
+                        return Err("duplicate metadata path");
                     }
+                    children
+                        .try_reserve(1)
+                        .map_err(|_| "metadata child allocation failed")?;
+                    children.push((try_owned_name(part)?, node));
                     return Ok(());
                 }
 
-                if !children.iter().any(|(n, _)| n == part) {
-                    children.push((
-                        String::from(*part),
-                        FsNode::Dir {
-                            children: Vec::new(),
-                        },
-                    ));
-                }
-                let pos = children.iter().position(|(n, _)| n == part).unwrap();
+                // The canonical serializer emits a directory record before
+                // every descendant. Requiring that order prevents corrupt
+                // paths from synthesizing uncounted implicit nodes.
+                let pos = children
+                    .iter()
+                    .position(|(name, _)| name == part)
+                    .ok_or("metadata parent directory missing")?;
                 current = &mut children[pos].1;
             }
             FsNode::File { .. } => return Err("path conflict"),
+        }
+    }
+    Ok(())
+}
+
+fn try_owned_name(value: &str) -> Result<String, &'static str> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| "metadata name allocation failed")?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+fn validate_metadata_path(path: &str) -> Result<(), &'static str> {
+    if path.is_empty()
+        || path.len() > 120
+        || path.starts_with('/')
+        || path.ends_with('/')
+        || path.contains('\\')
+        || path.bytes().any(|byte| byte == 0 || byte < 0x20)
+    {
+        return Err("invalid metadata path");
+    }
+    for component in path.split('/') {
+        if component.is_empty() || component == "." || component == ".." || component.len() > 64 {
+            return Err("invalid metadata path component");
         }
     }
     Ok(())
@@ -284,8 +337,12 @@ fn insert_at_path(root: &mut FsNode, path: &str, node: FsNode) -> Result<(), &'s
 /// the superblock (see `sync_tree`), so no scanning or end-of-data
 /// guessing is needed -- every byte read is known to be real data.
 fn read_metadata(len: usize) -> Result<Vec<u8>, &'static str> {
-    let len = len.min(MAX_METADATA_BYTES);
-    let mut blob = Vec::with_capacity(len);
+    if len > MAX_METADATA_BYTES {
+        return Err("metadata length exceeds reserved region");
+    }
+    let mut blob = Vec::new();
+    blob.try_reserve_exact(len)
+        .map_err(|_| "metadata buffer allocation failed")?;
     let mut sector_buf = [0u8; 512];
 
     let mut sector = METADATA_LBA;

@@ -39,6 +39,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -191,6 +192,31 @@ struct ProcessState {
     /// later `SYS_MMAP` call within the same process (documented limitation,
     /// see `ARCHITECTURE.md`).
     mmap_next: u64,
+    /// Normalized absolute VFS path. Each Ring-3 process owns this value;
+    /// changing one process's directory cannot affect the shell or a peer.
+    cwd: String,
+    /// Bounded, process-owned read-only file descriptions. File contents are
+    /// snapshotted by VFS at OPEN time, so no backend lock or node reference
+    /// survives across a syscall or process lifetime boundary.
+    open_files: Vec<Option<OpenFile>>,
+    open_file_bytes: usize,
+}
+
+struct OpenFile {
+    data: Arc<[u8]>,
+    offset: usize,
+}
+
+pub const MAX_OPEN_FILES: usize = 16;
+pub const MAX_OPEN_FILE_BYTES: usize = 256 * 1024;
+pub const MAX_TASKS: usize = 64;
+const FIRST_FILE_HANDLE: u32 = 3;
+
+struct UserProcessResources {
+    name: String,
+    cwd: String,
+    stack: Box<[u8; STACK_SIZE]>,
+    open_files: Vec<Option<OpenFile>>,
 }
 
 struct Scheduler {
@@ -568,7 +594,9 @@ pub fn init() {
     let idle = new_tcb(2, "idle", idle_entry);
 
     let mut sched = Scheduler {
-        tasks: Vec::new(),
+        // Reserve the complete bounded task table during trusted boot. A
+        // Ring-3 SPAWN can never force this vector to grow in a syscall.
+        tasks: Vec::with_capacity(MAX_TASKS),
         current: 0,
     };
     sched.tasks.push(Box::new(shell));
@@ -622,6 +650,60 @@ fn new_tcb(id: u32, name: &str, entry: fn()) -> Tcb {
     }
 }
 
+fn try_kernel_stack() -> Result<Box<[u8; STACK_SIZE]>, &'static str> {
+    let layout = core::alloc::Layout::new::<[u8; STACK_SIZE]>();
+    // `alloc_zeroed` is used directly so exhaustion is an ordinary error
+    // rather than `Box::new` invoking the kernel's fatal allocation handler.
+    let pointer = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if pointer.is_null() {
+        return Err("kernel stack allocation failed");
+    }
+    // Safety: `pointer` came from `alloc_zeroed` with exactly this array's
+    // layout and is uniquely owned. `Box` will return it through the same
+    // global allocator on every later success or rollback path.
+    Ok(unsafe { Box::from_raw(pointer.cast::<[u8; STACK_SIZE]>()) })
+}
+
+fn try_owned_string(value: &str) -> Result<String, &'static str> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(value.len())
+        .map_err(|_| "process string allocation failed")?;
+    owned.push_str(value);
+    Ok(owned)
+}
+
+fn try_user_process_resources(name: &str, cwd: &str) -> Result<UserProcessResources, &'static str> {
+    let stack = try_kernel_stack()?;
+    let name = try_owned_string(name)?;
+    let cwd = try_owned_string(cwd)?;
+    let mut open_files = Vec::new();
+    open_files
+        .try_reserve_exact(MAX_OPEN_FILES)
+        .map_err(|_| "file table allocation failed")?;
+    Ok(UserProcessResources {
+        name,
+        cwd,
+        stack,
+        open_files,
+    })
+}
+
+fn try_box_value<T>(value: T) -> Result<Box<T>, T> {
+    let layout = core::alloc::Layout::new::<T>();
+    // Safety: a non-null result is valid and suitably aligned for `T`.
+    let pointer = unsafe { alloc::alloc::alloc(layout) }.cast::<T>();
+    if pointer.is_null() {
+        return Err(value);
+    }
+    // Safety: the allocation has exactly `T`'s layout, is uniquely owned,
+    // and is initialized once before ownership transfers to `Box`.
+    unsafe {
+        pointer.write(value);
+        Ok(Box::from_raw(pointer))
+    }
+}
+
 /// Build the Tcb for a genuine user process: same kernel-stack setup as
 /// `new_tcb`, except the fake initial frame lands in `user_task_trampoline`
 /// (which drops to Ring 3 via `enter_ring3`) instead of `task_trampoline`
@@ -631,12 +713,17 @@ fn new_tcb(id: u32, name: &str, entry: fn()) -> Tcb {
 /// actually running (see `rust_user_entry`).
 fn new_user_tcb(
     id: u32,
-    name: &str,
+    resources: UserProcessResources,
     address_space: paging::AddressSpace,
     entry_point: u64,
     user_stack_top: u64,
 ) -> Tcb {
-    let mut stack = Box::new([0u8; STACK_SIZE]);
+    let UserProcessResources {
+        name,
+        cwd,
+        mut stack,
+        open_files,
+    } = resources;
     let stack_top = unsafe { stack.as_mut_ptr().add(STACK_SIZE) as usize };
     let aligned_top = stack_top & !0xF;
     let mut sp = aligned_top;
@@ -657,7 +744,7 @@ fn new_user_tcb(
 
     Tcb {
         id,
-        name: String::from(name),
+        name,
         state: TaskState::Ready,
         stack: Some(stack),
         saved_rsp: sp as u64,
@@ -669,6 +756,9 @@ fn new_user_tcb(
             user_stack_top,
             exit_code: None,
             mmap_next: paging::USER_MMAP_BASE,
+            cwd,
+            open_files,
+            open_file_bytes: 0,
         }),
         terminated_at_tick: 0,
     }
@@ -972,6 +1062,110 @@ pub fn current_task_id() -> Option<u32> {
         let sched = slot.as_ref()?;
         Some(sched.tasks[sched.current].id)
     })
+}
+
+pub fn current_working_directory() -> Option<String> {
+    with_scheduler(|slot| {
+        let sched = slot.as_ref()?;
+        let cwd = &sched.tasks[sched.current].process.as_ref()?.cwd;
+        try_owned_string(cwd).ok()
+    })
+}
+
+pub fn set_current_working_directory(cwd: String) -> bool {
+    with_scheduler(|slot| {
+        let sched = slot.as_mut()?;
+        sched.tasks[sched.current].process.as_mut()?.cwd = cwd;
+        Some(())
+    })
+    .is_some()
+}
+
+pub fn open_file_for_current_process(data: Arc<[u8]>) -> Option<u32> {
+    with_scheduler(|slot| {
+        let sched = slot.as_mut()?;
+        let process = sched.tasks[sched.current].process.as_mut()?;
+        let total = process.open_file_bytes.checked_add(data.len())?;
+        if total > MAX_OPEN_FILE_BYTES {
+            return None;
+        }
+        if let Some(index) = process.open_files.iter().position(Option::is_none) {
+            process.open_files[index] = Some(OpenFile { data, offset: 0 });
+            process.open_file_bytes = total;
+            return u32::try_from(index).ok()?.checked_add(FIRST_FILE_HANDLE);
+        }
+        if process.open_files.len() >= MAX_OPEN_FILES {
+            return None;
+        }
+        let index = process.open_files.len();
+        process.open_files.push(Some(OpenFile { data, offset: 0 }));
+        process.open_file_bytes = total;
+        u32::try_from(index).ok()?.checked_add(FIRST_FILE_HANDLE)
+    })
+}
+
+pub fn peek_file_for_current_process(
+    handle: u32,
+    max_len: usize,
+) -> Option<(Arc<[u8]>, usize, usize)> {
+    let index = usize::try_from(handle.checked_sub(FIRST_FILE_HANDLE)?).ok()?;
+    with_scheduler(|slot| {
+        let sched = slot.as_mut()?;
+        let file = sched.tasks[sched.current]
+            .process
+            .as_ref()?
+            .open_files
+            .get(index)?
+            .as_ref()?;
+        let end = file.offset.checked_add(max_len)?.min(file.data.len());
+        Some((Arc::clone(&file.data), file.offset, end))
+    })
+}
+
+pub fn advance_file_for_current_process(handle: u32, amount: usize) -> bool {
+    let Some(index) = handle
+        .checked_sub(FIRST_FILE_HANDLE)
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return false;
+    };
+    with_scheduler(|slot| {
+        let sched = slot.as_mut()?;
+        let file = sched.tasks[sched.current]
+            .process
+            .as_mut()?
+            .open_files
+            .get_mut(index)?
+            .as_mut()?;
+        let new_offset = file.offset.checked_add(amount)?;
+        if new_offset > file.data.len() {
+            return None;
+        }
+        file.offset = new_offset;
+        Some(())
+    })
+    .is_some()
+}
+
+pub fn close_file_for_current_process(handle: u32) -> bool {
+    let Some(index) = handle
+        .checked_sub(FIRST_FILE_HANDLE)
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return false;
+    };
+    with_scheduler(|slot| {
+        let sched = slot.as_mut()?;
+        let process = sched.tasks[sched.current].process.as_mut()?;
+        let slot = process.open_files.get_mut(index)?;
+        if slot.is_none() {
+            return None;
+        }
+        let file = slot.take()?;
+        process.open_file_bytes = process.open_file_bytes.checked_sub(file.data.len())?;
+        Some(())
+    })
+    .is_some()
 }
 
 /// This now-running user task's entry point and user stack top, stashed by
@@ -1620,6 +1814,22 @@ const USER_STACK_PAGES: u64 = 4;
 /// physical-memory-offset mapping, so this is safe to call from whichever
 /// task (ordinarily the shell) initiates the spawn.
 pub fn spawn_user_process(name: &str, elf_bytes: &[u8]) -> Result<u32, &'static str> {
+    spawn_user_process_with_cwd(name, elf_bytes, "/")
+}
+
+pub fn spawn_user_process_with_cwd(
+    name: &str,
+    elf_bytes: &[u8],
+    cwd: &str,
+) -> Result<u32, &'static str> {
+    if task_count() >= MAX_TASKS {
+        return Err("task limit reached");
+    }
+    // Allocate every bounded per-process heap object fallibly before page
+    // tables are created. Malicious or simply concurrent Ring-3 SPAWN
+    // requests must receive an ABI error under pressure, never enter the
+    // kernel allocation panic path.
+    let resources = try_user_process_resources(name, cwd)?;
     let address_space = paging::new_address_space()?;
 
     // `address_space` is never installed into a `Tcb`, never reachable from
@@ -1632,7 +1842,14 @@ pub fn spawn_user_process(name: &str, elf_bytes: &[u8]) -> Result<u32, &'static 
     // `new_address_space` and everything `build_user_tcb` had mapped so
     // far -- the PML4 at minimum, every ELF segment page and stack page
     // mapped before the failing step at worst.
-    let mut tcb = Some(build_user_tcb(name, elf_bytes, address_space)?);
+    let tcb = build_user_tcb(elf_bytes, resources, address_space)?;
+    let mut tcb = match try_box_value(tcb) {
+        Ok(tcb) => Some(tcb),
+        Err(mut tcb) => {
+            reclaim_unstarted_process(&mut tcb);
+            return Err("task control block allocation failed");
+        }
+    };
     let id = tcb.as_ref().expect("just constructed").id;
 
     // The very last failure point: `with_scheduler` itself refusing (the
@@ -1647,9 +1864,10 @@ pub fn spawn_user_process(name: &str, elf_bytes: &[u8]) -> Result<u32, &'static 
     // regardless of which branch inside actually ran.
     let push_result: Result<(), &'static str> = with_scheduler(|slot| {
         let sched = slot.as_mut().ok_or("scheduler not initialized")?;
-        sched
-            .tasks
-            .push(Box::new(tcb.take().expect("tcb not yet taken")));
+        if sched.tasks.len() >= MAX_TASKS {
+            return Err("task limit reached");
+        }
+        sched.tasks.push(tcb.take().expect("tcb not yet taken"));
         Ok(())
     });
 
@@ -1664,11 +1882,7 @@ pub fn spawn_user_process(name: &str, elf_bytes: &[u8]) -> Result<u32, &'static 
             // space loaded into CR3 -- freeing it is sound for the same
             // reason it's sound inside `build_user_tcb`.
             if let Some(mut tcb) = tcb {
-                if let Some(process) = tcb.process.as_mut() {
-                    if let Some(space) = process.address_space.take() {
-                        unsafe { paging::free_address_space(space) };
-                    }
-                }
+                reclaim_unstarted_process(&mut tcb);
             }
             Err(reason)
         }
@@ -1682,8 +1896,8 @@ pub fn spawn_user_process(name: &str, elf_bytes: &[u8]) -> Result<u32, &'static 
 /// (see `spawn_user_process`'s docs on why that makes every early-return
 /// here safe to reclaim immediately rather than leaking).
 fn build_user_tcb(
-    name: &str,
     elf_bytes: &[u8],
+    resources: UserProcessResources,
     mut address_space: paging::AddressSpace,
 ) -> Result<Tcb, &'static str> {
     macro_rules! try_or_free {
@@ -1729,9 +1943,19 @@ fn build_user_tcb(
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     Ok(new_user_tcb(
         id,
-        name,
+        resources,
         address_space,
         loaded.entry_point.as_u64(),
         stack_top,
     ))
+}
+
+fn reclaim_unstarted_process(tcb: &mut Tcb) {
+    if let Some(process) = tcb.process.as_mut() {
+        if let Some(space) = process.address_space.take() {
+            // Safety: this TCB was never inserted into the scheduler, so its
+            // address space cannot have become the active CR3.
+            unsafe { paging::free_address_space(space) };
+        }
+    }
 }

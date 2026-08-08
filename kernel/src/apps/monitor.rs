@@ -6,11 +6,11 @@ use alloc::vec::Vec;
 use bootloader_api::{info::MemoryRegionKind, BootInfo};
 
 use crate::allocator;
-use crate::fs;
 use crate::memory;
 use crate::net;
 use crate::paging;
 use crate::task;
+use crate::vfs;
 
 /// Collect monitor output lines.
 pub fn snapshot(boot_info: &BootInfo) -> Result<Vec<String>, &'static str> {
@@ -77,7 +77,7 @@ pub fn snapshot(boot_info: &BootInfo) -> Result<Vec<String>, &'static str> {
 
     lines.push(String::from("[ Filesystem ]"));
     lines.push(String::from("  TuwaiqFS v2 (persistent)"));
-    match fs::pwd() {
+    match vfs::shell_pwd() {
         Ok(path) => {
             let mut line = String::from("  CWD: ");
             line.push_str(&path);

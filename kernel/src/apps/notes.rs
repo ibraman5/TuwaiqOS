@@ -3,7 +3,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::fs;
+use crate::vfs;
 
 const NOTES_DIR: &str = ".notes";
 
@@ -31,7 +31,10 @@ fn create(name: &str) -> Result<Vec<String>, &'static str> {
     if name.is_empty() {
         return Err("usage: notes create <name>");
     }
-    fs::write_in_path(&note_path(name), "")?;
+    if vfs::kind("/", NOTES_DIR).is_err() {
+        vfs::create_dir("/", NOTES_DIR)?;
+    }
+    vfs::write_file("/", &note_path(name), b"")?;
     let mut lines = Vec::new();
     lines.push(format_message("Created note: ", name));
     Ok(lines)
@@ -39,7 +42,7 @@ fn create(name: &str) -> Result<Vec<String>, &'static str> {
 
 fn list() -> Result<Vec<String>, &'static str> {
     let mut lines = Vec::new();
-    match fs::ls_path(NOTES_DIR) {
+    match vfs::list_dir("/", NOTES_DIR) {
         Ok(entries) => {
             if entries.is_empty() {
                 lines.push(String::from("(no notes)"));
@@ -59,7 +62,8 @@ fn show(name: &str) -> Result<Vec<String>, &'static str> {
     if name.is_empty() {
         return Err("usage: notes show <name>");
     }
-    let content = fs::cat_path(&note_path(name))?;
+    let bytes = vfs::read_file("/", &note_path(name))?;
+    let content = String::from(core::str::from_utf8(&bytes).map_err(|_| "note is not UTF-8 text")?);
     let mut lines = Vec::new();
     lines.push(format_message("Note: ", name));
     lines.push(content);

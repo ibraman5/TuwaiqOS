@@ -1,24 +1,39 @@
-//! TuwaiqOS filesystem layer.
+//! TuwaiqFS-backed storage tree.
 //!
-//! Shell-facing API backed by TuwaiqFS v2 persistent storage.
+//! This module is the concrete root-filesystem backend used by `vfs.rs`.
+//! It deliberately accepts normalized absolute paths only; path policy,
+//! working directories, and mount selection belong to the VFS layer.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+use spin::Mutex;
+use x86_64::instructions::interrupts;
 
 use crate::tuwaiqfs::{self, FsNode};
 
 /// A named entry inside a directory.
+#[derive(Clone)]
 enum Entry {
-    File { content: String },
+    File { content: Arc<[u8]> },
     Dir { children: Vec<(String, Entry)> },
 }
 
 struct FileSystem {
     root: Entry,
-    cwd: Vec<String>,
 }
 
-static mut FS: Option<FileSystem> = None;
+/// The in-memory tree is reachable from the shell and from preempted Ring-3
+/// syscalls. Every access therefore uses the same interrupt-safe lock.
+/// Expensive ATA I/O is never performed while this lock is held.
+static FS: Mutex<Option<FileSystem>> = Mutex::new(None);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryKind {
+    File,
+    Directory,
+}
 
 pub fn init() {
     let mounted = tuwaiqfs::mount().unwrap_or_else(|reason| {
@@ -26,252 +41,105 @@ pub fn init() {
             "fs: mount failed ({}), falling back to an empty filesystem",
             reason
         );
-        tuwaiqfs::FsNode::Dir {
+        FsNode::Dir {
             children: Vec::new(),
         }
     });
 
     let root = match mounted {
         FsNode::Dir { children } => {
-            let mut entries = Vec::new();
-            for (name, node) in children {
-                entries.push((name, from_fs_node(node)));
-            }
+            let entries = children
+                .into_iter()
+                .map(|(name, node)| (name, from_fs_node(node)))
+                .collect();
             Entry::Dir { children: entries }
         }
-        _ => Entry::Dir {
+        FsNode::File { .. } => Entry::Dir {
             children: Vec::new(),
         },
     };
 
-    unsafe {
-        FS = Some(FileSystem {
-            root,
-            cwd: Vec::new(),
-        });
-    }
+    interrupts::without_interrupts(|| {
+        *FS.lock() = Some(FileSystem { root });
+    });
 }
 
 fn from_fs_node(node: FsNode) -> Entry {
     match node {
-        FsNode::File { content } => Entry::File { content },
-        FsNode::Dir { children } => {
-            let mut entries = Vec::new();
-            for (name, child) in children {
-                entries.push((name, from_fs_node(child)));
-            }
-            Entry::Dir { children: entries }
-        }
+        FsNode::File { content } => Entry::File {
+            content: Arc::from(content.into_boxed_slice()),
+        },
+        FsNode::Dir { children } => Entry::Dir {
+            children: children
+                .into_iter()
+                .map(|(name, child)| (name, from_fs_node(child)))
+                .collect(),
+        },
     }
 }
 
 fn to_fs_node(entry: &Entry) -> FsNode {
     match entry {
         Entry::File { content } => FsNode::File {
-            content: content.clone(),
+            content: content.as_ref().to_vec(),
         },
-        Entry::Dir { children } => {
-            let mut nodes = Vec::new();
-            for (name, child) in children {
-                nodes.push((name.clone(), to_fs_node(child)));
-            }
-            FsNode::Dir { children: nodes }
-        }
+        Entry::Dir { children } => FsNode::Dir {
+            children: children
+                .iter()
+                .map(|(name, child)| (name.clone(), to_fs_node(child)))
+                .collect(),
+        },
     }
 }
 
 fn with_fs<F, R>(f: F) -> Result<R, &'static str>
 where
-    F: FnOnce(&mut FileSystem) -> Result<R, &'static str>,
+    F: FnOnce(&FileSystem) -> Result<R, &'static str>,
 {
-    unsafe {
-        let slot = core::ptr::addr_of_mut!(FS);
-        match (*slot).as_mut() {
-            Some(fs) => f(fs),
-            None => Err("filesystem not initialized"),
-        }
-    }
+    interrupts::without_interrupts(|| {
+        let guard = FS.lock();
+        let fs = guard.as_ref().ok_or("filesystem not initialized")?;
+        f(fs)
+    })
+}
+
+fn mutate_and_persist<F>(f: F) -> Result<(), &'static str>
+where
+    F: FnOnce(&mut FileSystem) -> Result<(), &'static str>,
+{
+    // Phase 6 exposes no Ring-3 mutation syscall, so shell commands are the
+    // sole serialized writer. Clone only tree structure and Arc references
+    // while locked, then mutate and serialize the candidate with interrupts
+    // enabled. Publish it only after disk persistence succeeds: an ATA error
+    // leaves the prior in-memory tree untouched.
+    let mut candidate = interrupts::without_interrupts(|| {
+        let guard = FS.lock();
+        let fs = guard.as_ref().ok_or("filesystem not initialized")?;
+        Ok(FileSystem {
+            root: fs.root.clone(),
+        })
+    })?;
+    f(&mut candidate)?;
+    tuwaiqfs::sync_tree(&to_fs_node(&candidate.root))?;
+    interrupts::without_interrupts(|| {
+        let mut guard = FS.lock();
+        let fs = guard.as_mut().ok_or("filesystem not initialized")?;
+        fs.root = candidate.root;
+        Ok(())
+    })
 }
 
 impl FileSystem {
-    fn pwd(&self) -> String {
-        if self.cwd.is_empty() {
-            String::from("/")
-        } else {
-            let mut path = String::from("/");
-            path.push_str(&self.cwd.join("/"));
-            path
-        }
-    }
-
-    fn list_dir(&self) -> Result<Vec<String>, &'static str> {
-        let children = self.current_children()?;
-        let mut names = Vec::new();
-        for (name, entry) in children {
-            if matches!(entry, Entry::Dir { .. }) {
-                let mut line = name.clone();
-                line.push('/');
-                names.push(line);
-            } else {
-                names.push(name.clone());
-            }
-        }
-        Ok(names)
-    }
-
-    fn list_at_path(&self, path: &str) -> Result<Vec<String>, &'static str> {
-        let parts = split_path(path);
-        let children = self.children_at(&parts)?;
-        let mut names = Vec::new();
-        for (name, entry) in children {
-            if matches!(entry, Entry::Dir { .. }) {
-                let mut line = name.clone();
-                line.push('/');
-                names.push(line);
-            } else {
-                names.push(name.clone());
-            }
-        }
-        Ok(names)
-    }
-
-    fn touch(&mut self, name: &str) -> Result<(), &'static str> {
-        validate_name(name)?;
-        let children = self.current_children_mut()?;
-        if children.iter().any(|(n, _)| n == name) {
-            return Err("file or directory already exists");
-        }
-        children.push((
-            String::from(name),
-            Entry::File {
-                content: String::new(),
-            },
-        ));
-        self.persist()
-    }
-
-    fn mkdir(&mut self, name: &str) -> Result<(), &'static str> {
-        validate_name(name)?;
-        let children = self.current_children_mut()?;
-        if children.iter().any(|(n, _)| n == name) {
-            return Err("file or directory already exists");
-        }
-        children.push((
-            String::from(name),
-            Entry::Dir {
-                children: Vec::new(),
-            },
-        ));
-        self.persist()
-    }
-
-    fn read_file(&self, name: &str) -> Result<String, &'static str> {
-        validate_name(name)?;
-        let children = self.current_children()?;
-        for (entry_name, entry) in children {
-            if entry_name == name {
-                return match entry {
-                    Entry::File { content } => Ok(content.clone()),
-                    Entry::Dir { .. } => Err("is a directory"),
-                };
-            }
-        }
-        Err("file not found")
-    }
-
-    fn read_at_path(&self, path: &str) -> Result<String, &'static str> {
-        let parts = split_path(path);
-        if parts.is_empty() {
-            return Err("path required");
-        }
-        let file_name = parts.last().ok_or("path required")?;
-        validate_name(file_name)?;
-        let parent = &parts[..parts.len() - 1];
-        let children = self.children_at(parent)?;
-        for (entry_name, entry) in children {
-            if entry_name == file_name {
-                return match entry {
-                    Entry::File { content } => Ok(content.clone()),
-                    Entry::Dir { .. } => Err("is a directory"),
-                };
-            }
-        }
-        Err("file not found")
-    }
-
-    fn write_file(&mut self, name: &str, text: &str) -> Result<(), &'static str> {
-        validate_name(name)?;
-        let children = self.current_children_mut()?;
-        if let Some((_, entry)) = children.iter_mut().find(|(n, _)| n == name) {
-            return match entry {
-                Entry::File { content } => {
-                    *content = String::from(text);
-                    self.persist()
-                }
-                Entry::Dir { .. } => Err("is a directory"),
-            };
-        }
-        children.push((
-            String::from(name),
-            Entry::File {
-                content: String::from(text),
-            },
-        ));
-        self.persist()
-    }
-
-    fn write_at_path(&mut self, path: &str, text: &str) -> Result<(), &'static str> {
-        let parts = split_path(path);
-        if parts.is_empty() {
-            return Err("path required");
-        }
-        let file_name = parts.last().ok_or("path required")?.clone();
-        validate_name(&file_name)?;
-        let parent = parts[..parts.len() - 1].to_vec();
-
-        if parent.is_empty() {
-            return self.write_file(&file_name, text);
-        }
-
-        ensure_dir_chain(&mut self.root, &parent)?;
-        let children = self.children_at_mut(&parent)?;
-        if let Some((_, entry)) = children.iter_mut().find(|(n, _)| n == &file_name) {
-            return match entry {
-                Entry::File { content } => {
-                    *content = String::from(text);
-                    self.persist()
-                }
-                Entry::Dir { .. } => Err("is a directory"),
-            };
-        }
-        children.push((
-            file_name,
-            Entry::File {
-                content: String::from(text),
-            },
-        ));
-        self.persist()
-    }
-
-    fn persist(&self) -> Result<(), &'static str> {
-        tuwaiqfs::sync_tree(&to_fs_node(&self.root))
-    }
-
-    fn current_children(&self) -> Result<&Vec<(String, Entry)>, &'static str> {
-        self.children_at(&self.cwd)
-    }
-
-    fn current_children_mut(&mut self) -> Result<&mut Vec<(String, Entry)>, &'static str> {
-        let path = self.cwd.clone();
-        self.children_at_mut(&path)
-    }
-
-    fn children_at(&self, path: &[String]) -> Result<&Vec<(String, Entry)>, &'static str> {
+    fn entry_at(&self, path: &[String]) -> Result<&Entry, &'static str> {
         let mut node = &self.root;
         for part in path {
             node = find_child(node, part)?;
         }
-        match node {
+        Ok(node)
+    }
+
+    fn children_at(&self, path: &[String]) -> Result<&Vec<(String, Entry)>, &'static str> {
+        match self.entry_at(path)? {
             Entry::Dir { children } => Ok(children),
             Entry::File { .. } => Err("not a directory"),
         }
@@ -291,63 +159,118 @@ impl FileSystem {
         }
     }
 
-    fn all_entry_names(&self) -> Vec<String> {
-        let mut names = Vec::new();
-        collect_names(&self.root, &mut names);
-        names
+    fn parent_and_name(path: &str) -> Result<(Vec<String>, String), &'static str> {
+        let parts = split_absolute_path(path)?;
+        let name = parts.last().cloned().ok_or("root has no entry name")?;
+        Ok((parts[..parts.len() - 1].to_vec(), name))
     }
-}
 
-fn collect_names(entry: &Entry, out: &mut Vec<String>) {
-    match entry {
-        Entry::File { .. } => {}
-        Entry::Dir { children } => {
-            for (name, child) in children {
-                out.push(name.clone());
-                collect_names(child, out);
-            }
+    fn kind_at(&self, path: &str) -> Result<EntryKind, &'static str> {
+        let parts = split_absolute_path(path)?;
+        match self.entry_at(&parts)? {
+            Entry::File { .. } => Ok(EntryKind::File),
+            Entry::Dir { .. } => Ok(EntryKind::Directory),
         }
     }
-}
 
-fn ensure_dir_chain(root: &mut Entry, path: &[String]) -> Result<(), &'static str> {
-    let mut node = root;
-    for part in path {
-        match node {
-            Entry::Dir { children } => {
-                if !children.iter().any(|(n, _)| n == part) {
-                    children.push((
-                        part.clone(),
-                        Entry::Dir {
-                            children: Vec::new(),
-                        },
-                    ));
+    fn list_at(&self, path: &str) -> Result<Vec<String>, &'static str> {
+        let parts = split_absolute_path(path)?;
+        let children = self.children_at(&parts)?;
+        Ok(children
+            .iter()
+            .map(|(name, entry)| {
+                if matches!(entry, Entry::Dir { .. }) {
+                    let mut display = name.clone();
+                    display.push('/');
+                    display
+                } else {
+                    name.clone()
                 }
-                let index = children.iter().position(|(n, _)| n == part).unwrap();
-                node = &mut children[index].1;
-            }
-            Entry::File { .. } => return Err("path conflict"),
+            })
+            .collect())
+    }
+
+    fn read_at(&self, path: &str) -> Result<Arc<[u8]>, &'static str> {
+        let parts = split_absolute_path(path)?;
+        if parts.is_empty() {
+            return Err("is a directory");
+        }
+        match self.entry_at(&parts)? {
+            Entry::File { content } => Ok(Arc::clone(content)),
+            Entry::Dir { .. } => Err("is a directory"),
         }
     }
-    Ok(())
+
+    fn create_file_at(&mut self, path: &str) -> Result<(), &'static str> {
+        let (parent, name) = Self::parent_and_name(path)?;
+        let children = self.children_at_mut(&parent)?;
+        if children.iter().any(|(existing, _)| existing == &name) {
+            return Err("file or directory already exists");
+        }
+        children.push((
+            name,
+            Entry::File {
+                content: Arc::from([]),
+            },
+        ));
+        Ok(())
+    }
+
+    fn create_dir_at(&mut self, path: &str) -> Result<(), &'static str> {
+        let (parent, name) = Self::parent_and_name(path)?;
+        let children = self.children_at_mut(&parent)?;
+        if children.iter().any(|(existing, _)| existing == &name) {
+            return Err("file or directory already exists");
+        }
+        children.push((
+            name,
+            Entry::Dir {
+                children: Vec::new(),
+            },
+        ));
+        Ok(())
+    }
+
+    fn write_at(&mut self, path: &str, bytes: &[u8]) -> Result<(), &'static str> {
+        if bytes.len() > tuwaiqfs::MAX_FILE_SIZE {
+            return Err("file too large");
+        }
+        let (parent, name) = Self::parent_and_name(path)?;
+        let children = self.children_at_mut(&parent)?;
+        match children.iter_mut().find(|(existing, _)| existing == &name) {
+            Some((_, Entry::File { content })) => {
+                *content = Arc::from(bytes);
+            }
+            Some((_, Entry::Dir { .. })) => return Err("is a directory"),
+            None => children.push((
+                name,
+                Entry::File {
+                    content: Arc::from(bytes),
+                },
+            )),
+        }
+        Ok(())
+    }
 }
 
-fn split_path(path: &str) -> Vec<String> {
-    path.trim()
-        .trim_start_matches('/')
+fn split_absolute_path(path: &str) -> Result<Vec<String>, &'static str> {
+    if !path.starts_with('/') {
+        return Err("backend path must be absolute");
+    }
+    Ok(path
         .split('/')
-        .filter(|p| !p.is_empty())
+        .filter(|component| !component.is_empty())
         .map(String::from)
-        .collect()
+        .collect())
 }
 
 fn find_child<'a>(node: &'a Entry, name: &str) -> Result<&'a Entry, &'static str> {
     match node {
         Entry::Dir { children } => children
             .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, e)| e)
-            .ok_or("directory not found"),
+            .find(|(entry_name, _)| entry_name == name)
+            .map(|(_, entry)| entry)
+            .ok_or("entry not found"),
         Entry::File { .. } => Err("not a directory"),
     }
 }
@@ -356,73 +279,40 @@ fn find_child_mut<'a>(node: &'a mut Entry, name: &str) -> Result<&'a mut Entry, 
     match node {
         Entry::Dir { children } => children
             .iter_mut()
-            .find(|(n, _)| n == name)
-            .map(|(_, e)| e)
-            .ok_or("directory not found"),
+            .find(|(entry_name, _)| entry_name == name)
+            .map(|(_, entry)| entry)
+            .ok_or("entry not found"),
         Entry::File { .. } => Err("not a directory"),
     }
 }
 
-fn validate_name(name: &str) -> Result<(), &'static str> {
-    if name.is_empty() {
-        return Err("name required");
-    }
-    if name.contains('/') || name.contains('\\') {
-        return Err("invalid name");
-    }
-    Ok(())
+pub fn kind_at(path: &str) -> Result<EntryKind, &'static str> {
+    with_fs(|fs| fs.kind_at(path))
+}
+
+pub fn list_at(path: &str) -> Result<Vec<String>, &'static str> {
+    with_fs(|fs| fs.list_at(path))
+}
+
+pub fn read_at(path: &str) -> Result<Arc<[u8]>, &'static str> {
+    with_fs(|fs| fs.read_at(path))
+}
+
+pub fn create_file_at(path: &str) -> Result<(), &'static str> {
+    mutate_and_persist(|fs| fs.create_file_at(path))
+}
+
+pub fn create_dir_at(path: &str) -> Result<(), &'static str> {
+    mutate_and_persist(|fs| fs.create_dir_at(path))
+}
+
+pub fn write_at(path: &str, bytes: &[u8]) -> Result<(), &'static str> {
+    mutate_and_persist(|fs| fs.write_at(path, bytes))
 }
 
 pub fn sync_to_disk() -> Result<(), &'static str> {
-    with_fs(|fs| fs.persist())
-}
-
-pub fn pwd() -> Result<String, &'static str> {
-    with_fs(|fs| Ok(fs.pwd()))
-}
-
-pub fn ls() -> Result<Vec<String>, &'static str> {
-    with_fs(|fs| fs.list_dir())
-}
-
-pub fn ls_path(path: &str) -> Result<Vec<String>, &'static str> {
-    with_fs(|fs| fs.list_at_path(path))
-}
-
-pub fn touch(name: &str) -> Result<(), &'static str> {
-    with_fs(|fs| fs.touch(name.trim()))
-}
-
-pub fn mkdir(name: &str) -> Result<(), &'static str> {
-    with_fs(|fs| fs.mkdir(name.trim()))
-}
-
-pub fn cat(name: &str) -> Result<String, &'static str> {
-    with_fs(|fs| fs.read_file(name.trim()))
-}
-
-pub fn cat_path(path: &str) -> Result<String, &'static str> {
-    with_fs(|fs| fs.read_at_path(path))
-}
-
-pub fn write(name: &str, text: &str) -> Result<(), &'static str> {
-    with_fs(|fs| fs.write_file(name.trim(), text))
-}
-
-pub fn write_in_path(path: &str, text: &str) -> Result<(), &'static str> {
-    with_fs(|fs| fs.write_at_path(path, text))
-}
-
-pub fn completion_candidates(prefix: &str) -> Result<Vec<String>, &'static str> {
-    with_fs(|fs| {
-        let mut matches = Vec::new();
-        for name in fs.all_entry_names() {
-            if name.starts_with(prefix) {
-                matches.push(name);
-            }
-        }
-        Ok(matches)
-    })
+    let root = with_fs(|fs| Ok(fs.root.clone()))?;
+    tuwaiqfs::sync_tree(&to_fs_node(&root))
 }
 
 pub fn label() -> &'static str {

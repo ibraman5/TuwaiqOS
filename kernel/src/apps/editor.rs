@@ -3,7 +3,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::fs;
+use crate::vfs;
 
 /// Show a file and editing instructions.
 pub fn handle(args: &str) -> Result<Vec<String>, &'static str> {
@@ -12,7 +12,7 @@ pub fn handle(args: &str) -> Result<Vec<String>, &'static str> {
         return Err("usage: editor <file>");
     }
 
-    let content = fs::cat(name)?;
+    let content = vfs::shell_read(name)?;
     let mut lines = Vec::new();
     lines.push(format_line("Editing: ", name));
     lines.push(String::from("---"));

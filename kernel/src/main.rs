@@ -34,6 +34,7 @@ mod syscall;
 mod task;
 mod tuwaiqfs;
 mod usermode;
+mod vfs;
 mod vga_buffer;
 
 use bootloader_api::config::{BootloaderConfig, Mapping};
@@ -89,7 +90,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     ata::init();
-    fs::init();
+    vfs::init();
     task::init();
     net::init();
 
