@@ -50,14 +50,13 @@
 //!
 //! ## Pointer validation
 //!
-//! `WRITE` is the only syscall here that takes a pointer. Its length is
-//! capped (`MAX_WRITE_LEN`), and the bytes are never dereferenced directly
-//! under the caller's live CR3 -- `task::copy_from_current_user` walks the
-//! calling process's own page tables first (`paging::translate_in_address_space`
-//! under the hood) and only reads through the physical-memory-offset
-//! mapping once every page in range is confirmed `PRESENT | USER_ACCESSIBLE`.
-//! An invalid pointer or range is a clean `-1`, never a Ring 0 page fault
-//! from kernel code trusting a user-supplied address.
+//! `WRITE`, `MUNMAP`, `DISPLAY_INFO`, `DISPLAY_PRESENT`, and `INPUT_POLL`
+//! accept Ring-3-supplied addresses. Every raw address is converted with the
+//! fallible `VirtAddr::try_new` path, constrained to the private user region,
+//! checked for range overflow, and walked through the calling process's own
+//! page tables before any byte is read, written, presented, or unmapped.
+//! Required permissions are checked for the whole range before mutation. A
+//! malformed address or range is a clean `-1`, never a Ring-0 panic or fault.
 
 use crate::task;
 
@@ -162,9 +161,9 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) {
     // Safety: `frame` was constructed by `syscall_entry`'s own prologue,
     // immediately before this call, pointing at a live, exclusively-owned
     // region of the current task's own kernel stack -- valid for exactly
-    // the duration of this call, and nothing else touches it concurrently
-    // (single-core kernel, interrupts disabled for the whole interrupt-gate
-    // duration).
+    // the duration of this call. Long VM syscalls may enable interrupts and
+    // be preempted between bounded lock scopes, but another task runs on its
+    // own kernel stack; nothing can alias this suspended task's frame.
     let frame = unsafe { &mut *frame };
     let result = dispatch(frame.rax, frame.rdi, frame.rsi, frame.rdx);
     frame.rax = result as u64;
@@ -207,7 +206,10 @@ fn sys_exit(code: i32) -> ! {
 }
 
 fn sys_write(ptr: u64, len: u64) -> i64 {
-    if len as usize > MAX_WRITE_LEN {
+    let Ok(len_usize) = usize::try_from(len) else {
+        return -1;
+    };
+    if len_usize > MAX_WRITE_LEN {
         crate::serial_println!(
             "syscall: WRITE rejected -- len {} exceeds max {}",
             len,
@@ -216,7 +218,7 @@ fn sys_write(ptr: u64, len: u64) -> i64 {
         return -1;
     }
 
-    match task::copy_from_current_user(ptr, len as usize) {
+    match task::copy_from_current_user(ptr, len_usize) {
         Some(bytes) => {
             // This syscall's contract is "write these bytes," not "write
             // valid UTF-8" -- invalid sequences are replaced rather than
@@ -248,8 +250,8 @@ fn sys_getpid() -> i64 {
 }
 
 /// `MMAP(len, writable)`. See `task::mmap_in_current_process` for the full
-/// contract (arena bounds, permission handling, the documented
-/// no-partial-rollback limitation). `writable` is `a2 != 0`, matching this
+/// contract (arena bounds, permission handling, and transactional rollback
+/// on mapping/zeroing/permission failure). `writable` is `a2 != 0`, matching this
 /// ABI's usual "any nonzero value is true" convention for boolean-ish
 /// arguments.
 fn sys_mmap(len: u64, writable: u64) -> i64 {
@@ -291,7 +293,10 @@ fn sys_display_info(out_ptr: u64, out_len: u64) -> i64 {
         return -1;
     };
     let bytes = info.to_le_bytes();
-    if (out_len as usize) < bytes.len() {
+    let Ok(out_len_usize) = usize::try_from(out_len) else {
+        return -1;
+    };
+    if out_len_usize < bytes.len() {
         return -1;
     }
     if task::copy_to_current_user(out_ptr, &bytes) {
@@ -313,7 +318,10 @@ fn sys_display_info(out_ptr: u64, out_len: u64) -> i64 {
 /// size match, checked arithmetic, per-page `PRESENT | USER_ACCESSIBLE`
 /// validation of the entire source range before a single byte is copied).
 fn sys_display_present(ptr: u64, len: u64) -> i64 {
-    match crate::display::present(ptr, len as usize) {
+    let Ok(len) = usize::try_from(len) else {
+        return -1;
+    };
+    match crate::display::present(ptr, len) {
         Ok(()) => 0,
         Err(reason) => {
             crate::serial_println!(
@@ -334,8 +342,32 @@ fn sys_display_present(ptr: u64, len: u64) -> i64 {
 /// loop and are expected to see this constantly), `-1` for an invalid
 /// destination buffer.
 fn sys_input_poll(out_ptr: u64, out_len: u64) -> i64 {
+    let Some(caller_pid) = task::current_task_id() else {
+        return -1;
+    };
+    if crate::keyboard::foreground_process_id() != Some(caller_pid) {
+        crate::serial_println!(
+            "syscall: INPUT_POLL rejected -- pid {} is not foreground owner",
+            caller_pid
+        );
+        return -1;
+    }
     let bytes = crate::input::ENCODED_EVENT_LEN;
-    if (out_len as usize) < bytes {
+    let Ok(out_len) = usize::try_from(out_len) else {
+        return -1;
+    };
+    if out_len < bytes {
+        return -1;
+    }
+    // Validate before looking at queue state. Apart from making an invalid
+    // pointer return `-1` even while the queue is empty, this ordering is what
+    // guarantees a pending event cannot be consumed/lost by a failed copy.
+    if !task::validate_current_user_range(out_ptr, bytes, true) {
+        crate::serial_println!(
+            "syscall: INPUT_POLL rejected -- invalid destination (ptr={:#x}, len={})",
+            out_ptr,
+            out_len
+        );
         return -1;
     }
     match crate::input::poll() {

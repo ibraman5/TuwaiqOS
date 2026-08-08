@@ -117,12 +117,39 @@ impl BootInfoFrameAllocator {
         }
     }
 
-    fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> + '_ {
+    /// Resolve a bump-cursor index without replaying every preceding frame.
+    ///
+    /// The former iterator-and-`nth(self.next)` implementation made the
+    /// Nth allocation walk O(N) prior frames. Mapping a 64 MiB region therefore
+    /// became O(N^2), held the syscall/scheduler critical section for minutes,
+    /// and delayed interrupts. The boot memory map has only a small number of
+    /// regions, so selecting the containing region directly keeps each fresh
+    /// allocation O(number of memory-map regions).
+    fn usable_frame_at(&self, mut index: usize) -> Option<PhysFrame<Size4KiB>> {
+        for region in self
+            .memory_regions
+            .iter()
+            .filter(|region| region.kind == MemoryRegionKind::Usable)
+        {
+            let bytes = region.end.checked_sub(region.start)?;
+            let frames = usize::try_from(bytes / 4096).ok()?;
+            if index < frames {
+                let offset = u64::try_from(index).ok()?.checked_mul(4096)?;
+                let address = region.start.checked_add(offset)?;
+                return PhysFrame::from_start_address(PhysAddr::new(address)).ok();
+            }
+            index -= frames;
+        }
+        None
+    }
+
+    fn usable_frame_count(&self) -> usize {
         self.memory_regions
             .iter()
             .filter(|region| region.kind == MemoryRegionKind::Usable)
-            .flat_map(|region| (region.start..region.end).step_by(4096))
-            .map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
+            .filter_map(|region| region.end.checked_sub(region.start))
+            .filter_map(|bytes| usize::try_from(bytes / 4096).ok())
+            .fold(0usize, usize::saturating_add)
     }
 
     /// Total frames handed out over this allocator's lifetime (including
@@ -156,6 +183,14 @@ impl BootInfoFrameAllocator {
     pub fn frames_bumped(&self) -> usize {
         self.next
     }
+
+    /// Frames that can still be allocated without changing any allocator
+    /// state: recycled frames plus never-before-issued usable frames.
+    pub fn frames_available(&self) -> usize {
+        self.freed
+            .len()
+            .saturating_add(self.usable_frame_count().saturating_sub(self.next))
+    }
 }
 
 // Safety: `allocate_frame` only ever returns frames from the bootloader's
@@ -171,9 +206,9 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
             return Some(frame);
         }
 
-        let frame = self.usable_frames().nth(self.next);
-        self.next += 1;
+        let frame = self.usable_frame_at(self.next);
         if frame.is_some() {
+            self.next += 1;
             self.allocated_count += 1;
         }
         frame
@@ -326,6 +361,18 @@ pub fn frame_stats() -> Option<FrameStats> {
             free_in_pool: allocator.frames_in_free_pool(),
             bumped: allocator.frames_bumped(),
         })
+    })
+}
+
+/// Read-only admission control for multi-page mapping transactions. A caller
+/// can conservatively reserve enough capacity before installing the first
+/// leaf, so physical exhaustion is rejected with zero page-table mutation.
+pub fn can_allocate_frames(required: usize) -> bool {
+    with_paging(|_, frame_allocator_slot| {
+        frame_allocator_slot
+            .as_ref()
+            .map(|allocator| allocator.frames_available() >= required)
+            .unwrap_or(false)
     })
 }
 
@@ -511,23 +558,46 @@ pub fn map_in_address_space(
         // Safety: `space.pml4_frame` was allocated by `new_address_space`
         // and is exclusively owned by `space`.
         let mut mapper = unsafe { mapper_for(space.pml4_frame, phys_offset) };
-        let mut tracking = TrackingFrameAllocator {
-            inner: frame_allocator,
-            owned: &mut space.owned_frames,
+        let frame = {
+            let mut tracking = TrackingFrameAllocator {
+                inner: frame_allocator,
+                owned: &mut space.owned_frames,
+            };
+            tracking
+                .allocate_frame()
+                .ok_or("out of physical memory frames")?
         };
-
-        let frame = tracking
-            .allocate_frame()
-            .ok_or("out of physical memory frames")?;
 
         // Safety: `frame` was just allocated exclusively for this mapping,
         // and `page` falls within `space`'s own private region (checked
         // above), never aliased by another address space's mappings.
-        unsafe {
-            mapper
-                .map_to(page, frame, flags, &mut tracking)
-                .map_err(|_| "page mapping failed: already mapped or invalid page table state")?
-                .flush();
+        let map_result = {
+            let mut tracking = TrackingFrameAllocator {
+                inner: frame_allocator,
+                owned: &mut space.owned_frames,
+            };
+            // Safety: documented immediately above.
+            unsafe { mapper.map_to(page, frame, flags, &mut tracking) }
+        };
+        match map_result {
+            Ok(flush) => flush.flush(),
+            Err(_) => {
+                // The leaf frame is passed to `map_to`; it is never installed
+                // when `map_to` returns an error. Reclaim it immediately so a
+                // rejected/failed mapping cannot leak one frame per attempt.
+                // Any intermediate page-table frames `map_to` managed to
+                // install before an allocator failure stay owned by `space`
+                // and form valid empty tables reusable by a retry.
+                if let Some(pos) = space.owned_frames.iter().position(|owned| *owned == frame) {
+                    space.owned_frames.remove(pos);
+                }
+                // Safety: `map_to` failed before installing `frame` as a leaf,
+                // and it was removed from ownership tracking above.
+                unsafe {
+                    frame_allocator.deallocate_frame(frame);
+                }
+                return Err("page mapping failed: already mapped or invalid page table state");
+            }
         }
         Ok(())
     })
@@ -557,6 +627,93 @@ pub fn translate_in_address_space(
         } => Some((frame.start_address() + offset, flags)),
         TranslateResult::NotMapped | TranslateResult::InvalidFrameAddress(_) => None,
     }
+}
+
+/// Convert an untrusted raw Ring-3 address into a `VirtAddr` without ever
+/// invoking `VirtAddr::new`'s panicking invalid-address path. In addition to
+/// being canonical *as supplied* (no implicit sign-extension), the address
+/// must be inside the one private user region this kernel maps for a process.
+///
+/// Keeping this check separate from the page-table walk is deliberate: a
+/// kernel address might happen to translate through the kernel half cloned
+/// into every process CR3, but it is never a valid userspace pointer even if
+/// the eventual permission check would also reject it.
+pub fn checked_user_virt_addr(raw: u64) -> Result<VirtAddr, &'static str> {
+    let addr = VirtAddr::try_new(raw).map_err(|_| "non-canonical user address")?;
+    if addr.as_u64() != raw {
+        return Err("non-canonical user address");
+    }
+    let user_end = USER_SPACE_BASE
+        .checked_add(USER_SPACE_SIZE)
+        .ok_or("user address-space bound overflow")?;
+    if raw < USER_SPACE_BASE || raw >= user_end {
+        return Err("address is outside the process user region");
+    }
+    Ok(addr)
+}
+
+/// Prevalidate every page touched by an untrusted Ring-3 range.
+///
+/// This is the common security boundary for all pointer-bearing syscalls.
+/// It rejects a non-canonical start, arithmetic overflow, a range that leaves
+/// the private user region, an unmapped page, a supervisor-only page, or (for
+/// copy-out operations) a read-only page. Callers that promise atomic failure
+/// semantics invoke this for the *whole* range before copying or unmapping a
+/// single byte/page.
+pub fn validate_user_range(
+    space: &AddressSpace,
+    raw_start: u64,
+    len: usize,
+    require_writable: bool,
+) -> Result<VirtAddr, &'static str> {
+    let start = checked_user_virt_addr(raw_start)?;
+    let len = u64::try_from(len).map_err(|_| "user range length does not fit in u64")?;
+    let end = raw_start
+        .checked_add(len)
+        .ok_or("user range arithmetic overflow")?;
+    let user_end = USER_SPACE_BASE
+        .checked_add(USER_SPACE_SIZE)
+        .ok_or("user address-space bound overflow")?;
+    if end > user_end {
+        return Err("user range leaves the process user region");
+    }
+
+    // A zero-byte operation dereferences nothing, but its pointer is still
+    // required to be a canonical in-region user value. This gives all
+    // pointer-bearing syscalls one deterministic contract and ensures a
+    // malicious non-canonical value never becomes accepted merely because
+    // its accompanying length happened to be zero.
+    if len == 0 {
+        return Ok(start);
+    }
+
+    let mut checked = 0u64;
+    while checked < len {
+        let raw = raw_start
+            .checked_add(checked)
+            .ok_or("user range arithmetic overflow")?;
+        // `end <= user_end` above proves this exact conversion is canonical,
+        // but retain the fallible constructor at the untrusted boundary.
+        let addr = VirtAddr::try_new(raw).map_err(|_| "non-canonical user address")?;
+        if addr.as_u64() != raw {
+            return Err("non-canonical user address");
+        }
+        let (_, flags) = translate_in_address_space(space, addr)
+            .ok_or("user range contains an unmapped page")?;
+        if !flags.contains(PageTableFlags::PRESENT) {
+            return Err("user range contains a non-present page");
+        }
+        if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+            return Err("user range contains a supervisor-only page");
+        }
+        if require_writable && !flags.contains(PageTableFlags::WRITABLE) {
+            return Err("user range contains a read-only page");
+        }
+
+        let page_offset = raw % 4096;
+        checked += (4096 - page_offset).min(len - checked);
+    }
+    Ok(start)
 }
 
 /// Change the flags of an already-mapped page in `space`. Used by the ELF
@@ -614,6 +771,11 @@ fn for_each_mapped_chunk(
     len: u64,
     mut f: impl FnMut(*mut u8, usize),
 ) -> Result<(), &'static str> {
+    // Validate the complete destination before invoking `f` for the first
+    // chunk. This makes all users of this primitive atomic on validation
+    // failure: a bad later page can no longer leave an earlier page partly
+    // modified.
+    validate_user_range(space, start.as_u64(), len as usize, true)?;
     let phys_offset = physical_memory_offset().ok_or("physical memory offset not set")?;
     let mut written = 0u64;
     while written < len {
@@ -706,7 +868,7 @@ pub fn read_bytes_from_address_space(
     len: usize,
 ) -> Option<Vec<u8>> {
     let phys_offset = physical_memory_offset()?;
-    src.as_u64().checked_add(len as u64)?;
+    validate_user_range(space, src.as_u64(), len, false).ok()?;
 
     let mut out = Vec::with_capacity(len);
     let mut read = 0u64;
@@ -747,7 +909,7 @@ pub fn read_bytes_from_address_space_into(
         return false;
     };
     let len = dst.len() as u64;
-    if src.as_u64().checked_add(len).is_none() {
+    if validate_user_range(space, src.as_u64(), dst.len(), false).is_err() {
         return false;
     }
 
@@ -781,61 +943,239 @@ pub fn read_bytes_from_address_space_into(
     true
 }
 
-/// Unmap one page from `space`'s private address space and return its
-/// physical frame to the global allocator -- the real reclamation half of
-/// `SYS_MUNMAP` (Phase 5): the page stops translating at all (a subsequent
-/// access faults, exactly like touching memory that was never mapped), and
-/// the frame becomes available for reuse by any future allocation, not
-/// just cosmetically removed from `space`'s own bookkeeping.
-///
-/// Safe to call whether or not `space` is the active CR3, for the same
-/// `MapperFlush`/TLB reasoning as `map_in_address_space`: if `space` isn't
-/// currently loaded, the `invlpg` this issues targets whatever address
-/// space *is* loaded, which is architecturally harmless (at worst it
-/// evicts one unrelated, easily-refetched TLB entry). `SYS_MUNMAP`'s own
-/// call site only ever unmaps from the *current* process's own space,
-/// which is always the active CR3 during its own syscall, so the flush is
-/// exactly correct there.
-///
-/// Refuses anything outside `USER_REGION_PML4_INDEX`, same as
-/// `map_in_address_space` -- independent defense in depth beyond whatever
-/// range check the caller (`task::munmap_in_current_process`) already did.
-pub fn unmap_in_address_space(
-    space: &mut AddressSpace,
+/// Frame allocator used only while rolling back an interrupted batch
+/// unmap. All parent page tables necessarily still exist, so restoring a
+/// leaf mapping must not need a new frame; returning `None` makes that
+/// invariant explicit instead of accidentally allocating during rollback.
+struct NoFrameAllocator;
+
+// Safety: this allocator never hands out a frame, so it cannot violate the
+// uniqueness requirements of `FrameAllocator`.
+unsafe impl FrameAllocator<Size4KiB> for NoFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        None
+    }
+}
+
+/// A leaf mapping captured during `MUNMAP` prevalidation. Frames described by
+/// these records remain owned and unavailable to the global allocator until
+/// the complete transaction commits, which lets a long unmap yield between
+/// bounded batches without sacrificing all-or-nothing failure semantics.
+#[derive(Clone, Copy)]
+pub struct UnmapRecord {
     page: Page<Size4KiB>,
+    frame: PhysFrame<Size4KiB>,
+    flags: PageTableFlags,
+}
+
+/// Append validated leaf mappings to an in-progress unmap transaction.
+/// This changes no page table or ownership state.
+pub fn collect_unmap_records(
+    space: &AddressSpace,
+    raw_start: u64,
+    page_count: u64,
+    out: &mut Vec<UnmapRecord>,
 ) -> Result<(), &'static str> {
-    if pml4_index(page.start_address().as_u64()) != USER_REGION_PML4_INDEX {
-        return Err("refusing to unmap outside the process's private address-space region");
+    if page_count == 0 || raw_start % 4096 != 0 {
+        return Err("unmap range must contain aligned whole pages");
+    }
+    let byte_len = page_count
+        .checked_mul(4096)
+        .ok_or("unmap range length overflow")?;
+    let byte_len = usize::try_from(byte_len).map_err(|_| "unmap range too large")?;
+    validate_user_range(space, raw_start, byte_len, false)?;
+
+    let additional = usize::try_from(page_count).map_err(|_| "unmap page count too large")?;
+    out.reserve(additional);
+    let mut raw = raw_start;
+    for _ in 0..page_count {
+        let addr = VirtAddr::try_new(raw).map_err(|_| "non-canonical unmap address")?;
+        let (phys, flags) = translate_in_address_space(space, addr)
+            .ok_or("unmap range contains an unmapped page")?;
+        let frame = PhysFrame::from_start_address(phys)
+            .map_err(|_| "unmap translation was not frame-aligned")?;
+        out.push(UnmapRecord {
+            page: Page::<Size4KiB>::containing_address(addr),
+            frame,
+            flags,
+        });
+        raw = raw.checked_add(4096).ok_or("unmap address overflow")?;
+    }
+    Ok(())
+}
+
+/// Return a sorted, duplicate-free list of the transaction's leaf frames.
+pub fn unmap_record_frames(records: &[UnmapRecord]) -> Option<Vec<PhysFrame<Size4KiB>>> {
+    let mut frames: Vec<_> = records.iter().map(|record| record.frame).collect();
+    frames.sort_unstable_by_key(|frame| frame.start_address().as_u64());
+    frames.dedup_by_key(|frame| frame.start_address().as_u64());
+    (frames.len() == records.len()).then_some(frames)
+}
+
+/// One descending ownership-vector removal planned from an immutable snapshot.
+#[derive(Clone, Copy)]
+pub struct OwnershipRemoval {
+    index: usize,
+    frame: PhysFrame<Size4KiB>,
+}
+
+impl OwnershipRemoval {
+    pub fn frame(&self) -> PhysFrame<Size4KiB> {
+        self.frame
+    }
+}
+
+pub fn owned_frame_snapshot(space: &AddressSpace) -> Vec<PhysFrame<Size4KiB>> {
+    space.owned_frames.clone()
+}
+
+/// Build descending vector indices for every transaction frame. This runs
+/// outside scheduler/paging locks. Descending `Vec::remove` keeps all lower
+/// precomputed indices stable as higher elements are removed in earlier
+/// bounded batches.
+pub fn plan_unmap_ownership(
+    snapshot: &[PhysFrame<Size4KiB>],
+    sorted_frames: &[PhysFrame<Size4KiB>],
+) -> Option<Vec<OwnershipRemoval>> {
+    let mut removals = Vec::with_capacity(sorted_frames.len());
+    for (index, frame) in snapshot.iter().copied().enumerate() {
+        if sorted_frames.binary_search(&frame).is_ok() {
+            removals.push(OwnershipRemoval { index, frame });
+        }
+    }
+    if removals.len() != sorted_frames.len() {
+        return None;
+    }
+    removals.sort_unstable_by(|left, right| right.index.cmp(&left.index));
+    Some(removals)
+}
+
+/// Remove a bounded record batch from page tables while retaining physical
+/// ownership. On an unexpected failure the prefix removed by this call is
+/// restored before returning, so the caller may also restore earlier batches.
+pub fn unmap_records_atomic(
+    space: &mut AddressSpace,
+    records: &[UnmapRecord],
+) -> Result<(), &'static str> {
+    if records.is_empty() {
+        return Ok(());
     }
     let phys_offset = physical_memory_offset().ok_or("physical memory offset not set")?;
-    // Safety: `space.pml4_frame` is a valid level-4 table for as long as
-    // `space` exists.
+    // Safety: the caller holds exclusive access to `space`; its root and all
+    // parent tables remain owned throughout this deferred-reclamation phase.
     let mut mapper = unsafe { mapper_for(space.pml4_frame, phys_offset) };
-    let (frame, flush) = mapper
-        .unmap(page)
-        .map_err(|_| "unmap failed: page not mapped")?;
-    flush.flush();
-
-    // `owned_frames` no longer owns this one -- remove it so
-    // `free_address_space` (process exit) doesn't try to deallocate an
-    // already-deallocated frame later.
-    if let Some(pos) = space.owned_frames.iter().position(|f| *f == frame) {
-        space.owned_frames.remove(pos);
-    }
-
-    with_paging(|_, frame_allocator_slot| {
-        if let Some(frame_allocator) = frame_allocator_slot.as_mut() {
-            // Safety: `frame` was just unmapped from `space` (confirmed by
-            // `mapper.unmap` succeeding above) and removed from
-            // `owned_frames`, so it is neither still translated by any live
-            // mapping in `space` nor double-tracked -- exactly the contract
-            // `deallocate_frame` requires.
-            unsafe {
-                frame_allocator.deallocate_frame(frame);
+    let mut removed = 0usize;
+    for record in records {
+        match mapper.unmap(record.page) {
+            Ok((actual, flush)) if actual == record.frame => {
+                flush.flush();
+                removed += 1;
             }
+            Ok((actual, flush)) => {
+                flush.flush();
+                let mut no_frames = NoFrameAllocator;
+                // Safety: the leaf was just removed and its parent tables and
+                // frame remain live and owned.
+                let _ = unsafe { mapper.map_to(record.page, actual, record.flags, &mut no_frames) }
+                    .map(|flush| flush.flush());
+                break;
+            }
+            Err(_) => break,
         }
-    });
+    }
+    if removed == records.len() {
+        return Ok(());
+    }
+    let mut no_frames = NoFrameAllocator;
+    for record in records[..removed].iter().rev() {
+        // Safety: each leaf was removed above and nothing has reclaimed its
+        // frame or parent tables.
+        unsafe {
+            mapper
+                .map_to(record.page, record.frame, record.flags, &mut no_frames)
+                .map_err(|_| "failed to restore atomic unmap batch")?
+                .flush();
+        }
+    }
+    Err("atomic unmap batch failed; removed prefix was restored")
+}
+
+/// Restore previously removed transaction batches. No allocation is needed
+/// because `Mapper::unmap` never frees parent page tables.
+pub fn restore_unmap_records(
+    space: &mut AddressSpace,
+    records: &[UnmapRecord],
+) -> Result<(), &'static str> {
+    let phys_offset = physical_memory_offset().ok_or("physical memory offset not set")?;
+    // Safety: exclusive `space` access and retained frame/table ownership.
+    let mut mapper = unsafe { mapper_for(space.pml4_frame, phys_offset) };
+    let mut no_frames = NoFrameAllocator;
+    for record in records {
+        // Safety: this record's leaf is absent, while its frame and parent
+        // tables are still owned by `space`.
+        unsafe {
+            mapper
+                .map_to(record.page, record.frame, record.flags, &mut no_frames)
+                .map_err(|_| "failed to restore unmap transaction")?
+                .flush();
+        }
+    }
     Ok(())
+}
+
+/// Commit ownership after every leaf in a transaction has been removed.
+/// Physical frames are returned separately, after this succeeds.
+pub fn remove_unmapped_ownership(space: &mut AddressSpace, removals: &[OwnershipRemoval]) -> bool {
+    for removal in removals {
+        if space.owned_frames.get(removal.index).copied() != Some(removal.frame) {
+            return false;
+        }
+        space.owned_frames.remove(removal.index);
+    }
+    true
+}
+
+/// Return leaf frames from a committed unmap to the global reuse pool.
+pub fn release_frames(frames: &[PhysFrame<Size4KiB>]) -> Result<(), &'static str> {
+    with_paging(|_, frame_allocator_slot| {
+        let allocator = frame_allocator_slot
+            .as_mut()
+            .ok_or("frame allocator not active")?;
+        for frame in frames {
+            // Safety: the transaction removed these leaves and their address
+            // space relinquished ownership before this call.
+            unsafe { allocator.deallocate_frame(*frame) };
+        }
+        Ok(())
+    })
+}
+
+/// Atomically unmap a page-aligned range from one process address space.
+///
+/// The complete range is translated and permission-checked before the first
+/// page-table entry is changed. Leaf frames are not returned to the physical
+/// allocator until every unmap has succeeded. If an unexpected mapper error
+/// occurs after an earlier leaf was removed, those earlier leaves are restored
+/// to their original frames and flags before returning failure. Thus an
+/// invalid or partially mapped `MUNMAP` request can never punch a partial hole
+/// in the caller's address space.
+pub fn unmap_range_in_address_space_atomic(
+    space: &mut AddressSpace,
+    raw_start: u64,
+    page_count: u64,
+) -> Result<(), &'static str> {
+    let mut records = Vec::new();
+    collect_unmap_records(space, raw_start, page_count, &mut records)?;
+    let frames = unmap_record_frames(&records).ok_or("duplicate frame in unmap transaction")?;
+    let snapshot = owned_frame_snapshot(space);
+    let removals = plan_unmap_ownership(&snapshot, &frames)
+        .ok_or("unmap range contains a frame not owned by this address space")?;
+    unmap_records_atomic(space, &records)?;
+    if !remove_unmapped_ownership(space, &removals) {
+        restore_unmap_records(space, &records)?;
+        return Err("unmapped leaf frame missing from address-space ownership");
+    }
+    release_frames(&frames)
 }
 
 /// Load `frame` as the active CR3. Called on *every* scheduler switch

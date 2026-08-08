@@ -290,12 +290,26 @@ impl Scheduler {
             self.tasks[self.current].state = TaskState::Ready;
         }
 
-        let mut next = self.current;
-        for offset in 1..=n {
-            let idx = (self.current + offset) % n;
-            if self.tasks[idx].state == TaskState::Ready {
-                next = idx;
-                break;
+        let requested = FOREGROUND_WAKE_ID.swap(0, Ordering::AcqRel);
+        let mut next = if requested != 0 {
+            self.tasks
+                .iter()
+                .position(|task| {
+                    task.id == requested
+                        && task.state == TaskState::Ready
+                        && task.id != self.tasks[self.current].id
+                })
+                .unwrap_or(self.current)
+        } else {
+            self.current
+        };
+        if next == self.current {
+            for offset in 1..=n {
+                let idx = (self.current + offset) % n;
+                if self.tasks[idx].state == TaskState::Ready {
+                    next = idx;
+                    break;
+                }
             }
         }
 
@@ -350,6 +364,12 @@ impl Scheduler {
 static SCHEDULER: Mutex<Option<Scheduler>> = Mutex::new(None);
 static NEXT_ID: AtomicU32 = AtomicU32::new(3); // 1 = shell, 2 = idle
 static TICKS_SINCE_SWITCH: AtomicU64 = AtomicU64::new(0);
+static FOREGROUND_WAKE_ID: AtomicU32 = AtomicU32::new(0);
+static VM_BATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+static VM_BATCH_TOTAL_CYCLES: AtomicU64 = AtomicU64::new(0);
+static VM_BATCH_MAX_CYCLES: AtomicU64 = AtomicU64::new(0);
+static VM_BATCH_MAX_KIND: AtomicU32 = AtomicU32::new(0);
+static MMAP_FAIL_AFTER_PAGES: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// The only sanctioned way to touch `SCHEDULER`. Every call site used to
 /// take `SCHEDULER.lock()` directly; several (`init`, `spawn`, `list`,
@@ -376,6 +396,75 @@ where
         let mut guard = SCHEDULER.lock();
         f(&mut guard)
     })
+}
+
+fn with_vm_batch<F, R>(kind: u32, f: F) -> R
+where
+    F: FnOnce(&mut Option<Scheduler>) -> R,
+{
+    let started = unsafe { core::arch::x86_64::_rdtsc() };
+    let result = with_scheduler(f);
+    let cycles = unsafe { core::arch::x86_64::_rdtsc() }.saturating_sub(started);
+    record_vm_batch_cycles(cycles, kind);
+    result
+}
+
+fn record_vm_batch_cycles(cycles: u64, kind: u32) {
+    VM_BATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+    VM_BATCH_TOTAL_CYCLES.fetch_add(cycles, Ordering::Relaxed);
+    let mut current = VM_BATCH_MAX_CYCLES.load(Ordering::Relaxed);
+    while cycles > current {
+        match VM_BATCH_MAX_CYCLES.compare_exchange_weak(
+            current,
+            cycles,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                VM_BATCH_MAX_KIND.store(kind, Ordering::Relaxed);
+                break;
+            }
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct VmBatchTelemetry {
+    pub count: u64,
+    pub total_cycles: u64,
+    pub max_cycles: u64,
+    pub max_kind: u32,
+}
+
+pub fn reset_vm_batch_telemetry() {
+    VM_BATCH_COUNT.store(0, Ordering::Relaxed);
+    VM_BATCH_TOTAL_CYCLES.store(0, Ordering::Relaxed);
+    VM_BATCH_MAX_CYCLES.store(0, Ordering::Relaxed);
+    VM_BATCH_MAX_KIND.store(0, Ordering::Relaxed);
+}
+
+pub fn vm_batch_telemetry() -> VmBatchTelemetry {
+    VmBatchTelemetry {
+        count: VM_BATCH_COUNT.load(Ordering::Relaxed),
+        total_cycles: VM_BATCH_TOTAL_CYCLES.load(Ordering::Relaxed),
+        max_cycles: VM_BATCH_MAX_CYCLES.load(Ordering::Relaxed),
+        max_kind: VM_BATCH_MAX_KIND.load(Ordering::Relaxed),
+    }
+}
+
+/// Arm one deterministic, kernel-internal MMAP rollback test. This is not
+/// reachable from the syscall ABI; the shell acceptance command uses it once
+/// before starting the dedicated hostile ELF.
+pub fn inject_next_mmap_failure_after(mapped_pages: u64) {
+    MMAP_FAIL_AFTER_PAGES.store(mapped_pages, Ordering::Release);
+}
+
+/// Disarm the kernel-internal MMAP rollback test hook. The shell calls this
+/// on every completion path so a failed process spawn can never leave a
+/// latent failure armed for an unrelated userspace process.
+pub fn clear_mmap_failure_injection() {
+    MMAP_FAIL_AFTER_PAGES.store(u64::MAX, Ordering::Release);
 }
 
 // Safety: `context_switch` only touches the callee-saved registers SysV
@@ -609,6 +698,19 @@ pub fn spawn(name: &str, entry: fn()) -> u32 {
         sched.tasks.push(Box::new(tcb));
     });
     id
+}
+
+/// Request one latency-sensitive scheduling choice for a foreground process.
+/// The request is consumed exactly once by `prepare_switch`; it does not alter
+/// the timer quantum or permanently prioritize the task over round-robin peers.
+pub fn request_foreground_wake(id: u32) {
+    FOREGROUND_WAKE_ID.store(id, Ordering::Release);
+    // Ask the next 100 Hz PIT interrupt to run the scheduler instead of
+    // waiting out the current task's remaining 50 ms quantum. The request is
+    // still consumed once in `prepare_switch`; if `id` is already current,
+    // ordinary round-robin selection applies and continuous input cannot pin
+    // the desktop on CPU.
+    TICKS_SINCE_SWITCH.store(TIME_SLICE_TICKS, Ordering::Release);
 }
 
 /// Called from `interrupts::timer_interrupt_handler` on every PIT tick.
@@ -892,13 +994,17 @@ fn current_process_entry() -> Option<(u64, u64)> {
 /// dereference of a user-supplied address.
 pub fn copy_from_current_user(addr: u64, len: usize) -> Option<Vec<u8>> {
     with_scheduler(|slot| {
+        let user_addr = VirtAddr::try_new(addr).ok()?;
+        if user_addr.as_u64() != addr {
+            return None;
+        }
         let sched = slot.as_ref()?;
         let space = sched.tasks[sched.current]
             .process
             .as_ref()?
             .address_space
             .as_ref()?;
-        paging::read_bytes_from_address_space(space, VirtAddr::new(addr), len)
+        paging::read_bytes_from_address_space(space, user_addr, len)
     })
 }
 
@@ -914,13 +1020,34 @@ pub fn copy_from_current_user(addr: u64, len: usize) -> Option<Vec<u8>> {
 /// process or if any byte in range fails validation.
 pub fn copy_to_current_user(addr: u64, data: &[u8]) -> bool {
     with_scheduler(|slot| {
+        let user_addr = VirtAddr::try_new(addr).ok()?;
+        if user_addr.as_u64() != addr {
+            return None;
+        }
         let sched = slot.as_ref()?;
         let space = sched.tasks[sched.current]
             .process
             .as_ref()?
             .address_space
             .as_ref()?;
-        paging::write_bytes_in_address_space(space, VirtAddr::new(addr), data).ok()
+        paging::write_bytes_in_address_space(space, user_addr, data).ok()
+    })
+    .is_some()
+}
+
+/// Validate an entire caller-supplied range in the currently running user
+/// process without reading from or writing to it. `INPUT_POLL` uses this
+/// before removing an event from the queue, including when the queue is empty,
+/// so an invalid destination always reports `-1` and can never consume data.
+pub fn validate_current_user_range(addr: u64, len: usize, writable: bool) -> bool {
+    with_scheduler(|slot| {
+        let sched = slot.as_ref()?;
+        let space = sched.tasks[sched.current]
+            .process
+            .as_ref()?
+            .address_space
+            .as_ref()?;
+        paging::validate_user_range(space, addr, len, writable).ok()
     })
     .is_some()
 }
@@ -964,6 +1091,45 @@ fn page_count_for(len: u64) -> Option<u64> {
 /// caller's behalf.
 pub const MAX_MMAP_LEN: u64 = 64 * 1024 * 1024;
 
+/// Bound VM work done while the scheduler lock and interrupts are held. Long
+/// syscalls explicitly enable interrupts between these batches and yield, so
+/// a hostile maximum-size request cannot suppress the 100 Hz clock or starve
+/// round-robin peers.
+pub const VM_BATCH_PAGES: u64 = 4;
+
+fn current_space_matches_mmap_start(process: &ProcessState, start: u64) -> bool {
+    process.mmap_next == start && process.address_space.is_some()
+}
+
+fn rollback_mmap_or_exit(start: u64, mapped_pages: u64) {
+    let mut rolled_back = 0u64;
+    while rolled_back < mapped_pages {
+        let batch = VM_BATCH_PAGES.min(mapped_pages - rolled_back);
+        let batch_start = start + rolled_back * 4096;
+        let restored = with_vm_batch(14, |slot| {
+            let Some(sched) = slot.as_mut() else {
+                return false;
+            };
+            let Some(space) = sched.tasks[sched.current]
+                .process
+                .as_mut()
+                .and_then(|process| process.address_space.as_mut())
+            else {
+                return false;
+            };
+            paging::unmap_range_in_address_space_atomic(space, batch_start, batch).is_ok()
+        });
+        if !restored {
+            crate::serial_println!(
+                "mmap: rollback invariant failed at {:#x}; terminating caller fail-closed",
+                batch_start
+            );
+            exit_with_code(255);
+        }
+        rolled_back += batch;
+    }
+}
+
 /// `SYS_MMAP`'s implementation: grow the *currently running* user
 /// process's own anonymous-memory arena by `len` bytes (rounded up to
 /// whole pages) and return the new region's starting address, or `None` on
@@ -983,15 +1149,11 @@ pub const MAX_MMAP_LEN: u64 = 64 * 1024 * 1024;
 /// process's address space no matter what this function does or doesn't
 /// check.
 ///
-/// **Known limitation**: a partially-successful mapping (some pages
-/// mapped, a later one fails -- e.g. the allocator runs out of frames
-/// partway through a large request) is not rolled back page-by-page; the
-/// successfully mapped pages remain mapped (tracked in the process's own
-/// `AddressSpace::owned_frames`, so they are still correctly freed whenever
-/// the process eventually exits) but are not returned to the caller and
-/// cannot be reused by a later `SYS_MMAP` call in this minimal, no-free-list
-/// bump allocator. Documented rather than silently accepted -- see
-/// `ARCHITECTURE.md`'s Phase 5 known limitations.
+/// Mapping, zero-fill, and final-permission installation are transactional at
+/// the syscall boundary: if any step fails, every leaf page installed for the
+/// request is unmapped and reclaimed, and `mmap_next` is left unchanged. Empty
+/// paging-structure frames created while attempting the range remain valid,
+/// process-owned infrastructure and are reused by a retry at the same address.
 pub fn mmap_in_current_process(len: u64, writable: bool) -> Option<u64> {
     if len == 0 || len > MAX_MMAP_LEN {
         return None;
@@ -999,54 +1161,190 @@ pub fn mmap_in_current_process(len: u64, writable: bool) -> Option<u64> {
     let pages = page_count_for(len)?;
     let region_len = pages.checked_mul(4096)?;
 
-    with_scheduler(|slot| {
-        let sched = slot.as_mut()?;
-        let process = sched.tasks[sched.current].process.as_mut()?;
-        let space = process.address_space.as_mut()?;
-
+    let (start, end, worst_case_frames) = with_vm_batch(1, |slot| {
+        let sched = slot.as_ref()?;
+        let process = sched.tasks[sched.current].process.as_ref()?;
         let start = process.mmap_next;
         let end = start.checked_add(region_len)?;
         if end > paging::USER_MMAP_LIMIT {
             return None;
         }
+        let first_2m = start >> 21;
+        let last_2m = end.checked_sub(1)? >> 21;
+        let p1_tables = last_2m.checked_sub(first_2m)?.checked_add(1)?;
+        let worst_case_frames = pages.checked_add(p1_tables)?.checked_add(2)?;
+        let worst_case_frames = usize::try_from(worst_case_frames).ok()?;
+        Some((start, end, worst_case_frames))
+    })?;
 
-        let mut flags =
-            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
-        if writable {
-            flags |= PageTableFlags::WRITABLE;
-        } else {
-            // Zeroing below needs a WRITABLE mapping regardless of what the
-            // caller ultimately wants; map writable now, narrow to the
-            // requested (read-only) permissions once the zero-fill is done
-            // -- identical two-step "populate, then lock down" pattern
-            // `elf.rs` already uses for segment permissions.
-            flags |= PageTableFlags::WRITABLE;
-        }
+    // Admission control is conservative and mutation-free. A competing
+    // process may consume frames after this check once interrupts are enabled;
+    // any resulting mid-map failure is fully rolled back below.
+    if !paging::can_allocate_frames(worst_case_frames) {
+        return None;
+    }
 
-        let mut page_addr = start;
-        while page_addr < end {
-            let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(page_addr));
-            paging::map_in_address_space(space, page, flags).ok()?;
-            page_addr += 4096;
-        }
+    // Safety: `MMAP` is entered through an interrupt gate with IF cleared.
+    // From this point onward no scheduler/paging borrow or lock escapes its
+    // bounded closure, so timer/IRQ preemption between batches is safe. IRET
+    // restores the caller's original flags on return.
+    x86_64::instructions::interrupts::enable();
 
-        paging::zero_bytes_in_address_space(space, VirtAddr::new(start), region_len).ok()?;
-
-        if !writable {
-            let final_flags = PageTableFlags::PRESENT
-                | PageTableFlags::USER_ACCESSIBLE
-                | PageTableFlags::NO_EXECUTE;
-            let mut page_addr = start;
-            while page_addr < end {
-                let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(page_addr));
-                paging::update_flags_in_address_space(space, page, final_flags).ok()?;
-                page_addr += 4096;
+    // Prevalidate the complete destination before the first mutation.
+    let mut checked_pages = 0u64;
+    while checked_pages < pages {
+        let batch = VM_BATCH_PAGES.min(pages - checked_pages);
+        let batch_start = start + checked_pages * 4096;
+        let clear = with_vm_batch(2, |slot| {
+            let Some(sched) = slot.as_ref() else {
+                return false;
+            };
+            let Some(process) = sched.tasks[sched.current].process.as_ref() else {
+                return false;
+            };
+            if !current_space_matches_mmap_start(process, start) {
+                return false;
             }
+            let space = process.address_space.as_ref().unwrap();
+            (0..batch).all(|offset| {
+                VirtAddr::try_new(batch_start + offset * 4096)
+                    .ok()
+                    .and_then(|addr| paging::translate_in_address_space(space, addr))
+                    .is_none()
+            })
+        });
+        if !clear {
+            return None;
         }
+        checked_pages += batch;
+    }
 
+    let staging_flags = PageTableFlags::PRESENT
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE
+        | PageTableFlags::WRITABLE;
+    let mut mapped_pages = 0u64;
+    while mapped_pages < pages {
+        let fail_after = MMAP_FAIL_AFTER_PAGES.load(Ordering::Acquire);
+        if fail_after != u64::MAX && mapped_pages >= fail_after {
+            MMAP_FAIL_AFTER_PAGES.store(u64::MAX, Ordering::Release);
+            rollback_mmap_or_exit(start, mapped_pages);
+            return None;
+        }
+        let batch = VM_BATCH_PAGES.min(pages - mapped_pages);
+        let batch_start = start + mapped_pages * 4096;
+        let mapped_now = with_vm_batch(3, |slot| {
+            let Some(sched) = slot.as_mut() else {
+                return 0;
+            };
+            let Some(process) = sched.tasks[sched.current].process.as_mut() else {
+                return 0;
+            };
+            if !current_space_matches_mmap_start(process, start) {
+                return 0;
+            }
+            let space = process.address_space.as_mut().unwrap();
+            let mut done = 0u64;
+            for offset in 0..batch {
+                let Ok(addr) = VirtAddr::try_new(batch_start + offset * 4096) else {
+                    break;
+                };
+                let page: Page<Size4KiB> = Page::containing_address(addr);
+                if paging::map_in_address_space(space, page, staging_flags).is_err() {
+                    break;
+                }
+                done += 1;
+            }
+            done
+        });
+        mapped_pages += mapped_now;
+        if mapped_now != batch {
+            rollback_mmap_or_exit(start, mapped_pages);
+            return None;
+        }
+    }
+
+    let mut zeroed_pages = 0u64;
+    while zeroed_pages < pages {
+        let batch = VM_BATCH_PAGES.min(pages - zeroed_pages);
+        let batch_start = start + zeroed_pages * 4096;
+        let zeroed = with_vm_batch(4, |slot| {
+            let Some(sched) = slot.as_mut() else {
+                return false;
+            };
+            let Some(process) = sched.tasks[sched.current].process.as_mut() else {
+                return false;
+            };
+            let Some(space) = process.address_space.as_mut() else {
+                return false;
+            };
+            let Ok(addr) = VirtAddr::try_new(batch_start) else {
+                return false;
+            };
+            paging::zero_bytes_in_address_space(space, addr, batch * 4096).is_ok()
+        });
+        if !zeroed {
+            rollback_mmap_or_exit(start, mapped_pages);
+            return None;
+        }
+        zeroed_pages += batch;
+    }
+
+    if !writable {
+        let final_flags =
+            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
+        let mut protected_pages = 0u64;
+        while protected_pages < pages {
+            let batch = VM_BATCH_PAGES.min(pages - protected_pages);
+            let batch_start = start + protected_pages * 4096;
+            let protected = with_vm_batch(5, |slot| {
+                let Some(sched) = slot.as_mut() else {
+                    return false;
+                };
+                let Some(space) = sched.tasks[sched.current]
+                    .process
+                    .as_mut()
+                    .and_then(|process| process.address_space.as_mut())
+                else {
+                    return false;
+                };
+                for offset in 0..batch {
+                    let Ok(addr) = VirtAddr::try_new(batch_start + offset * 4096) else {
+                        return false;
+                    };
+                    let page: Page<Size4KiB> = Page::containing_address(addr);
+                    if paging::update_flags_in_address_space(space, page, final_flags).is_err() {
+                        return false;
+                    }
+                }
+                true
+            });
+            if !protected {
+                rollback_mmap_or_exit(start, mapped_pages);
+                return None;
+            }
+            protected_pages += batch;
+        }
+    }
+
+    let committed = with_vm_batch(6, |slot| {
+        let Some(sched) = slot.as_mut() else {
+            return false;
+        };
+        let Some(process) = sched.tasks[sched.current].process.as_mut() else {
+            return false;
+        };
+        if process.mmap_next != start {
+            return false;
+        }
         process.mmap_next = end;
-        Some(start)
-    })
+        true
+    });
+    if !committed {
+        rollback_mmap_or_exit(start, mapped_pages);
+        return None;
+    }
+    Some(start)
 }
 
 /// `SYS_MUNMAP`'s implementation: unmap `[ptr, ptr+len)` from the
@@ -1068,30 +1366,139 @@ pub fn munmap_in_current_process(ptr: u64, len: u64) -> bool {
         return false;
     };
 
-    with_scheduler(|slot| {
-        let Some(sched) = slot.as_mut() else {
+    let in_bounds = with_vm_batch(7, |slot| {
+        let Some(sched) = slot.as_ref() else {
             return false;
         };
-        let Some(process) = sched.tasks[sched.current].process.as_mut() else {
+        let Some(process) = sched.tasks[sched.current].process.as_ref() else {
             return false;
         };
-        if ptr < paging::USER_MMAP_BASE || end > process.mmap_next {
-            return false;
-        }
-        let Some(space) = process.address_space.as_mut() else {
-            return false;
-        };
+        ptr >= paging::USER_MMAP_BASE && end <= process.mmap_next && process.address_space.is_some()
+    });
+    if !in_bounds {
+        return false;
+    }
 
-        let mut page_addr = ptr;
-        while page_addr < end {
-            let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(page_addr));
-            if paging::unmap_in_address_space(space, page).is_err() {
+    // Safety: identical bounded-lock argument to `mmap_in_current_process`.
+    x86_64::instructions::interrupts::enable();
+    let pages = len / 4096;
+    let mut records = Vec::with_capacity(pages as usize);
+    let mut collected = 0u64;
+    while collected < pages {
+        let batch = VM_BATCH_PAGES.min(pages - collected);
+        let batch_start = ptr + collected * 4096;
+        let valid = with_vm_batch(8, |slot| {
+            let Some(sched) = slot.as_ref() else {
                 return false;
-            }
-            page_addr += 4096;
+            };
+            let Some(space) = sched.tasks[sched.current]
+                .process
+                .as_ref()
+                .and_then(|process| process.address_space.as_ref())
+            else {
+                return false;
+            };
+            paging::collect_unmap_records(space, batch_start, batch, &mut records).is_ok()
+        });
+        if !valid {
+            return false;
         }
-        true
-    })
+        collected += batch;
+    }
+
+    let Some(frames) = paging::unmap_record_frames(&records) else {
+        return false;
+    };
+    let ownership_snapshot = with_vm_batch(9, |slot| {
+        slot.as_ref()
+            .and_then(|sched| sched.tasks[sched.current].process.as_ref())
+            .and_then(|process| process.address_space.as_ref())
+            .map(paging::owned_frame_snapshot)
+    });
+    let Some(ownership_snapshot) = ownership_snapshot else {
+        return false;
+    };
+    let Some(removals) = paging::plan_unmap_ownership(&ownership_snapshot, &frames) else {
+        return false;
+    };
+
+    let mut removed = 0usize;
+    while removed < records.len() {
+        let batch_end = (removed + VM_BATCH_PAGES as usize).min(records.len());
+        let ok = with_vm_batch(10, |slot| {
+            let Some(sched) = slot.as_mut() else {
+                return false;
+            };
+            let Some(space) = sched.tasks[sched.current]
+                .process
+                .as_mut()
+                .and_then(|process| process.address_space.as_mut())
+            else {
+                return false;
+            };
+            paging::unmap_records_atomic(space, &records[removed..batch_end]).is_ok()
+        });
+        if !ok {
+            let restored = with_vm_batch(11, |slot| {
+                let Some(sched) = slot.as_mut() else {
+                    return false;
+                };
+                let Some(space) = sched.tasks[sched.current]
+                    .process
+                    .as_mut()
+                    .and_then(|process| process.address_space.as_mut())
+                else {
+                    return false;
+                };
+                paging::restore_unmap_records(space, &records[..removed]).is_ok()
+            });
+            if !restored {
+                crate::serial_println!(
+                    "munmap: restoration invariant failed; terminating caller fail-closed"
+                );
+                exit_with_code(255);
+            }
+            return false;
+        }
+        removed = batch_end;
+    }
+
+    for removal_batch in removals.chunks(VM_BATCH_PAGES as usize) {
+        let ownership_removed = with_vm_batch(12, |slot| {
+            let Some(sched) = slot.as_mut() else {
+                return false;
+            };
+            let Some(space) = sched.tasks[sched.current]
+                .process
+                .as_mut()
+                .and_then(|process| process.address_space.as_mut())
+            else {
+                return false;
+            };
+            paging::remove_unmapped_ownership(space, removal_batch)
+        });
+        if !ownership_removed {
+            crate::serial_println!(
+                "munmap: ownership commit invariant failed; terminating caller fail-closed"
+            );
+            exit_with_code(255);
+        }
+        let release_frames: Vec<_> = removal_batch
+            .iter()
+            .map(paging::OwnershipRemoval::frame)
+            .collect();
+        let started = unsafe { core::arch::x86_64::_rdtsc() };
+        let released = paging::release_frames(&release_frames).is_ok();
+        let cycles = unsafe { core::arch::x86_64::_rdtsc() }.saturating_sub(started);
+        record_vm_batch_cycles(cycles, 13);
+        if !released {
+            crate::serial_println!(
+                "munmap: frame-release invariant failed; terminating caller fail-closed"
+            );
+            exit_with_code(255);
+        }
+    }
+    true
 }
 
 /// Number of physical frames a process's address space currently owns --
