@@ -100,11 +100,12 @@ pub fn framebuffer_checksum() -> Option<u64> {
 ///   truncated or read out of bounds;
 /// - every page of `[user_ptr, user_ptr+user_len)` in the calling
 ///   process's own address space must be mapped `PRESENT |
-///   USER_ACCESSIBLE` (checked arithmetic throughout, via
-///   `paging::read_bytes_from_address_space_into` -- the same validated,
-///   chunk-at-a-time primitive `WRITE`'s pointer validation is built on,
-///   just copying straight into the destination instead of an intermediate
-///   `Vec` for this call's much larger, once-per-frame payload).
+///   USER_ACCESSIBLE`, using the same checked full-range validator as the
+///   other pointer-bearing syscalls.
+///
+/// Once preflight succeeds, the caller's CR3 is still active and immutable
+/// for this single-threaded process, so one contiguous copy updates the
+/// disjoint kernel framebuffer without a redundant second page-table walk.
 ///
 /// A process's own `SYS_MMAP`'d buffer is never the real framebuffer and
 /// is never touched by any *other* process's address space (Phase 4's
@@ -124,16 +125,29 @@ pub fn present(user_ptr: u64, user_len: usize) -> Result<(), &'static str> {
     let started = unsafe { core::arch::x86_64::_rdtsc() };
     let ok = crate::task::with_current_address_space(|space| {
         // Full-range preflight happens before even borrowing the mutable
-        // framebuffer slice. `read_bytes_from_address_space_into` repeats the
-        // check defensively before its first copy, so a later unmapped or
-        // supervisor page can never produce a partially presented frame.
+        // framebuffer slice. The process's CR3 remains active throughout this
+        // non-preemptible syscall and a process has one userspace thread, so
+        // the mapping cannot change between validation and the copy.
         if paging::validate_user_range(space, user_ptr, user_len, false).is_err() {
             return false;
         }
         let Some(fb_buffer) = crate::framebuffer_console::raw_buffer_mut() else {
             return false;
         };
-        paging::read_bytes_from_address_space_into(space, user_addr, fb_buffer)
+        // Safety: the complete source was just validated PRESENT and
+        // USER_ACCESSIBLE in the active caller's address space. The source is
+        // a private user-region range and the destination is the disjoint
+        // kernel-owned framebuffer slice, both valid for exactly `user_len`.
+        // One contiguous copy avoids a second per-page page-table walk while
+        // preserving the all-validation-before-mutation contract.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                user_addr.as_ptr::<u8>(),
+                fb_buffer.as_mut_ptr(),
+                user_len,
+            );
+        }
+        true
     });
 
     match ok {

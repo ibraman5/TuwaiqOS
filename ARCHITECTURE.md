@@ -686,13 +686,12 @@ owned into a controlled interface for Ring 3:
   truncated or read out of bounds); every page of the caller's buffer must
   be mapped `PRESENT | USER_ACCESSIBLE` in the caller's own address space.
   A full-range preflight completes before the mutable physical framebuffer is
-  borrowed, then `paging::read_bytes_from_address_space_into` repeats that
-  preflight defensively before its first copy. A bad later page therefore
-  changes zero framebuffer bytes. This uses a
-  direct-copy primitive (no intermediate `Vec`) added specifically because
-  this call's payload is a full frame (megabytes) submitted every redraw,
-  where `WRITE`'s existing `Vec`-allocating primitive would cost a fresh
-  multi-megabyte allocation on every single presented frame.
+  borrowed. The caller's CR3 remains active and its one userspace thread
+  cannot change mappings during this non-preemptible syscall; only then does
+  one contiguous copy update the disjoint kernel framebuffer. A bad later page
+  therefore changes zero framebuffer bytes. Avoiding both an intermediate
+  multi-megabyte `Vec` and a redundant second page-table walk keeps the
+  validated full-frame copy below one scheduler quantum in acceptance.
 - **Negative tests** (`bad_display.rs`): kernel, noncanonical, cross-page,
   unmapped, partially mapped, and wrong-sized buffers are rejected. The shell
   compares full-framebuffer checksums before/after the hostile process to prove
@@ -923,11 +922,12 @@ Measured dirty-candidate results before the final clean-commit rerun were:
   with adjacent move coalescing and zero dropped events;
 - the former 64 MiB VM blackout took 30.942 s with PIT suppressed. Batched VM
   transactions reduced the full allocation/rejection/unmap/reuse sequence to
-  12.586 s while PIT advanced during both large syscalls. Critical sections
-  averaged 20 milli-ticks (~0.2 ms); the observed QEMU/host tail was 5718
-  milli-ticks (~57 ms), under the 100 ms hard gate;
-- full-frame present measured 4808 milli-ticks (~48 ms) worst case, below one
-  50 ms scheduler quantum. The desktop avoids presents entirely while idle;
+  12.957 s while PIT advanced during both large syscalls. Critical sections
+  averaged 21 milli-ticks (~0.21 ms); the observed QEMU/host tail was 5976
+  milli-ticks (~59.8 ms), under the 100 ms hard gate;
+- after removing the redundant second page-table walk, full-frame present
+  measured 3532 milli-ticks (~35.3 ms) worst case, below one 50 ms scheduler
+  quantum. The desktop avoids presents entirely while idle;
 - the kernel build retained the pre-existing 9 warnings and added zero new
   warnings. Rust formatting and `git diff --check` are final gates.
 

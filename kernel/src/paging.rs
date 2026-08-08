@@ -893,56 +893,6 @@ pub fn read_bytes_from_address_space(
     Some(out)
 }
 
-/// Like `read_bytes_from_address_space`, but copies directly into a
-/// caller-supplied `dst` instead of allocating a new `Vec` -- used by
-/// `display::present` (Phase 5) to copy a validated user framebuffer
-/// straight into the real one without an unnecessary intermediate heap
-/// allocation on every frame. Same validation as the `Vec`-returning
-/// version: every page touched must be `PRESENT | USER_ACCESSIBLE`, and
-/// `src + dst.len()` must not overflow.
-pub fn read_bytes_from_address_space_into(
-    space: &AddressSpace,
-    src: VirtAddr,
-    dst: &mut [u8],
-) -> bool {
-    let Some(phys_offset) = physical_memory_offset() else {
-        return false;
-    };
-    let len = dst.len() as u64;
-    if validate_user_range(space, src.as_u64(), dst.len(), false).is_err() {
-        return false;
-    }
-
-    let mut read = 0u64;
-    while read < len {
-        let addr = src + read;
-        let Some((phys, flags)) = translate_in_address_space(space, addr) else {
-            return false;
-        };
-        if !flags.contains(PageTableFlags::USER_ACCESSIBLE) {
-            return false;
-        }
-        let page_offset = addr.as_u64() % 4096;
-        let chunk_len = (4096 - page_offset).min(len - read);
-        let src_ptr: *const u8 = (phys_offset + phys.as_u64()).as_ptr();
-        // Safety: `phys` was just resolved from a `PRESENT | USER_ACCESSIBLE`
-        // mapping in `space`'s own tables (checked above); `dst[read..]` has
-        // at least `chunk_len` bytes remaining since the loop never exceeds
-        // `dst.len()` total (checked via the overflow guard above and the
-        // `read < len` condition); the physical-memory offset mapping
-        // covers all usable RAM.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                src_ptr,
-                dst[read as usize..].as_mut_ptr(),
-                chunk_len as usize,
-            );
-        }
-        read += chunk_len;
-    }
-    true
-}
-
 /// Frame allocator used only while rolling back an interrupted batch
 /// unmap. All parent page tables necessarily still exist, so restoring a
 /// leaf mapping must not need a new frame; returning `None` makes that
