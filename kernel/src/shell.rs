@@ -1850,6 +1850,13 @@ fn handle_desktop_interaction_test(mode: ConsoleMode) {
         return;
     }
     let interaction = x86_64::instructions::interrupts::without_interrupts(|| {
+        // Measure the ready desktop's controlled interaction path, not host
+        // mouse packets that may have arrived while its mmap/first present
+        // was still starting. This diagnostic owns the foreground session
+        // and injects the complete sequence below, so discard that startup
+        // residue and begin telemetry at the actual measurement boundary.
+        crate::input::clear();
+        crate::input::reset_telemetry();
         crate::mouse::reset_decoder_for_diagnostics();
         (|| -> Result<(), &'static str> {
             inject_mouse_to(150, 100, 0)?;
