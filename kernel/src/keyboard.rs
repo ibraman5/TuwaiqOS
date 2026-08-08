@@ -1,15 +1,15 @@
 //! PS/2 keyboard input (interrupt-driven).
 //!
 //! Scancodes arrive one byte at a time from `interrupts::keyboard_interrupt_handler`
-//! (IRQ1), are decoded here into `KeyEvent`s, and queued for the shell to
-//! drain with `poll_key()`. This replaces the v0.5 implementation, which
-//! re-read ports 0x60/0x64 in a tight loop from the shell's own input loop;
-//! `poll_key()` keeps its exact old signature so `shell.rs` needed no changes.
+//! (IRQ1), are decoded here into `KeyEvent`s, and routed to exactly one
+//! foreground owner: either the Ring 0 shell queue or the Ring 3 input queue.
+//! Ownership changes clear both queues, so keys typed into the desktop can
+//! never replay into the privileged shell after the desktop exits.
 //!
 //! Supports printable keys, Shift modifiers, arrow keys, and Tab.
 
 use alloc::collections::VecDeque;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -23,7 +23,16 @@ pub enum KeyEvent {
     ArrowUp,
     ArrowDown,
     Tab,
+    Escape,
     None,
+}
+
+/// The one destination allowed to receive decoded keyboard events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ForegroundInputOwner {
+    Shell = 0,
+    Desktop = 1,
 }
 
 static LEFT_SHIFT: AtomicBool = AtomicBool::new(false);
@@ -31,6 +40,9 @@ static RIGHT_SHIFT: AtomicBool = AtomicBool::new(false);
 /// Set after seeing the 0xE0 extended-scancode prefix; the *next* byte
 /// delivered by IRQ1 completes that two-byte sequence.
 static EXTENDED_PENDING: AtomicBool = AtomicBool::new(false);
+/// PID 0 is reserved as the Ring 0 shell sentinel; scheduler user-task IDs
+/// start above zero. A nonzero value binds input polling to that one process.
+static FOREGROUND_PROCESS_ID: AtomicU32 = AtomicU32::new(0);
 
 fn shift_active() -> bool {
     LEFT_SHIFT.load(Ordering::Relaxed) || RIGHT_SHIFT.load(Ordering::Relaxed)
@@ -68,11 +80,7 @@ where
 pub fn on_scancode(scancode: u8) {
     if EXTENDED_PENDING.swap(false, Ordering::Relaxed) {
         if let Some(event) = translate_extended(scancode) {
-            push(event);
-            // Additive fan-out into the Phase 5 unified input queue -- see
-            // `input.rs`'s module docs for why this cannot regress this
-            // (unchanged) shell-facing queue/path.
-            crate::input::push_key_event(event);
+            route(event);
         }
         return;
     }
@@ -83,18 +91,60 @@ pub fn on_scancode(scancode: u8) {
     }
 
     if let Some(event) = translate_scancode(scancode) {
-        push(event);
-        crate::input::push_key_event(event);
+        route(event);
     }
 }
 
-fn push(event: KeyEvent) {
+fn route(event: KeyEvent) {
+    match foreground_owner() {
+        ForegroundInputOwner::Shell => push_shell(event),
+        ForegroundInputOwner::Desktop => crate::input::push_key_event(event),
+    }
+}
+
+fn push_shell(event: KeyEvent) {
     with_queue(|queue| {
         if queue.len() < QUEUE_CAPACITY {
             queue.push_back(event);
         }
         // Silently drop when full: better to lose an unread keystroke than
         // to block the ISR or grow the queue unbounded.
+    });
+}
+
+/// Return the current exclusive keyboard-input owner.
+pub fn foreground_owner() -> ForegroundInputOwner {
+    if foreground_process_id().is_some() {
+        ForegroundInputOwner::Desktop
+    } else {
+        ForegroundInputOwner::Shell
+    }
+}
+
+/// The only Ring 3 PID allowed to consume foreground input, or `None` while
+/// the privileged shell owns the keyboard.
+pub fn foreground_process_id() -> Option<u32> {
+    match FOREGROUND_PROCESS_ID.load(Ordering::Acquire) {
+        0 => None,
+        pid => Some(pid),
+    }
+}
+
+/// Atomically hand keyboard input to `owner` and discard every event queued
+/// for either the previous or next owner. Interrupts stay disabled across
+/// both queue clears and the owner store, so an IRQ1 cannot land in the
+/// middle and route a key according to half-transitioned state.
+pub fn set_foreground_process_id(process_id: Option<u32>) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        QUEUE.lock().clear();
+        crate::input::clear();
+        if process_id.is_some() {
+            crate::input::reset_telemetry();
+        }
+        // Do not let an 0xE0 prefix received by one owner reinterpret the
+        // first byte received by the next owner.
+        EXTENDED_PENDING.store(false, Ordering::Relaxed);
+        FOREGROUND_PROCESS_ID.store(process_id.unwrap_or(0), Ordering::Release);
     });
 }
 
@@ -138,6 +188,7 @@ fn translate_scancode(scancode: u8) -> Option<KeyEvent> {
         0x1C => Some(KeyEvent::Enter),
         0x0E => Some(KeyEvent::Backspace),
         0x0F => Some(KeyEvent::Tab),
+        0x01 => Some(KeyEvent::Escape),
         0x39 => Some(KeyEvent::Char(b' ')),
         0x02 => emit_pair(b'1', b'!'),
         0x03 => emit_pair(b'2', b'@'),

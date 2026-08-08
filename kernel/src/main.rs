@@ -78,8 +78,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Programs the PS/2 auxiliary device, then unmasks its IRQ line only
     // once that's done (see `interrupts::enable_mouse`'s docs for why that
     // ordering matters).
-    mouse::init();
-    interrupts::enable_mouse();
+    // IRQ1 and PS/2 controller replies share port 0x60. Keep the short,
+    // bounded auxiliary-device transaction exclusive so the keyboard ISR
+    // cannot consume a configuration byte or mouse ACK mid-initialization.
+    let mouse_ready = x86_64::instructions::interrupts::without_interrupts(mouse::init);
+    if mouse_ready {
+        interrupts::enable_mouse();
+    } else {
+        serial_println!("mouse: IRQ12 remains masked; boot continues without mouse input");
+    }
 
     ata::init();
     fs::init();

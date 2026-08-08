@@ -6,9 +6,11 @@
 //! surface.
 
 use hello_user::{
-    syscall, SYS_DISPLAY_INFO, SYS_DISPLAY_PRESENT, SYS_EXIT, SYS_INPUT_POLL, SYS_MMAP,
+    syscall, SYS_DISPLAY_INFO, SYS_DISPLAY_PRESENT, SYS_EXIT, SYS_INPUT_POLL, SYS_MMAP, SYS_MUNMAP,
     SYS_UPTIME_TICKS, SYS_YIELD,
 };
+
+pub const KEY_ESCAPE: u8 = 0x1B;
 
 pub const PIXEL_FORMAT_BGR: u32 = 1;
 pub const PIXEL_FORMAT_U8: u32 = 2;
@@ -62,6 +64,13 @@ pub fn mmap(len: u64, writable: bool) -> Option<u64> {
     } else {
         Some(result as u64)
     }
+}
+
+/// `SYS_MUNMAP`: release a page-aligned mapping range before normal exit.
+pub fn munmap(ptr: u64, len: u64) -> bool {
+    // Safety: plain integers; the kernel validates alignment, ownership,
+    // bounds, and that the complete range is mapped before changing it.
+    unsafe { syscall(SYS_MUNMAP, ptr, len, 0) == 0 }
 }
 
 /// `SYS_DISPLAY_PRESENT`: `true` if the frame was accepted and copied to

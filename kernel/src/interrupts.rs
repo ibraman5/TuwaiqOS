@@ -74,6 +74,8 @@ impl InterruptIndex {
 }
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
+static FIRST_TICK_TSC: AtomicU64 = AtomicU64::new(0);
+static LAST_TICK_TSC: AtomicU64 = AtomicU64::new(0);
 
 /// PIT channel 0 is programmed for this frequency in `init_pit`.
 const TIMER_HZ: u64 = 100;
@@ -87,6 +89,19 @@ pub fn ticks() -> u64 {
 /// a placeholder string. Zero until `init()` has enabled the PIT.
 pub fn uptime_seconds() -> u64 {
     ticks() / TIMER_HZ
+}
+
+/// Average invariant-TSC cycles observed per delivered PIT tick. Diagnostics
+/// use this to express short RDTSC measurements in timer-tick units without
+/// assuming a host or virtual CPU frequency.
+pub fn average_tsc_cycles_per_tick() -> Option<u64> {
+    let ticks = ticks();
+    let first = FIRST_TICK_TSC.load(Ordering::Relaxed);
+    let last = LAST_TICK_TSC.load(Ordering::Relaxed);
+    if ticks < 2 || first == 0 || last <= first {
+        return None;
+    }
+    Some((last - first) / (ticks - 1))
 }
 
 /// Halt the CPU until the next interrupt fires (timer or keyboard). Used by
@@ -429,6 +444,9 @@ extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame)
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    let tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let _ = FIRST_TICK_TSC.compare_exchange(0, tsc, Ordering::Relaxed, Ordering::Relaxed);
+    LAST_TICK_TSC.store(tsc, Ordering::Relaxed);
     TICKS.fetch_add(1, Ordering::Relaxed);
     // Safety: EOI is only ever issued here, for the interrupt this ISR
     // itself is handling, matching the IRQ this vector is registered for.

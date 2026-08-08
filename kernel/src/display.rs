@@ -16,11 +16,15 @@
 //! framebuffer and hope."
 
 use crate::paging;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const PIXEL_FORMAT_RGB: u32 = 0;
 const PIXEL_FORMAT_BGR: u32 = 1;
 const PIXEL_FORMAT_U8: u32 = 2;
 const PIXEL_FORMAT_UNKNOWN: u32 = 3;
+static PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PRESENT_TOTAL_CYCLES: AtomicU64 = AtomicU64::new(0);
+static PRESENT_MAX_CYCLES: AtomicU64 = AtomicU64::new(0);
 
 /// Fixed 20-byte wire format for `SYS_DISPLAY_INFO` -- five little-endian
 /// `u32`s, in this exact order. `stride` is in *pixels*, not bytes (matches
@@ -68,6 +72,23 @@ pub fn info() -> Option<DisplayInfo> {
     })
 }
 
+/// Deterministic checksum of the complete physical framebuffer, used by the
+/// Phase 5 acceptance harness to prove rejected `DISPLAY_PRESENT` calls make
+/// zero destination changes. This is 64-bit FNV-1a: compact and stable, not a
+/// cryptographic integrity primitive.
+pub fn framebuffer_checksum() -> Option<u64> {
+    const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+    let buffer = crate::framebuffer_console::raw_buffer_mut()?;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in buffer.iter() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    Some(hash)
+}
+
 /// `SYS_DISPLAY_PRESENT`'s implementation: copy the *currently running*
 /// process's own validated buffer at `user_ptr` into the real framebuffer.
 ///
@@ -96,21 +117,59 @@ pub fn present(user_ptr: u64, user_len: usize) -> Result<(), &'static str> {
     if user_len != fb_info.byte_len {
         return Err("buffer size does not match display dimensions");
     }
+    let user_addr = paging::checked_user_virt_addr(user_ptr)?;
 
+    // `RDTSC` is diagnostic only: it measures the copy cost without adding a
+    // timer interrupt, lock, allocation, or scheduler-policy dependency.
+    let started = unsafe { core::arch::x86_64::_rdtsc() };
     let ok = crate::task::with_current_address_space(|space| {
+        // Full-range preflight happens before even borrowing the mutable
+        // framebuffer slice. `read_bytes_from_address_space_into` repeats the
+        // check defensively before its first copy, so a later unmapped or
+        // supervisor page can never produce a partially presented frame.
+        if paging::validate_user_range(space, user_ptr, user_len, false).is_err() {
+            return false;
+        }
         let Some(fb_buffer) = crate::framebuffer_console::raw_buffer_mut() else {
             return false;
         };
-        paging::read_bytes_from_address_space_into(
-            space,
-            x86_64::VirtAddr::new(user_ptr),
-            fb_buffer,
-        )
+        paging::read_bytes_from_address_space_into(space, user_addr, fb_buffer)
     });
 
     match ok {
-        Some(true) => Ok(()),
+        Some(true) => {
+            let cycles = unsafe { core::arch::x86_64::_rdtsc() }.saturating_sub(started);
+            PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
+            PRESENT_TOTAL_CYCLES.fetch_add(cycles, Ordering::Relaxed);
+            update_max(&PRESENT_MAX_CYCLES, cycles);
+            Ok(())
+        }
         Some(false) => Err("invalid source buffer"),
         None => Err("current task is not a user process"),
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct PresentTelemetry {
+    pub count: u64,
+    pub total_cycles: u64,
+    pub max_cycles: u64,
+}
+
+pub fn present_telemetry() -> PresentTelemetry {
+    PresentTelemetry {
+        count: PRESENT_COUNT.load(Ordering::Relaxed),
+        total_cycles: PRESENT_TOTAL_CYCLES.load(Ordering::Relaxed),
+        max_cycles: PRESENT_MAX_CYCLES.load(Ordering::Relaxed),
+    }
+}
+
+fn update_max(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
     }
 }

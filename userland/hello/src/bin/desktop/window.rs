@@ -22,6 +22,32 @@ pub struct Window {
     pub visible: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PressAction {
+    None,
+    Raised { window_index: usize },
+    DragStarted { window_index: usize },
+    Closed { window_index: usize },
+}
+
+#[derive(Clone, Copy)]
+struct DragState {
+    window_index: usize,
+    offset_x: i32,
+    offset_y: i32,
+    start_x: i32,
+    start_y: i32,
+}
+
+#[derive(Clone, Copy)]
+pub struct DragResult {
+    pub window_index: usize,
+    pub from_x: i32,
+    pub from_y: i32,
+    pub to_x: i32,
+    pub to_y: i32,
+}
+
 impl Window {
     const fn empty() -> Self {
         Self {
@@ -57,16 +83,15 @@ impl Window {
 
 pub struct WindowManager {
     pub windows: [Window; MAX_WINDOWS],
-    /// How many slots in `windows` are live (spawned, possibly since
-    /// closed but never reused -- see `spawn`'s docs on why this design
-    /// deliberately doesn't recycle closed slots).
+    /// Number of initialized slots in `windows`. Closed slots stay in this
+    /// range and are reused by a later `spawn`.
     count: usize,
     /// Back-to-front draw/hit-test order over the first `count` window
     /// indices.
     order: [usize; MAX_WINDOWS],
     /// `(window index, cursor-to-window-origin offset)` while a title-bar
     /// drag is in progress.
-    dragging: Option<(usize, i32, i32)>,
+    dragging: Option<DragState>,
 }
 
 impl WindowManager {
@@ -79,17 +104,18 @@ impl WindowManager {
         }
     }
 
-    /// Create a new visible window. Returns `None` once `MAX_WINDOWS` have
-    /// ever been spawned -- deliberately not reused after a close: the
-    /// fixed-capacity array trades "a long-running desktop can eventually
-    /// run out of window slots" for "no slot-reuse bookkeeping to get
-    /// wrong," which is the right trade for a first, intentionally small
-    /// window model.
+    /// Create a new visible window. A closed slot is recycled before the
+    /// fixed array grows, so repeatedly opening and closing panels does not
+    /// exhaust the desktop for the rest of its lifetime.
     pub fn spawn(&mut self, x: i32, y: i32, w: i32, h: i32, title: &[u8]) -> Option<usize> {
-        if self.count >= MAX_WINDOWS {
-            return None;
-        }
-        let idx = self.count;
+        let recycled = self.windows[..self.count]
+            .iter()
+            .position(|window| !window.visible);
+        let idx = match recycled {
+            Some(idx) => idx,
+            None if self.count < MAX_WINDOWS => self.count,
+            None => return None,
+        };
         let mut window = Window::empty();
         window.x = x;
         window.y = y;
@@ -100,8 +126,12 @@ impl WindowManager {
         window.title[..len].copy_from_slice(&title[..len]);
         window.title_len = len;
         self.windows[idx] = window;
-        self.order[idx] = idx;
-        self.count += 1;
+        if recycled.is_some() {
+            self.bring_to_front(idx);
+        } else {
+            self.order[idx] = idx;
+            self.count += 1;
+        }
         Some(idx)
     }
 
@@ -136,7 +166,7 @@ impl WindowManager {
 
     pub fn close(&mut self, idx: usize) {
         self.windows[idx].visible = false;
-        if self.dragging.map(|(d, _, _)| d) == Some(idx) {
+        if self.dragging.map(|drag| drag.window_index) == Some(idx) {
             self.dragging = None;
         }
     }
@@ -144,31 +174,112 @@ impl WindowManager {
     /// Handle a left-button press at `(x, y)`: closes a clicked close-box,
     /// starts a drag from a clicked title bar, or just raises the clicked
     /// window to the front -- whichever applies, in that priority order.
-    /// Returns `true` if the click actually hit a window (as opposed to
-    /// empty desktop), so `main.rs` can decide whether to also check the
-    /// launcher button.
-    pub fn handle_press(&mut self, x: i32, y: i32) -> bool {
+    /// Returns the exact model action so acceptance tests can distinguish
+    /// a real close/drag/z-order transition from a merely redrawn frame.
+    pub fn handle_press(&mut self, x: i32, y: i32) -> PressAction {
         let Some(idx) = self.hit_test(x, y) else {
-            return false;
+            return PressAction::None;
         };
         self.bring_to_front(idx);
         let window = self.windows[idx];
         if window.in_close_box(x, y) {
             self.close(idx);
+            PressAction::Closed { window_index: idx }
         } else if window.in_title_bar(x, y) {
-            self.dragging = Some((idx, x - window.x, y - window.y));
+            self.dragging = Some(DragState {
+                window_index: idx,
+                offset_x: x - window.x,
+                offset_y: y - window.y,
+                start_x: window.x,
+                start_y: window.y,
+            });
+            PressAction::DragStarted { window_index: idx }
+        } else {
+            PressAction::Raised { window_index: idx }
         }
-        true
     }
 
     pub fn handle_drag(&mut self, x: i32, y: i32) {
-        if let Some((idx, off_x, off_y)) = self.dragging {
-            self.windows[idx].x = x - off_x;
-            self.windows[idx].y = y - off_y;
+        if let Some(drag) = self.dragging {
+            self.windows[drag.window_index].x = x - drag.offset_x;
+            self.windows[drag.window_index].y = y - drag.offset_y;
         }
     }
 
-    pub fn handle_release(&mut self) {
-        self.dragging = None;
+    pub fn handle_release(&mut self) -> Option<DragResult> {
+        let drag = self.dragging.take()?;
+        let window = self.windows[drag.window_index];
+        Some(DragResult {
+            window_index: drag.window_index,
+            from_x: drag.start_x,
+            from_y: drag.start_y,
+            to_x: window.x,
+            to_y: window.y,
+        })
     }
+}
+
+/// Deterministic, framebuffer-independent acceptance check for the window
+/// policy. The kernel shell compiles this exact module as a diagnostics-only
+/// module and exposes it through `desktoptest`; the real desktop also uses
+/// the same methods below for live mouse interaction.
+pub fn self_test() -> Result<(), &'static str> {
+    let mut wm = WindowManager::new();
+    let back = wm
+        .spawn(0, 0, 100, 80, b"back")
+        .ok_or("initial spawn failed")?;
+    let front = wm
+        .spawn(10, 10, 100, 80, b"front")
+        .ok_or("overlapping spawn failed")?;
+
+    if wm.hit_test(20, 30) != Some(front) {
+        return Err("initial z-order is not front-to-back");
+    }
+
+    // A title-bar click in the non-overlapping part of `back` raises it.
+    if wm.handle_press(5, 5) != (PressAction::DragStarted { window_index: back }) {
+        return Err("title-bar press missed visible window");
+    }
+    let _ = wm.handle_release();
+    if wm.hit_test(20, 30) != Some(back) {
+        return Err("clicked window was not raised");
+    }
+
+    // Drag while held, then prove release ends the drag.
+    wm.handle_press(20, 10);
+    wm.handle_drag(50, 45);
+    let drag = wm.handle_release().ok_or("drag release was not recorded")?;
+    let dragged = *wm.window(back);
+    if dragged.x != 30
+        || dragged.y != 35
+        || drag.from_x != 0
+        || drag.from_y != 0
+        || drag.to_x != 30
+        || drag.to_y != 35
+    {
+        return Err("title-bar drag produced incorrect bounds");
+    }
+    wm.handle_drag(70, 70);
+    if wm.window(back).x != 30 || wm.window(back).y != 35 {
+        return Err("window continued moving after button release");
+    }
+
+    // The close-box must hide the selected window, and its slot must be
+    // reusable without changing fixed-capacity/z-order invariants.
+    let close_x = wm.window(back).x + wm.window(back).w - 1;
+    let close_y = wm.window(back).y + 1;
+    if wm.handle_press(close_x, close_y) != (PressAction::Closed { window_index: back }) {
+        return Err("close-box did not report close action");
+    }
+    if wm.window(back).visible {
+        return Err("close-box did not hide window");
+    }
+    let recycled = wm
+        .spawn(40, 40, 80, 60, b"reused")
+        .ok_or("closed slot was not reusable")?;
+    if recycled != back || wm.hit_test(45, 45) != Some(recycled) {
+        return Err("recycled window was not restored at front");
+    }
+
+    Ok(())
 }

@@ -22,6 +22,13 @@ use crate::paging;
 use crate::reboot;
 use crate::task;
 
+// Diagnostics compile the exact userspace window-policy source rather than
+// maintaining a lookalike kernel test model. It is never used for rendering
+// or policy in Ring 0; `desktoptest` only invokes its pure state self-test.
+#[path = "../../userland/hello/src/bin/desktop/window.rs"]
+#[allow(dead_code)]
+mod desktop_window_model;
+
 const MAX_LINE: usize = 128;
 const HISTORY_SIZE: usize = 16;
 
@@ -149,6 +156,7 @@ pub fn run(boot_info: &'static BootInfo, mode: ConsoleMode) -> ! {
                 KeyEvent::Tab => {
                     len = tab_complete(mode, &mut line, len);
                 }
+                KeyEvent::Escape => {}
                 KeyEvent::Enter => {
                     println(mode, "");
                     let command = core::str::from_utf8(&line[..len]).unwrap_or("");
@@ -196,6 +204,12 @@ fn tab_complete(mode: ConsoleMode, line: &mut [u8], len: usize) -> usize {
         }
         for name in loader::program_names() {
             if (*name).starts_with(token) {
+                matches.push(String::from(*name));
+            }
+        }
+    } else if prefix.starts_with("runelf ") {
+        for name in embedded_program_names() {
+            if name.starts_with(token) {
                 matches.push(String::from(*name));
             }
         }
@@ -269,6 +283,8 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
         return;
     }
 
+    crate::serial_println!("shell: command begin: {}", line);
+
     let (command, args) = split_command(line);
 
     match command {
@@ -324,7 +340,18 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
         "isolate" => handle_isolate(mode, args),
         "spawnfail" => handle_spawnfail(mode, args),
         "reap" => handle_reap(mode, args),
+        "autoreap" => handle_automatic_reap(mode, args),
+        "killreap" => handle_kill_reap(mode, args),
         "desktop" => handle_desktop(mode),
+        "desktoppeer" => handle_desktop_peer(mode),
+        "desktopfaultpeer" => handle_desktop_fault_peer(mode),
+        "desktopkilltest" => handle_desktop_kill_test(mode),
+        "desktopinteraction" => handle_desktop_interaction_test(mode),
+        "desktopcycle" => handle_desktop_cycle(mode, args),
+        "desktoptest" => handle_desktop_test(mode),
+        "mousetest" => handle_mouse_test(mode),
+        "desktopstats" => print_desktop_lifecycle_stats("manual"),
+        "inputstats" => print_input_telemetry(mode, "manual"),
         "ai" => handle_ai_command(mode, line, args),
         "ask" => handle_ask_command(mode, args),
         _ => {
@@ -332,6 +359,7 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
             println(mode, command);
         }
     }
+    crate::serial_println!("shell: command complete: {}", line);
 }
 
 fn print_entries(mode: ConsoleMode, entries: Vec<String>) {
@@ -461,12 +489,60 @@ fn embedded_program(name: &str) -> Option<&'static [u8]> {
             env!("CARGO_MANIFEST_DIR"),
             "/../target/x86_64-unknown-none/release/bad_input"
         ))),
+        "mmap_ro_fault" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/mmap_ro_fault"
+        ))),
+        "mmap_nx_fault" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/mmap_nx_fault"
+        ))),
+        "post_unmap_fault" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/post_unmap_fault"
+        ))),
+        "mmap_exhaustion" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/mmap_exhaustion"
+        ))),
+        "mmap_partial_failure" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/mmap_partial_failure"
+        ))),
         "desktop" => Some(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../target/x86_64-unknown-none/release/desktop"
         ))),
+        "desktop_peer" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/desktop_peer"
+        ))),
         _ => None,
     }
+}
+
+fn embedded_program_names() -> &'static [&'static str] {
+    &[
+        "hello",
+        "bad_syscall",
+        "bad_pointer",
+        "bad_privileged",
+        "bad_kernel",
+        "bad_unmapped",
+        "bad_ud2",
+        "bad_divzero",
+        "bad_mmap",
+        "bad_munmap",
+        "bad_display",
+        "bad_input",
+        "mmap_ro_fault",
+        "mmap_nx_fault",
+        "post_unmap_fault",
+        "mmap_exhaustion",
+        "mmap_partial_failure",
+        "desktop",
+        "desktop_peer",
+    ]
 }
 
 fn wait_for_terminated(id: u32) {
@@ -482,6 +558,13 @@ fn wait_for_terminated(id: u32) {
 fn print_process_result(mode: ConsoleMode, id: u32) {
     match task::info(id) {
         Ok(t) => {
+            crate::serial_println!(
+                "process: result pid={} name={} state={} exit_code={}",
+                t.id,
+                t.name,
+                task::state_label(t.state),
+                t.exit_code.map(i64::from).unwrap_or(-1)
+            );
             print(mode, "  pid=");
             print_u64(mode, t.id as u64);
             print(mode, " name=");
@@ -511,11 +594,32 @@ fn print_process_result(mode: ConsoleMode, id: u32) {
 /// serial log.
 fn handle_runelf(mode: ConsoleMode, args: &str) {
     let name = args.trim();
+    if name == "desktop" {
+        handle_desktop(mode);
+        return;
+    }
+    if name == "bad_input" {
+        handle_input_security_test(mode);
+        return;
+    }
+    if name == "bad_display" {
+        handle_display_atomicity_test(mode);
+        return;
+    }
+    if name == "mmap_exhaustion" {
+        handle_mmap_exhaustion_test(mode);
+        return;
+    }
+    if name == "mmap_partial_failure" {
+        handle_mmap_partial_failure_test(mode);
+        return;
+    }
     let Some(bytes) = embedded_program(name) else {
         println(
             mode,
             "Usage: runelf <hello|bad_syscall|bad_pointer|bad_privileged|bad_kernel|bad_unmapped|\
-             bad_ud2|bad_divzero|bad_mmap|bad_munmap|bad_display|bad_input|desktop>",
+             bad_ud2|bad_divzero|bad_mmap|bad_munmap|bad_display|bad_input|mmap_ro_fault|\
+             mmap_nx_fault|post_unmap_fault|mmap_exhaustion|mmap_partial_failure|desktop|desktop_peer>",
         );
         return;
     };
@@ -534,6 +638,209 @@ fn handle_runelf(mode: ConsoleMode, args: &str) {
             print(mode, "Process load error: ");
             println(mode, reason);
         }
+    }
+}
+
+/// Launch `bad_input` as the actual foreground PID and seed one known event.
+/// Its invalid-pointer polls must leave this record queued for the final
+/// valid poll, proving validation happens before consumption.
+fn handle_input_security_test(mode: ConsoleMode) {
+    let Some(bytes) = embedded_program("bad_input") else {
+        println(mode, "bad_input: embedded program missing");
+        return;
+    };
+    let spawn = x86_64::instructions::interrupts::without_interrupts(|| {
+        let id = task::spawn_user_process("bad_input", bytes)?;
+        acquire_desktop_foreground(id);
+        crate::input::push_key_event(KeyEvent::Char(b'Z'));
+        crate::serial_println!("input: security seeded pid={} tag=1 code=90", id);
+        Ok(id)
+    });
+    match spawn {
+        Ok(id) => {
+            print(mode, "Spawned foreground input-security pid ");
+            print_u64(mode, id as u64);
+            println(mode, ", waiting for deterministic checks...");
+            wait_for_terminated(id);
+            let telemetry = release_desktop_foreground(id);
+            emit_input_telemetry("bad-input-release", telemetry);
+            print_process_result(mode, id);
+        }
+        Err(reason) => {
+            print(mode, "Process load error: ");
+            println(mode, reason);
+        }
+    }
+}
+
+/// Verify a rejected cross-page `DISPLAY_PRESENT` leaves every framebuffer
+/// byte unchanged. The baseline is deliberately taken after the last
+/// pre-spawn console write, and the result is sampled before any post-run
+/// console output can perturb the framebuffer.
+fn handle_display_atomicity_test(mode: ConsoleMode) {
+    let Some(bytes) = embedded_program("bad_display") else {
+        println(mode, "bad_display: embedded program missing");
+        return;
+    };
+    println(
+        mode,
+        "Running bad_display with framebuffer atomicity checksum...",
+    );
+    let Some(checksum_before) = crate::display::framebuffer_checksum() else {
+        println(mode, "display atomicity: FAIL framebuffer unavailable");
+        return;
+    };
+
+    let result = match task::spawn_user_process("bad_display", bytes) {
+        Ok(id) => {
+            wait_for_terminated(id);
+            let checksum_after = crate::display::framebuffer_checksum();
+            Some((id, checksum_after))
+        }
+        Err(_) => None,
+    };
+
+    match result {
+        Some((id, Some(checksum_after))) => {
+            println(
+                mode,
+                &format!(
+                    "display atomicity: {} checksum_before={:#x} checksum_after={:#x}",
+                    if checksum_before == checksum_after {
+                        "PASS"
+                    } else {
+                        "FAIL"
+                    },
+                    checksum_before,
+                    checksum_after
+                ),
+            );
+            print_process_result(mode, id);
+        }
+        Some((id, None)) => {
+            println(mode, "display atomicity: FAIL framebuffer disappeared");
+            print_process_result(mode, id);
+        }
+        None => println(mode, "display atomicity: FAIL process load error"),
+    }
+}
+
+fn handle_mmap_exhaustion_test(mode: ConsoleMode) {
+    let Some(bytes) = embedded_program("mmap_exhaustion") else {
+        println(mode, "mmap_exhaustion: embedded program missing");
+        return;
+    };
+    println(
+        mode,
+        "Running mmap exhaustion, rollback, and frame-reuse test...",
+    );
+    task::reap_now();
+    let before = frame_reuse_stats();
+    let id = match task::spawn_user_process("mmap_exhaustion", bytes) {
+        Ok(id) => id,
+        Err(reason) => {
+            print(mode, "Process load error: ");
+            println(mode, reason);
+            return;
+        }
+    };
+    task::reset_vm_batch_telemetry();
+    wait_for_terminated(id);
+    let exit_code = task::info(id).ok().and_then(|info| info.exit_code);
+    task::reap_now();
+    let after = frame_reuse_stats();
+    let passed = exit_code == Some(0) && before.live == after.live;
+    println(
+        mode,
+        &format!(
+            "mmap exhaustion cleanup: {} exit_code={} live_before={} live_after={} bump_before={} bump_after={} free_before={} free_after={}",
+            if passed { "PASS" } else { "FAIL" },
+            exit_code.map(i64::from).unwrap_or(-1),
+            before.live,
+            after.live,
+            before.bump,
+            after.bump,
+            before.free,
+            after.free
+        ),
+    );
+    let vm = task::vm_batch_telemetry();
+    let cycles_per_tick = crate::interrupts::average_tsc_cycles_per_tick().unwrap_or(0);
+    let max_milli_ticks = if cycles_per_tick == 0 {
+        0
+    } else {
+        vm.max_cycles.saturating_mul(1000) / cycles_per_tick
+    };
+    println(
+        mode,
+        &format!(
+            "vm batch telemetry: count={} total_cycles={} average_cycles={} max_cycles={} max_kind={} cycles_per_tick={} max_milli_ticks={} pages_per_batch={}",
+            vm.count,
+            vm.total_cycles,
+            if vm.count == 0 { 0 } else { vm.total_cycles / vm.count },
+            vm.max_cycles,
+            vm.max_kind,
+            cycles_per_tick,
+            max_milli_ticks,
+            task::VM_BATCH_PAGES
+        ),
+    );
+}
+
+fn handle_mmap_partial_failure_test(mode: ConsoleMode) {
+    let Some(bytes) = embedded_program("mmap_partial_failure") else {
+        println(mode, "mmap_partial_failure: embedded program missing");
+        return;
+    };
+    task::reap_now();
+    let before = frame_reuse_stats();
+    task::inject_next_mmap_failure_after(4);
+    let id = match task::spawn_user_process("mmap_partial_failure", bytes) {
+        Ok(id) => id,
+        Err(reason) => {
+            task::clear_mmap_failure_injection();
+            print(mode, "Process load error: ");
+            println(mode, reason);
+            return;
+        }
+    };
+    wait_for_terminated(id);
+    // The ELF normally consumes the hook. Clear it defensively if it exited
+    // before reaching MMAP so no later process inherits test-only state.
+    task::clear_mmap_failure_injection();
+    let exit_code = task::info(id).ok().and_then(|info| info.exit_code);
+    task::reap_now();
+    let after = frame_reuse_stats();
+    let passed = exit_code == Some(0) && before.live == after.live;
+    println(
+        mode,
+        &format!(
+            "mmap partial rollback: {} exit_code={} live_before={} live_after={} bump_before={} bump_after={}",
+            if passed { "PASS" } else { "FAIL" },
+            exit_code.map(i64::from).unwrap_or(-1),
+            before.live,
+            after.live,
+            before.bump,
+            after.bump
+        ),
+    );
+}
+
+#[derive(Clone, Copy)]
+struct FrameReuseStats {
+    bump: usize,
+    free: usize,
+    live: usize,
+}
+
+fn frame_reuse_stats() -> FrameReuseStats {
+    let (bump, free) = paging::frame_stats()
+        .map(|stats| (stats.bumped, stats.free_in_pool))
+        .unwrap_or((0, 0));
+    FrameReuseStats {
+        bump,
+        free,
+        live: bump.saturating_sub(free),
     }
 }
 
@@ -831,6 +1138,118 @@ fn handle_reap(mode: ConsoleMode, args: &str) {
     }
 }
 
+fn parse_positive_count(mode: ConsoleMode, args: &str, usage: &str) -> Option<u32> {
+    match args.trim().parse() {
+        Ok(count) if (1..=100).contains(&count) => Some(count),
+        _ => {
+            println(mode, usage);
+            None
+        }
+    }
+}
+
+/// Prove the scheduler's ordinary grace-period path removes terminated TCBs
+/// without a diagnostic force-reap call.
+fn handle_automatic_reap(mode: ConsoleMode, args: &str) {
+    let Some(count) = parse_positive_count(mode, args, "Usage: autoreap <1-100>") else {
+        return;
+    };
+    let Some(bytes) = embedded_program("hello") else {
+        println(mode, "autoreap: embedded hello missing");
+        return;
+    };
+    task::reap_now();
+    let before = desktop_lifecycle_stats();
+    for index in 0..count {
+        let name = format!("autoreap-{}", index);
+        let Ok(id) = task::spawn_user_process(&name, bytes) else {
+            println(mode, "automatic reap: FAIL spawn error");
+            return;
+        };
+        wait_for_terminated(id);
+    }
+    let held = task::task_count();
+    let started = interrupts::ticks();
+    while interrupts::ticks().saturating_sub(started) < 510 {
+        task::yield_now();
+    }
+    // One additional scheduling decision runs `prepare_switch` after the
+    // grace deadline even if the tick boundary coincided with this task.
+    task::yield_now();
+    let after = desktop_lifecycle_stats();
+    let passed = held >= before.tasks.saturating_add(count as usize)
+        && after.tasks == before.tasks
+        && after.live_frames == before.live_frames
+        && after.heap_used == before.heap_used;
+    println(
+        mode,
+        &format!(
+            "automatic reap: {} count={} tasks_before={} held={} tasks_after={} live_frames_before={} live_frames_after={} heap_used_before={} heap_used_after={}",
+            if passed { "PASS" } else { "FAIL" },
+            count,
+            before.tasks,
+            held,
+            after.tasks,
+            before.live_frames,
+            after.live_frames,
+            before.heap_used,
+            after.heap_used
+        ),
+    );
+}
+
+/// Exercise explicit kill of a never-scheduled user process, immediate
+/// address-space reclamation, TCB destruction, and kernel-stack heap reuse.
+fn handle_kill_reap(mode: ConsoleMode, args: &str) {
+    let Some(count) = parse_positive_count(mode, args, "Usage: killreap <1-100>") else {
+        return;
+    };
+    let Some(bytes) = embedded_program("hello") else {
+        println(mode, "killreap: embedded hello missing");
+        return;
+    };
+
+    let run_one = || -> Result<(), &'static str> {
+        let id = task::spawn_user_process("kill-reap", bytes)?;
+        task::kill(id)?;
+        task::reap_now();
+        Ok(())
+    };
+    task::reap_now();
+    if run_one().is_err() {
+        println(mode, "kill reap: FAIL warmup");
+        return;
+    }
+    let before = desktop_lifecycle_stats();
+    for _ in 0..count {
+        if run_one().is_err() {
+            println(mode, "kill reap: FAIL kill/reap operation");
+            return;
+        }
+    }
+    let after = desktop_lifecycle_stats();
+    let passed = before.tasks == after.tasks
+        && before.frame_bump == after.frame_bump
+        && before.live_frames == after.live_frames
+        && before.heap_used == after.heap_used;
+    println(
+        mode,
+        &format!(
+            "kill reap: {} count={} tasks_before={} tasks_after={} frame_bump_before={} frame_bump_after={} live_frames_before={} live_frames_after={} heap_used_before={} heap_used_after={}",
+            if passed { "PASS" } else { "FAIL" },
+            count,
+            before.tasks,
+            after.tasks,
+            before.frame_bump,
+            after.frame_bump,
+            before.live_frames,
+            after.live_frames,
+            before.heap_used,
+            after.heap_used
+        ),
+    );
+}
+
 /// `desktop` -- launches the first real Tuwaiq Desktop (Phase 5, Milestones
 /// 6-8) as a genuine Ring 3 ELF process through exactly the same
 /// `task::spawn_user_process` path `runelf` uses -- no Ring 0 shortcut.
@@ -846,17 +1265,551 @@ fn handle_desktop(mode: ConsoleMode) {
         return;
     };
 
-    match task::spawn_user_process("desktop", bytes) {
+    task::reap_now();
+    print_desktop_lifecycle_stats("before");
+    match spawn_foreground_process("desktop", bytes) {
         Ok(id) => {
             print(mode, "Launching Tuwaiq Desktop as pid ");
             print_u64(mode, id as u64);
-            println(mode, "...");
+            println(mode, " (press Esc to exit)...");
             wait_for_terminated(id);
+            let telemetry = release_desktop_foreground(id);
+            emit_input_telemetry("desktop-release", telemetry);
+            clear_screen(mode);
             print(mode, "Desktop exited: ");
             print_process_result(mode, id);
+            task::reap_now();
+            print_desktop_lifecycle_stats("after");
         }
         Err(reason) => {
             print(mode, "Desktop load error: ");
+            println(mode, reason);
+            print_desktop_lifecycle_stats("spawn-failed");
+        }
+    }
+}
+
+/// Run the desktop and an ordinary Ring 3 peer concurrently. Both are
+/// spawned before the shell yields; only the desktop owns foreground input.
+fn handle_desktop_peer(mode: ConsoleMode) {
+    let (Some(desktop_bytes), Some(peer_bytes)) = (
+        embedded_program("desktop"),
+        embedded_program("desktop_peer"),
+    ) else {
+        println(mode, "desktoppeer: embedded program missing");
+        return;
+    };
+
+    task::reap_now();
+    print_desktop_lifecycle_stats("peer-before");
+    let desktop_id = match spawn_foreground_process("desktop", desktop_bytes) {
+        Ok(id) => id,
+        Err(reason) => {
+            print(mode, "Desktop load error: ");
+            println(mode, reason);
+            return;
+        }
+    };
+    let peer_id = match task::spawn_user_process("desktop_peer", peer_bytes) {
+        Ok(id) => id,
+        Err(reason) => {
+            let _ = task::kill(desktop_id);
+            let _ = release_desktop_foreground(desktop_id);
+            task::reap_now();
+            print(mode, "Desktop peer load error: ");
+            println(mode, reason);
+            return;
+        }
+    };
+
+    crate::serial_println!(
+        "desktop: concurrent session desktop_pid={} peer_pid={}",
+        desktop_id,
+        peer_id
+    );
+    print(mode, "Launching desktop pid ");
+    print_u64(mode, desktop_id as u64);
+    print(mode, " with Ring 3 peer pid ");
+    print_u64(mode, peer_id as u64);
+    println(mode, " (press Esc to exit desktop)...");
+
+    wait_for_terminated(desktop_id);
+    let telemetry = release_desktop_foreground(desktop_id);
+    emit_input_telemetry("desktop-peer-release", telemetry);
+    clear_screen(mode);
+    print(mode, "Desktop exited: ");
+    print_process_result(mode, desktop_id);
+    wait_for_terminated(peer_id);
+    print(mode, "Concurrent peer exited: ");
+    print_process_result(mode, peer_id);
+    task::reap_now();
+    print_desktop_lifecycle_stats("peer-after");
+}
+
+/// Run a live desktop while a hostile sibling executes `ud2`. The CPU fault
+/// must terminate only the sibling; the desktop then receives a normal Escape
+/// event and exits zero, proving both isolation and shell recovery.
+fn handle_desktop_fault_peer(mode: ConsoleMode) {
+    let (Some(desktop_bytes), Some(fault_bytes)) =
+        (embedded_program("desktop"), embedded_program("bad_ud2"))
+    else {
+        println(mode, "desktopfaultpeer: embedded program missing");
+        return;
+    };
+    task::reap_now();
+    let Ok(desktop_id) = spawn_foreground_process("desktop", desktop_bytes) else {
+        println(mode, "desktop fault peer: FAIL desktop spawn");
+        return;
+    };
+    let Ok(fault_id) = task::spawn_user_process("desktop-fault-peer", fault_bytes) else {
+        let _ = task::kill(desktop_id);
+        let _ = release_desktop_foreground(desktop_id);
+        task::reap_now();
+        println(mode, "desktop fault peer: FAIL hostile peer spawn");
+        return;
+    };
+    wait_for_terminated(fault_id);
+    let peer_exit = task::info(fault_id).ok().and_then(|info| info.exit_code);
+    let desktop_survived = matches!(
+        task::info(desktop_id),
+        Ok(info) if info.state != task::TaskState::Terminated
+    );
+    crate::input::push_key_event(KeyEvent::Escape);
+    wait_for_terminated(desktop_id);
+    let desktop_exit = task::info(desktop_id).ok().and_then(|info| info.exit_code);
+    let telemetry = release_desktop_foreground(desktop_id);
+    emit_input_telemetry("desktop-fault-peer-release", telemetry);
+    let passed = peer_exit == Some(132) && desktop_survived && desktop_exit == Some(0);
+    clear_screen(mode);
+    println(
+        mode,
+        &format!(
+            "desktop fault peer: {} peer_exit={:?} desktop_survived={} desktop_exit={:?}",
+            if passed { "PASS" } else { "FAIL" },
+            peer_exit,
+            desktop_survived,
+            desktop_exit
+        ),
+    );
+    task::reap_now();
+}
+
+/// Force-terminate a running desktop and verify foreground ownership and all
+/// resource baselines recover even though the normal userspace exit path did
+/// not run.
+fn handle_desktop_kill_test(mode: ConsoleMode) {
+    let Some(bytes) = embedded_program("desktop") else {
+        println(mode, "desktopkilltest: embedded desktop missing");
+        return;
+    };
+    task::reap_now();
+    let before = desktop_lifecycle_stats();
+    let Ok(id) = spawn_foreground_process("desktop-kill-test", bytes) else {
+        println(mode, "desktop kill: FAIL spawn");
+        return;
+    };
+    let started = interrupts::ticks();
+    while interrupts::ticks().saturating_sub(started) < 2 {
+        task::yield_now();
+    }
+    let killed = task::kill(id).is_ok();
+    let _ = release_desktop_foreground(id);
+    task::reap_now();
+    let after = desktop_lifecycle_stats();
+    let passed = killed
+        && crate::keyboard::foreground_process_id().is_none()
+        && before.tasks == after.tasks
+        && before.live_frames == after.live_frames
+        && before.heap_used == after.heap_used;
+    clear_screen(mode);
+    println(
+        mode,
+        &format!(
+            "desktop kill: {} tasks_before={} tasks_after={} live_frames_before={} live_frames_after={} heap_used_before={} heap_used_after={}",
+            if passed { "PASS" } else { "FAIL" },
+            before.tasks,
+            after.tasks,
+            before.live_frames,
+            after.live_frames,
+            before.heap_used,
+            after.heap_used
+        ),
+    );
+}
+
+fn inject_mouse_to(x: i32, y: i32, buttons: u8) -> Result<(), &'static str> {
+    for _ in 0..16 {
+        let (current_x, current_y) = crate::mouse::cursor_position();
+        let dx = (x - current_x).clamp(-255, 255);
+        let dy = (y - current_y).clamp(-255, 255);
+        if dx == 0 && dy == 0 {
+            return crate::mouse::inject_screen_packet(0, 0, buttons);
+        }
+        crate::mouse::inject_screen_packet(dx as i16, dy as i16, buttons)?;
+    }
+    let (current_x, current_y) = crate::mouse::cursor_position();
+    crate::serial_println!(
+        "desktop interaction: mouse target failed target=({}, {}) current=({}, {})",
+        x,
+        y,
+        current_x,
+        current_y
+    );
+    Err("mouse cursor did not converge on target")
+}
+
+/// Drive live Ring-3 desktop policy through the production PS/2 decoder,
+/// foreground queue, and INPUT_POLL syscall. Userspace emits exact markers
+/// only after each model transition actually occurs.
+fn handle_desktop_interaction_test(mode: ConsoleMode) {
+    let Some(bytes) = embedded_program("desktop") else {
+        println(mode, "desktopinteraction: embedded desktop missing");
+        return;
+    };
+    task::reap_now();
+    if run_one_desktop_cycle(bytes).is_err() {
+        println(mode, "desktop interaction: FAIL warmup lifecycle");
+        task::reap_now();
+        return;
+    }
+    task::reap_now();
+    let before = desktop_lifecycle_stats();
+    let presents_before = crate::display::present_telemetry().count;
+    let Ok(id) = spawn_foreground_process("desktop-interaction", bytes) else {
+        println(mode, "desktop interaction: FAIL spawn");
+        return;
+    };
+    if !wait_for_desktop_present(id, presents_before, 500) {
+        let _ = task::kill(id);
+        let _ = release_desktop_foreground(id);
+        println(mode, "desktop interaction: FAIL first present timeout");
+        return;
+    }
+    let interaction = x86_64::instructions::interrupts::without_interrupts(|| {
+        crate::mouse::reset_decoder_for_diagnostics();
+        (|| -> Result<(), &'static str> {
+            inject_mouse_to(150, 100, 0)?;
+            crate::mouse::inject_screen_packet(0, 0, 1)?;
+            inject_mouse_to(210, 140, 1)?;
+            crate::mouse::inject_screen_packet(0, 0, 0)?;
+            inject_mouse_to(510, 140, 0)?;
+            crate::mouse::inject_screen_packet(0, 0, 1)?;
+            crate::mouse::inject_screen_packet(0, 0, 0)?;
+            inject_mouse_to(50, 10, 0)?;
+            crate::mouse::inject_screen_packet(0, 0, 1)?;
+            crate::mouse::inject_screen_packet(0, 0, 0)?;
+            crate::mouse::inject_screen_packet(0, 0, 1)?;
+            crate::mouse::inject_screen_packet(0, 0, 0)?;
+            inject_mouse_to(190, 200, 0)?;
+            crate::mouse::inject_screen_packet(0, 0, 1)?;
+            crate::mouse::inject_screen_packet(0, 0, 0)?;
+            Ok(())
+        })()
+    });
+    crate::input::push_key_event(KeyEvent::Escape);
+    wait_for_terminated(id);
+    let exit = task::info(id).ok().and_then(|info| info.exit_code);
+    let telemetry = release_desktop_foreground(id);
+    emit_input_telemetry("desktop-interaction-release", telemetry);
+    task::reap_now();
+    let after = desktop_lifecycle_stats();
+    let passed = interaction.is_ok()
+        && exit == Some(0)
+        && telemetry.dropped_events == 0
+        && before.tasks == after.tasks
+        && before.live_frames == after.live_frames
+        && before.heap_used == after.heap_used;
+    clear_screen(mode);
+    println(
+        mode,
+        &format!(
+            "desktop interaction: {} exit={:?} tasks_before={} tasks_after={} live_frames_before={} live_frames_after={} heap_used_before={} heap_used_after={}",
+            if passed { "PASS" } else { "FAIL" },
+            exit,
+            before.tasks,
+            after.tasks,
+            before.live_frames,
+            after.live_frames,
+            before.heap_used,
+            after.heap_used
+        ),
+    );
+}
+
+fn acquire_desktop_foreground(id: u32) {
+    crate::keyboard::set_foreground_process_id(Some(id));
+    crate::serial_println!("input: foreground acquire owner=desktop pid={}", id);
+}
+
+/// Make a newly created user process visible to the scheduler and bind input
+/// ownership without an interruptible gap. Otherwise the 100 Hz timer could
+/// run the process between spawn and handoff, causing its first INPUT_POLL to
+/// observe the shell as owner.
+fn spawn_foreground_process(name: &str, bytes: &'static [u8]) -> Result<u32, &'static str> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let id = task::spawn_user_process(name, bytes)?;
+        acquire_desktop_foreground(id);
+        Ok(id)
+    })
+}
+
+fn release_desktop_foreground(id: u32) -> crate::input::InputTelemetry {
+    let telemetry = x86_64::instructions::interrupts::without_interrupts(|| {
+        let telemetry = crate::input::telemetry();
+        crate::keyboard::set_foreground_process_id(None);
+        telemetry
+    });
+    crate::serial_println!("input: foreground release owner=shell former_pid={}", id);
+    telemetry
+}
+
+fn emit_input_telemetry(label: &str, stats: crate::input::InputTelemetry) {
+    let average_milli_ticks = if stats.delivered_mouse_moves == 0 {
+        0
+    } else {
+        stats.mouse_age_total_ticks.saturating_mul(1000) / stats.delivered_mouse_moves
+    };
+    crate::serial_println!(
+        "input: telemetry label={} depth={} max_depth={} coalesced_moves={} dropped={} mouse_delivered={} mouse_age_total_ticks={} mouse_age_max_ticks={} mouse_age_avg_milli_ticks={}",
+        label,
+        stats.current_depth,
+        stats.max_depth,
+        stats.coalesced_mouse_moves,
+        stats.dropped_events,
+        stats.delivered_mouse_moves,
+        stats.mouse_age_total_ticks,
+        stats.mouse_age_max_ticks,
+        average_milli_ticks
+    );
+}
+
+fn print_input_telemetry(mode: ConsoleMode, label: &str) {
+    emit_input_telemetry(label, crate::input::telemetry());
+    let mouse = crate::mouse::telemetry();
+    crate::serial_println!(
+        "mouse: telemetry initialized={} raw_bytes={} packets={} desync_bytes={} overflow_packets={}",
+        crate::mouse::is_initialized(),
+        mouse.raw_bytes,
+        mouse.complete_packets,
+        mouse.desync_bytes,
+        mouse.overflow_packets
+    );
+    let present = crate::display::present_telemetry();
+    let average_cycles = if present.count == 0 {
+        0
+    } else {
+        present.total_cycles / present.count
+    };
+    let cycles_per_tick = crate::interrupts::average_tsc_cycles_per_tick().unwrap_or(0);
+    let max_milli_ticks = if cycles_per_tick == 0 {
+        0
+    } else {
+        present.max_cycles.saturating_mul(1000) / cycles_per_tick
+    };
+    crate::serial_println!(
+        "display: telemetry presents={} total_cycles={} average_cycles={} max_cycles={} cycles_per_tick={} max_milli_ticks={}",
+        present.count,
+        present.total_cycles,
+        average_cycles,
+        present.max_cycles,
+        cycles_per_tick,
+        max_milli_ticks
+    );
+    println(mode, "Input telemetry emitted to serial.");
+}
+
+fn print_desktop_lifecycle_stats(label: &str) {
+    let stats = desktop_lifecycle_stats();
+    crate::serial_println!(
+        "desktop: lifecycle label={} tasks={} frame_bump={} frame_current={} frame_free={} heap_used={}",
+        label,
+        stats.tasks,
+        stats.frame_bump,
+        stats.live_frames,
+        stats.frame_free,
+        stats.heap_used
+    );
+}
+
+#[derive(Clone, Copy)]
+struct DesktopLifecycleStats {
+    tasks: usize,
+    frame_bump: usize,
+    live_frames: usize,
+    frame_free: usize,
+    heap_used: usize,
+}
+
+fn desktop_lifecycle_stats() -> DesktopLifecycleStats {
+    let (frame_bump, frame_free) = paging::frame_stats()
+        .map(|stats| (stats.bumped, stats.free_in_pool))
+        .unwrap_or((0, 0));
+    DesktopLifecycleStats {
+        tasks: task::task_count(),
+        frame_bump,
+        live_frames: frame_bump.saturating_sub(frame_free),
+        frame_free,
+        heap_used: allocator::used(),
+    }
+}
+
+/// Deterministic normal-exit/restart stress proof. One warm-up session grows
+/// reusable allocator pools; the measured sessions must then return TCBs,
+/// address spaces, kernel stacks, and mmap frames to the same baseline.
+fn handle_desktop_cycle(mode: ConsoleMode, args: &str) {
+    let cycles: u32 = match args.trim().parse() {
+        Ok(count) if (1..=100).contains(&count) => count,
+        _ => {
+            println(mode, "Usage: desktopcycle <1-100>");
+            return;
+        }
+    };
+    let Some(bytes) = embedded_program("desktop") else {
+        println(mode, "desktopcycle: embedded desktop missing");
+        return;
+    };
+
+    task::reap_now();
+    if let Err(reason) = run_one_desktop_cycle(bytes) {
+        clear_screen(mode);
+        println(
+            mode,
+            &format!("desktop lifecycle: FAIL warmup reason={}", reason),
+        );
+        task::reap_now();
+        return;
+    }
+    task::reap_now();
+    let before = desktop_lifecycle_stats();
+
+    for cycle in 1..=cycles {
+        if let Err(reason) = run_one_desktop_cycle(bytes) {
+            clear_screen(mode);
+            println(
+                mode,
+                &format!("desktop lifecycle: FAIL cycle={} reason={}", cycle, reason),
+            );
+            task::reap_now();
+            return;
+        }
+        task::reap_now();
+    }
+
+    let after = desktop_lifecycle_stats();
+    let passed = before.tasks == after.tasks
+        && before.live_frames == after.live_frames
+        && before.frame_bump == after.frame_bump
+        && before.heap_used == after.heap_used;
+    clear_screen(mode);
+    println(
+        mode,
+        &format!(
+            "desktop lifecycle: {} cycles={}",
+            if passed { "PASS" } else { "FAIL" },
+            cycles
+        ),
+    );
+    println(
+        mode,
+        &format!(
+            "desktop lifecycle: tasks before={} after={}",
+            before.tasks, after.tasks
+        ),
+    );
+    println(
+        mode,
+        &format!(
+            "desktop lifecycle: live_frames before={} after={}",
+            before.live_frames, after.live_frames
+        ),
+    );
+    println(
+        mode,
+        &format!(
+            "desktop lifecycle: frame_bump before={} after={}",
+            before.frame_bump, after.frame_bump
+        ),
+    );
+    println(
+        mode,
+        &format!(
+            "desktop lifecycle: heap_used before={} after={}",
+            before.heap_used, after.heap_used
+        ),
+    );
+}
+
+fn run_one_desktop_cycle(bytes: &'static [u8]) -> Result<(), &'static str> {
+    let presents_before = crate::display::present_telemetry().count;
+    let id = spawn_foreground_process("desktop-cycle", bytes)?;
+
+    // Require a real successful present before requesting exit. A fixed sleep
+    // could expire while a preemptible backbuffer allocation is still in
+    // progress and accidentally test spawn->exit without ever running the UI.
+    if !wait_for_desktop_present(id, presents_before, 500) {
+        let _ = task::kill(id);
+        let _ = release_desktop_foreground(id);
+        return Err("desktop first present timed out");
+    }
+    crate::input::push_key_event(KeyEvent::Escape);
+
+    let exit_wait_started = interrupts::ticks();
+    let timed_out = loop {
+        match task::info(id) {
+            Ok(info) if info.state == task::TaskState::Terminated => break false,
+            Err(_) => break true,
+            _ if interrupts::ticks().saturating_sub(exit_wait_started) >= 500 => {
+                let _ = task::kill(id);
+                break true;
+            }
+            _ => task::yield_now(),
+        }
+    };
+
+    let _telemetry = release_desktop_foreground(id);
+    if timed_out {
+        return Err("desktop exit timed out");
+    }
+    match task::info(id) {
+        Ok(info) if info.exit_code == Some(0) => Ok(()),
+        Ok(_) => Err("desktop did not exit with code 0"),
+        Err(_) => Err("desktop TCB disappeared before verification"),
+    }
+}
+
+fn wait_for_desktop_present(id: u32, before: u64, timeout_ticks: u64) -> bool {
+    let started = interrupts::ticks();
+    loop {
+        if crate::display::present_telemetry().count > before {
+            return true;
+        }
+        match task::info(id) {
+            Ok(info) if info.state == task::TaskState::Terminated => return false,
+            Err(_) => return false,
+            _ if interrupts::ticks().saturating_sub(started) >= timeout_ticks => return false,
+            _ => task::yield_now(),
+        }
+    }
+}
+
+fn handle_desktop_test(mode: ConsoleMode) {
+    match desktop_window_model::self_test() {
+        Ok(()) => println(mode, "desktoptest: PASS drag close z-order slot-reuse"),
+        Err(reason) => {
+            print(mode, "desktoptest: FAIL ");
+            println(mode, reason);
+        }
+    }
+}
+
+fn handle_mouse_test(mode: ConsoleMode) {
+    match crate::mouse::self_test() {
+        Ok(()) => println(
+            mode,
+            "mousetest: PASS resync signed-motion y-inversion clamp overflow button-edges",
+        ),
+        Err(reason) => {
+            print(mode, "mousetest: FAIL ");
             println(mode, reason);
         }
     }
@@ -1143,12 +2096,24 @@ fn print_help(mode: ConsoleMode) {
     );
     println(
         mode,
-        "         bad_divzero|bad_mmap|bad_munmap|bad_display|bad_input|desktop>",
+        "         bad_divzero|bad_mmap|bad_munmap|bad_display|bad_input|mmap_ro_fault|",
+    );
+    println(
+        mode,
+        "         mmap_nx_fault|post_unmap_fault|mmap_exhaustion|mmap_partial_failure|desktop|desktop_peer>",
     );
     println(mode, "  isolate [bad_program]");
     println(mode, "  spawnfail <count>");
     println(mode, "  reap <count>");
-    println(mode, "  desktop");
+    println(mode, "  autoreap <count> | killreap <count>");
+    println(
+        mode,
+        "  desktop | desktoppeer | desktopfaultpeer | desktopkilltest | desktopinteraction",
+    );
+    println(
+        mode,
+        "  desktopcycle <count> | desktoptest | mousetest | desktopstats | inputstats",
+    );
     println(mode, "  ai | ai status | ask <question>");
     println(mode, "");
     println(mode, "Tip: use Up/Down for history, Tab to complete.");
@@ -1253,7 +2218,18 @@ fn command_names() -> &'static [&'static str] {
         "isolate",
         "spawnfail",
         "reap",
+        "autoreap",
+        "killreap",
         "desktop",
+        "desktoppeer",
+        "desktopfaultpeer",
+        "desktopkilltest",
+        "desktopinteraction",
+        "desktopcycle",
+        "desktoptest",
+        "mousetest",
+        "desktopstats",
+        "inputstats",
         "ai",
         "ask",
     ]
@@ -1334,6 +2310,7 @@ fn print_meminfo(boot_info: &BootInfo, mode: ConsoleMode) {
 }
 
 fn print(mode: ConsoleMode, text: &str) {
+    crate::serial_print!("{}", text);
     match mode {
         ConsoleMode::Framebuffer => crate::framebuffer_console::print(text),
         ConsoleMode::Vga => crate::vga_buffer::print(text),
@@ -1341,6 +2318,7 @@ fn print(mode: ConsoleMode, text: &str) {
 }
 
 fn println(mode: ConsoleMode, text: &str) {
+    crate::serial_println!("{}", text);
     match mode {
         ConsoleMode::Framebuffer => crate::framebuffer_console::println(text),
         ConsoleMode::Vga => crate::vga_buffer::println(text),
@@ -1352,6 +2330,7 @@ fn print_char(mode: ConsoleMode, ch: u8) {
 }
 
 fn backspace(mode: ConsoleMode) {
+    crate::serial_print!("\x08 \x08");
     match mode {
         ConsoleMode::Framebuffer => crate::framebuffer_console::backspace(),
         ConsoleMode::Vga => crate::vga_buffer::backspace(),
