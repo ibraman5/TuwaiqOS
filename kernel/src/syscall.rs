@@ -35,6 +35,7 @@
 //! |18 | MKDIR          | `path_ptr, path_len`           | `0`, or `-1`                 |
 //! |19 | READDIR        | `path_ptr, path_len, spec_ptr` | bytes listed, or `-1`        |
 //! |20 | STAT           | `path_ptr, path_len, out_ptr`  | `0`, or `-1`                 |
+//! |21 | SEEK           | `handle, absolute_offset`      | new offset, or `-1`          |
 //!
 //! (Phase 5 -- see `ARCHITECTURE.md`'s "Phase 5: userland runtime and the
 //! first graphical desktop" section for the design behind 4-9.)
@@ -93,6 +94,7 @@ const SYS_REMOVE: u64 = 17;
 const SYS_MKDIR: u64 = 18;
 const SYS_READDIR: u64 = 19;
 const SYS_STAT: u64 = 20;
+const SYS_SEEK: u64 = 21;
 
 /// Upper bound on a single `WRITE`'s length -- generous for this ABI's
 /// only real use (a handful of short diagnostic lines from `hello_user`),
@@ -222,6 +224,7 @@ fn dispatch(num: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_MKDIR => sys_mkdir(a1, a2),
         SYS_READDIR => sys_readdir(a1, a2, a3),
         SYS_STAT => sys_stat(a1, a2, a3),
+        SYS_SEEK => sys_seek(a1, a2),
         _ => {
             // Exactly the "unknown syscall numbers must fail safely"
             // requirement: logged for visibility, a plain error return,
@@ -707,6 +710,20 @@ fn sys_stat(path_ptr: u64, path_len: u64, out_ptr: u64) -> i64 {
     record[8..16].copy_from_slice(&size.to_le_bytes());
     if task::copy_to_current_user(out_ptr, &record) {
         0
+    } else {
+        -1
+    }
+}
+
+fn sys_seek(handle: u64, absolute_offset: u64) -> i64 {
+    let Ok(handle) = u32::try_from(handle) else {
+        return -1;
+    };
+    let Ok(offset) = usize::try_from(absolute_offset) else {
+        return -1;
+    };
+    if task::seek_file_for_current_process(handle, offset) {
+        absolute_offset as i64
     } else {
         -1
     }

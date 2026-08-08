@@ -64,6 +64,16 @@ const AI_LAUNCHER_X: i32 = 112;
 const AI_LAUNCHER_Y: i32 = 4;
 const AI_LAUNCHER_W: i32 = 176;
 const AI_LAUNCHER_H: i32 = 20;
+const FILES_LAUNCHER_X: i32 = 300;
+const FILES_LAUNCHER_Y: i32 = 4;
+const FILES_LAUNCHER_W: i32 = 128;
+const FILES_LAUNCHER_H: i32 = 20;
+const TERMINAL_LAUNCHER_X: i32 = 440;
+const TERMINAL_LAUNCHER_Y: i32 = 4;
+const TERMINAL_LAUNCHER_W: i32 = 104;
+const TERMINAL_LAUNCHER_H: i32 = 20;
+const EXIT_LAUNCH_FILE_MANAGER: i64 = 10;
+const EXIT_LAUNCH_TERMINAL: i64 = 11;
 const AI_EXECUTABLE: &[u8] = b"/apps/tuwaiq-ai";
 const AI_WINDOW_TITLE: &[u8] = b"Tuwaiq AI - Preview";
 
@@ -136,14 +146,20 @@ extern "C" fn rust_main() -> ! {
     let mut first_frame = true;
 
     loop {
-        let (input_dirty, exit_requested) = pump_input(&mut state, &info);
-        if exit_requested {
-            hello_user::write(b"desktop: normal exit requested\n");
+        let (input_dirty, exit_code) = pump_input(&mut state, &info);
+        if let Some(exit_code) = exit_code {
+            if exit_code == EXIT_LAUNCH_FILE_MANAGER {
+                hello_user::write(b"desktop: launch request file-manager\n");
+            } else if exit_code == EXIT_LAUNCH_TERMINAL {
+                hello_user::write(b"desktop: launch request terminal\n");
+            } else {
+                hello_user::write(b"desktop: normal exit requested\n");
+            }
             if !sys::munmap(addr, mapped_len) {
                 hello_user::write(b"desktop: backbuffer cleanup failed\n");
                 sys::exit(2);
             }
-            sys::exit(0);
+            sys::exit(exit_code);
         }
 
         let clock_second = sys::uptime_ticks() / TIMER_HZ;
@@ -171,7 +187,7 @@ extern "C" fn rust_main() -> ! {
     }
 }
 
-fn pump_input(state: &mut DesktopState, info: &sys::DisplayInfo) -> (bool, bool) {
+fn pump_input(state: &mut DesktopState, info: &sys::DisplayInfo) -> (bool, Option<i64>) {
     let mut buf = [0u8; 8];
     let mut dirty = false;
     // Drain every queued event this frame rather than just one, so a burst
@@ -179,7 +195,13 @@ fn pump_input(state: &mut DesktopState, info: &sys::DisplayInfo) -> (bool, bool)
     // two of this process's time slices) doesn't visibly lag the cursor.
     while sys::input_poll(&mut buf) {
         match buf[0] {
-            1 if buf[1] == sys::KEY_ESCAPE => return (dirty, true),
+            1 if buf[1] == sys::KEY_ESCAPE => return (dirty, Some(0)),
+            1 if matches!(buf[1], b'f' | b'F') => {
+                return (true, Some(EXIT_LAUNCH_FILE_MANAGER));
+            }
+            1 if matches!(buf[1], b't' | b'T') => {
+                return (true, Some(EXIT_LAUNCH_TERMINAL));
+            }
             1 => dirty |= on_key_down(state, buf[1]),
             2 => {
                 let x = i16::from_le_bytes([buf[4], buf[5]]) as i32;
@@ -197,14 +219,16 @@ fn pump_input(state: &mut DesktopState, info: &sys::DisplayInfo) -> (bool, bool)
                 let button = buf[1];
                 let pressed = buf[2] != 0;
                 if button == 0 {
-                    on_left_button(state, pressed);
+                    if let Some(exit_code) = on_left_button(state, pressed) {
+                        return (true, Some(exit_code));
+                    }
                     dirty = true;
                 }
             }
             _ => {}
         }
     }
-    (dirty, false)
+    (dirty, None)
 }
 
 fn on_key_down(state: &mut DesktopState, code: u8) -> bool {
@@ -221,13 +245,13 @@ fn on_key_down(state: &mut DesktopState, code: u8) -> bool {
     true
 }
 
-fn on_left_button(state: &mut DesktopState, pressed: bool) {
+fn on_left_button(state: &mut DesktopState, pressed: bool) -> Option<i64> {
     if !pressed {
         state.left_down = false;
         if let Some(drag) = state.wm.handle_release() {
             emit_drag_marker(drag);
         }
-        return;
+        return None;
     }
     state.left_down = true;
 
@@ -240,7 +264,7 @@ fn on_left_button(state: &mut DesktopState, pressed: bool) {
         LAUNCHER_H,
     ) {
         spawn_panel(state);
-        return;
+        return None;
     }
 
     if point_in_rect(
@@ -252,7 +276,29 @@ fn on_left_button(state: &mut DesktopState, pressed: bool) {
         AI_LAUNCHER_H,
     ) {
         spawn_ai_preview(state);
-        return;
+        return None;
+    }
+
+    if point_in_rect(
+        state.cursor_x,
+        state.cursor_y,
+        FILES_LAUNCHER_X,
+        FILES_LAUNCHER_Y,
+        FILES_LAUNCHER_W,
+        FILES_LAUNCHER_H,
+    ) {
+        return Some(EXIT_LAUNCH_FILE_MANAGER);
+    }
+
+    if point_in_rect(
+        state.cursor_x,
+        state.cursor_y,
+        TERMINAL_LAUNCHER_X,
+        TERMINAL_LAUNCHER_Y,
+        TERMINAL_LAUNCHER_W,
+        TERMINAL_LAUNCHER_H,
+    ) {
+        return Some(EXIT_LAUNCH_TERMINAL);
     }
 
     match state.wm.handle_press(state.cursor_x, state.cursor_y) {
@@ -262,6 +308,7 @@ fn on_left_button(state: &mut DesktopState, pressed: bool) {
         }
         PressAction::None | PressAction::DragStarted { .. } => {}
     }
+    None
 }
 
 fn emit_drag_marker(drag: DragResult) {
@@ -419,6 +466,24 @@ fn draw_system_bar(canvas: &mut Canvas, width: i32, seconds: u64) {
         COLOR_LAUNCHER.1,
         COLOR_LAUNCHER.2,
     );
+    canvas.fill_rect(
+        FILES_LAUNCHER_X,
+        FILES_LAUNCHER_Y,
+        FILES_LAUNCHER_W,
+        FILES_LAUNCHER_H,
+        COLOR_LAUNCHER.0,
+        COLOR_LAUNCHER.1,
+        COLOR_LAUNCHER.2,
+    );
+    canvas.fill_rect(
+        TERMINAL_LAUNCHER_X,
+        TERMINAL_LAUNCHER_Y,
+        TERMINAL_LAUNCHER_W,
+        TERMINAL_LAUNCHER_H,
+        COLOR_LAUNCHER.0,
+        COLOR_LAUNCHER.1,
+        COLOR_LAUNCHER.2,
+    );
     canvas.draw_text(
         b"+ Launch",
         LAUNCHER_X + 6,
@@ -435,10 +500,26 @@ fn draw_system_bar(canvas: &mut Canvas, width: i32, seconds: u64) {
         COLOR_TEXT.1,
         COLOR_TEXT.2,
     );
+    canvas.draw_text(
+        b"File Manager [F]",
+        FILES_LAUNCHER_X + 6,
+        FILES_LAUNCHER_Y + 6,
+        COLOR_TEXT.0,
+        COLOR_TEXT.1,
+        COLOR_TEXT.2,
+    );
+    canvas.draw_text(
+        b"Terminal [T]",
+        TERMINAL_LAUNCHER_X + 6,
+        TERMINAL_LAUNCHER_Y + 6,
+        COLOR_TEXT.0,
+        COLOR_TEXT.1,
+        COLOR_TEXT.2,
+    );
 
     canvas.draw_text(
         b"TuwaiqOS",
-        AI_LAUNCHER_X + AI_LAUNCHER_W + 20,
+        TERMINAL_LAUNCHER_X + TERMINAL_LAUNCHER_W + 20,
         LAUNCHER_Y + 6,
         COLOR_TEXT.0,
         COLOR_TEXT.1,
@@ -447,7 +528,7 @@ fn draw_system_bar(canvas: &mut Canvas, width: i32, seconds: u64) {
 
     canvas.draw_text(
         b"Esc: Exit",
-        AI_LAUNCHER_X + AI_LAUNCHER_W + 120,
+        TERMINAL_LAUNCHER_X + TERMINAL_LAUNCHER_W + 120,
         LAUNCHER_Y + 6,
         COLOR_TEXT_DIM.0,
         COLOR_TEXT_DIM.1,

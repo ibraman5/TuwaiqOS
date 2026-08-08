@@ -76,7 +76,7 @@ pub fn snapshot(boot_info: &BootInfo) -> Result<Vec<String>, &'static str> {
     lines.push(String::from(""));
 
     lines.push(String::from("[ Filesystem ]"));
-    lines.push(String::from("  TuwaiqFS v2 (persistent)"));
+    lines.push(String::from("  TuwaiqFS v3 (recoverable)"));
     match vfs::shell_pwd() {
         Ok(path) => {
             let mut line = String::from("  CWD: ");

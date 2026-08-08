@@ -61,16 +61,8 @@ pub enum EntryKind {
     Directory,
 }
 
-pub fn init() {
-    let mounted = tuwaiqfs::mount().unwrap_or_else(|reason| {
-        crate::serial_println!(
-            "fs: mount failed ({}), falling back to an empty filesystem",
-            reason
-        );
-        FsNode::Dir {
-            children: Vec::new(),
-        }
-    });
+pub fn init() -> Result<(), &'static str> {
+    let mounted = tuwaiqfs::mount()?;
 
     let root = match mounted {
         FsNode::Dir { children } => {
@@ -80,15 +72,14 @@ pub fn init() {
                 .collect();
             Entry::Dir { children: entries }
         }
-        FsNode::File { .. } => Entry::Dir {
-            children: Vec::new(),
-        },
+        FsNode::File { .. } => return Err("TuwaiqFS root is not a directory"),
     };
 
     let root = Arc::new(FileSystem { root });
     interrupts::without_interrupts(|| {
         *FS.lock() = Some(root);
     });
+    Ok(())
 }
 
 fn from_fs_node(node: FsNode) -> Entry {
@@ -162,6 +153,32 @@ where
         *guard = Some(published);
         Ok(())
     })
+}
+
+/// Exercise the checkpoint power-loss boundary without publishing the
+/// candidate tree. The inactive slot receives an uncommitted partial write;
+/// both the active on-disk generation and the in-memory snapshot remain the
+/// last successfully committed state.
+pub fn inject_interrupted_write(
+    path: &str,
+    bytes: &[u8],
+    data_sectors: usize,
+) -> Result<(), &'static str> {
+    let _writer = WriterGuard::acquire()?;
+    let snapshot = interrupts::without_interrupts(|| {
+        let guard = FS.lock();
+        guard
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or("filesystem not initialized")
+    })?;
+    let mut candidate = (*snapshot).clone();
+    candidate.write_at(path, bytes)?;
+    match tuwaiqfs::sync_tree_interrupted(&to_fs_node(&candidate.root), data_sectors) {
+        Err("injected interrupted checkpoint") => Ok(()),
+        Err(reason) => Err(reason),
+        Ok(()) => Err("interrupted checkpoint unexpectedly committed"),
+    }
 }
 
 impl FileSystem {
@@ -395,5 +412,5 @@ pub fn sync_to_disk() -> Result<(), &'static str> {
 }
 
 pub fn label() -> &'static str {
-    "TuwaiqFS v2"
+    "TuwaiqFS v3"
 }

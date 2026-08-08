@@ -15,6 +15,7 @@ mod apps;
 mod ata;
 mod display;
 mod elf;
+mod fat32;
 mod font8x8;
 mod framebuffer_console;
 mod fs;

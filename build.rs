@@ -5,12 +5,24 @@
 //! spawn nested `cargo` while the `bootloader` crate's own build.rs is running.
 
 use std::fs;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const KERNEL_TARGET: &str = "x86_64-unknown-none";
 const KERNEL_BIN: &str = "kernel";
 const IMAGE_NAME: &str = "boot-bios-tuwaiqos.img";
+const SECTOR_SIZE: u64 = 512;
+const FAT32_START_LBA: u32 = 24_576;
+const FAT32_TOTAL_SECTORS: u32 = 69_632;
+const FAT32_RESERVED_SECTORS: u32 = 32;
+const FAT32_FAT_SECTORS: u32 = 536;
+const TUWAIQFS_SUPERBLOCK_LBA: u32 = 8192;
+const TUWAIQFS_SLOT_A_LBA: u32 = 23_490;
+const TUWAIQFS_SLOT_SECTORS: u32 = 512;
+const TUWAIQFS_SLOT_B_LBA: u32 = TUWAIQFS_SLOT_A_LBA + TUWAIQFS_SLOT_SECTORS;
+const TUWAIQFS_MAX_METADATA: usize = (TUWAIQFS_SLOT_SECTORS as usize - 1) * 512;
+const TUWAIQFS_SLOT_COMMITTED: u32 = 0x434F_4D54;
 
 fn main() {
     if let Err(err) = run() {
@@ -24,6 +36,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     track_kernel_sources();
+    track_application_sources();
     print_build_environment();
 
     let profile = env_var("PROFILE")?;
@@ -72,6 +85,9 @@ fn run() -> Result<(), String> {
         ));
     }
 
+    create_tuwaiqfs_application_volume(&image, &target_dir)?;
+    create_fat32_resource_volume(&image)?;
+
     let image_size = fs::metadata(&image)
         .map_err(|e| format!("cannot read image metadata: {e}"))?
         .len();
@@ -84,6 +100,241 @@ fn run() -> Result<(), String> {
     println!("cargo:warning=TuwaiqOS disk image: {}", image.display());
 
     Ok(())
+}
+
+fn create_tuwaiqfs_application_volume(image: &Path, target_dir: &Path) -> Result<(), String> {
+    let applications = [
+        ("desktop", "desktop"),
+        ("file_manager", "file-manager"),
+        ("terminal", "terminal"),
+        ("tuwaiq_ai", "tuwaiq-ai"),
+    ];
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"TREE");
+    write_tuwaiqfs_record(&mut blob, 2, "apps", None)?;
+    for (binary, installed_name) in applications {
+        let path = target_dir
+            .join("x86_64-unknown-none")
+            .join("release")
+            .join(binary);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let bytes = fs::read(&path).map_err(|error| {
+            format!(
+                "packaged application '{}' is missing; run scripts\\build.ps1: {error}",
+                path.display()
+            )
+        })?;
+        let installed_path = format!("apps/{installed_name}");
+        write_tuwaiqfs_record(&mut blob, 1, &installed_path, Some(&bytes))?;
+    }
+    let catalog = b"desktop\nfile-manager\nterminal\ntuwaiq-ai\n";
+    write_tuwaiqfs_record(&mut blob, 1, "apps/catalog.txt", Some(catalog))?;
+    write_tuwaiqfs_record(&mut blob, 2, "data", None)?;
+    for directory in ["desktop", "file-manager", "terminal", "tuwaiq-ai"] {
+        write_tuwaiqfs_record(&mut blob, 2, &format!("data/{directory}"), None)?;
+    }
+    if blob.len() > TUWAIQFS_MAX_METADATA {
+        return Err(format!(
+            "packaged TuwaiqFS metadata is {} bytes, limit is {}",
+            blob.len(),
+            TUWAIQFS_MAX_METADATA
+        ));
+    }
+
+    let mut superblock = [0u8; 512];
+    superblock[..8].copy_from_slice(b"TQFSv2\0\0");
+    superblock[8..12].copy_from_slice(&3u32.to_le_bytes());
+    superblock[12..16].copy_from_slice(&TUWAIQFS_SLOT_A_LBA.to_le_bytes());
+    superblock[16..20].copy_from_slice(&TUWAIQFS_SLOT_SECTORS.to_le_bytes());
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(image)
+        .map_err(|error| format!("cannot open disk image for TuwaiqFS setup: {error}"))?;
+    write_sector(&mut file, TUWAIQFS_SUPERBLOCK_LBA, &superblock)?;
+    let mut checkpoint = [0u8; 512];
+    checkpoint[..8].copy_from_slice(b"TQCKPT\0\0");
+    checkpoint[8..16].copy_from_slice(&1u64.to_le_bytes());
+    checkpoint[16..20].copy_from_slice(&(blob.len() as u32).to_le_bytes());
+    checkpoint[20..24].copy_from_slice(&crc32(&blob).to_le_bytes());
+    write_sector(&mut file, TUWAIQFS_SLOT_A_LBA, &checkpoint)?;
+    write_sector(&mut file, TUWAIQFS_SLOT_B_LBA, &[0u8; 512])?;
+    let mut sector = [0u8; 512];
+    let mut offset = 0usize;
+    for index in 0..blob.len().div_ceil(512) {
+        sector.fill(0);
+        let count = blob.len().saturating_sub(offset).min(512);
+        if count != 0 {
+            sector[..count].copy_from_slice(&blob[offset..offset + count]);
+            offset += count;
+        }
+        write_sector(&mut file, TUWAIQFS_SLOT_A_LBA + 1 + index as u32, &sector)?;
+    }
+    checkpoint[24..28].copy_from_slice(&TUWAIQFS_SLOT_COMMITTED.to_le_bytes());
+    write_sector(&mut file, TUWAIQFS_SLOT_A_LBA, &checkpoint)?;
+    println!(
+        "TuwaiqFS application volume: {} bytes, {} packaged applications",
+        blob.len(),
+        applications.len()
+    );
+    Ok(())
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn write_tuwaiqfs_record(
+    out: &mut Vec<u8>,
+    kind: u8,
+    path: &str,
+    content: Option<&[u8]>,
+) -> Result<(), String> {
+    if path.is_empty() || path.len() > 120 || path.len() > u8::MAX as usize {
+        return Err(format!("invalid packaged TuwaiqFS path: {path}"));
+    }
+    out.push(kind);
+    out.push(path.len() as u8);
+    out.extend_from_slice(path.as_bytes());
+    if kind == 1 {
+        let bytes = content.ok_or_else(|| format!("missing content for {path}"))?;
+        let length = u16::try_from(bytes.len())
+            .map_err(|_| format!("packaged application exceeds 65,535 bytes: {path}"))?;
+        out.extend_from_slice(&length.to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+    Ok(())
+}
+
+fn create_fat32_resource_volume(image: &Path) -> Result<(), String> {
+    let final_len = u64::from(FAT32_START_LBA + FAT32_TOTAL_SECTORS) * SECTOR_SIZE;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(image)
+        .map_err(|error| format!("cannot open disk image for FAT32 setup: {error}"))?;
+    file.set_len(final_len)
+        .map_err(|error| format!("cannot extend disk image for FAT32: {error}"))?;
+
+    let mut partition = [0u8; 16];
+    partition[4] = 0x0C;
+    partition[8..12].copy_from_slice(&FAT32_START_LBA.to_le_bytes());
+    partition[12..16].copy_from_slice(&FAT32_TOTAL_SECTORS.to_le_bytes());
+    write_at(&mut file, 446 + 2 * 16, &partition)?;
+
+    let mut boot = [0u8; 512];
+    boot[0..3].copy_from_slice(&[0xEB, 0x58, 0x90]);
+    boot[3..11].copy_from_slice(b"TUWAIQOS");
+    boot[11..13].copy_from_slice(&512u16.to_le_bytes());
+    boot[13] = 1;
+    boot[14..16].copy_from_slice(&(FAT32_RESERVED_SECTORS as u16).to_le_bytes());
+    boot[16] = 2;
+    boot[21] = 0xF8;
+    boot[24..26].copy_from_slice(&32u16.to_le_bytes());
+    boot[26..28].copy_from_slice(&64u16.to_le_bytes());
+    boot[28..32].copy_from_slice(&FAT32_START_LBA.to_le_bytes());
+    boot[32..36].copy_from_slice(&FAT32_TOTAL_SECTORS.to_le_bytes());
+    boot[36..40].copy_from_slice(&FAT32_FAT_SECTORS.to_le_bytes());
+    boot[44..48].copy_from_slice(&2u32.to_le_bytes());
+    boot[48..50].copy_from_slice(&1u16.to_le_bytes());
+    boot[50..52].copy_from_slice(&6u16.to_le_bytes());
+    boot[64] = 0x80;
+    boot[66] = 0x29;
+    boot[67..71].copy_from_slice(&0x5451_4653u32.to_le_bytes());
+    boot[71..82].copy_from_slice(b"TUWAIQBOOT ");
+    boot[82..90].copy_from_slice(b"FAT32   ");
+    boot[510] = 0x55;
+    boot[511] = 0xAA;
+    write_sector(&mut file, FAT32_START_LBA, &boot)?;
+    write_sector(&mut file, FAT32_START_LBA + 6, &boot)?;
+
+    let mut fsinfo = [0u8; 512];
+    fsinfo[0..4].copy_from_slice(&0x4161_5252u32.to_le_bytes());
+    fsinfo[484..488].copy_from_slice(&0x6141_7272u32.to_le_bytes());
+    fsinfo[488..492].copy_from_slice(&u32::MAX.to_le_bytes());
+    fsinfo[492..496].copy_from_slice(&u32::MAX.to_le_bytes());
+    fsinfo[508..512].copy_from_slice(&0xAA55_0000u32.to_le_bytes());
+    write_sector(&mut file, FAT32_START_LBA + 1, &fsinfo)?;
+
+    let mut fat = [0u8; 512];
+    for (cluster, value) in [
+        (0usize, 0x0FFF_FFF8u32),
+        (1, 0xFFFF_FFFF),
+        (2, 0x0FFF_FFFF),
+        (3, 0x0FFF_FFFF),
+        (4, 0x0FFF_FFFF),
+        (5, 0x0FFF_FFFF),
+    ] {
+        let offset = cluster * 4;
+        fat[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let first_fat = FAT32_START_LBA + FAT32_RESERVED_SECTORS;
+    write_sector(&mut file, first_fat, &fat)?;
+    write_sector(&mut file, first_fat + FAT32_FAT_SECTORS, &fat)?;
+
+    let data_start = FAT32_START_LBA + FAT32_RESERVED_SECTORS + 2 * FAT32_FAT_SECTORS;
+    let readme = b"TuwaiqOS FAT32 resource volume\n";
+    let apps = b"desktop\nfile-manager\nterminal\n";
+    let mut root = [0u8; 512];
+    write_short_entry(
+        &mut root[0..32],
+        b"README  TXT",
+        0x20,
+        3,
+        readme.len() as u32,
+    );
+    write_short_entry(&mut root[32..64], b"DOCS       ", 0x10, 4, 0);
+    write_sector(&mut file, data_start, &root)?;
+
+    let mut readme_sector = [0u8; 512];
+    readme_sector[..readme.len()].copy_from_slice(readme);
+    write_sector(&mut file, data_start + 1, &readme_sector)?;
+
+    let mut docs = [0u8; 512];
+    write_short_entry(&mut docs[0..32], b".          ", 0x10, 4, 0);
+    write_short_entry(&mut docs[32..64], b"..         ", 0x10, 2, 0);
+    write_short_entry(
+        &mut docs[64..96],
+        b"APPS    TXT",
+        0x20,
+        5,
+        apps.len() as u32,
+    );
+    write_sector(&mut file, data_start + 2, &docs)?;
+
+    let mut apps_sector = [0u8; 512];
+    apps_sector[..apps.len()].copy_from_slice(apps);
+    write_sector(&mut file, data_start + 3, &apps_sector)?;
+    println!("FAT32 resource volume: LBA {FAT32_START_LBA}, {FAT32_TOTAL_SECTORS} sectors");
+    Ok(())
+}
+
+fn write_short_entry(out: &mut [u8], name: &[u8; 11], attributes: u8, cluster: u32, size: u32) {
+    out[..11].copy_from_slice(name);
+    out[11] = attributes;
+    out[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+    out[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+    out[28..32].copy_from_slice(&size.to_le_bytes());
+}
+
+fn write_sector(file: &mut fs::File, lba: u32, bytes: &[u8; 512]) -> Result<(), String> {
+    write_at(file, u64::from(lba) * SECTOR_SIZE, bytes)
+}
+
+fn write_at(file: &mut fs::File, offset: u64, bytes: &[u8]) -> Result<(), String> {
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| format!("disk image seek failed at {offset}: {error}"))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("disk image write failed at {offset}: {error}"))
 }
 
 /// Track every kernel source file, not a hand-maintained subset.
@@ -108,6 +359,25 @@ fn track_kernel_sources() {
             if path.is_dir() {
                 dirs.push_back(path);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
+}
+
+fn track_application_sources() {
+    println!("cargo:rerun-if-changed=userland/hello/Cargo.toml");
+    let mut dirs = std::collections::VecDeque::new();
+    dirs.push_back(PathBuf::from("userland/hello/src"));
+    while let Some(dir) = dirs.pop_front() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push_back(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
                 println!("cargo:rerun-if-changed={}", path.display());
             }
         }

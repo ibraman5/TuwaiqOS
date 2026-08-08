@@ -7,7 +7,7 @@ use core::arch::global_asm;
 
 use hello_user::{
     syscall, SYS_CHDIR, SYS_CLOSE, SYS_EXIT, SYS_GETCWD, SYS_MMAP, SYS_MUNMAP, SYS_OPEN, SYS_READ,
-    SYS_SPAWN,
+    SYS_SEEK, SYS_SPAWN,
 };
 
 global_asm!(
@@ -143,6 +143,18 @@ extern "C" fn rust_main() -> ! {
         hello_user::write(b"\n");
         fail(b"file-api: sequential READ mismatch");
     }
+    if call(SYS_SEEK, handle as u64, 0, 0) != 0 {
+        fail(b"file-api: SEEK rewind failed");
+    }
+    let mut rewound = [0u8; 5];
+    if call(SYS_READ, handle as u64, rewound.as_mut_ptr() as u64, 5) != 5
+        || &rewound != b"phase"
+        || call(SYS_SEEK, handle as u64, 12, 0) != -1
+        || call(SYS_SEEK, u64::MAX, 0, 0) != -1
+        || call(SYS_SEEK, handle as u64, 11, 0) != 11
+    {
+        fail(b"file-api: SEEK bounds/handle semantics");
+    }
     if call(
         SYS_READ,
         handle as u64,
@@ -183,7 +195,7 @@ extern "C" fn rust_main() -> ! {
     }
 
     hello_user::write(
-        b"file-api: PASS cwd paths malformed-pointers cross-page atomic-read eof handles exit-cleanup\n",
+        b"file-api: PASS cwd paths malformed-pointers cross-page atomic-read seek eof handles exit-cleanup\n",
     );
     exit(0)
 }

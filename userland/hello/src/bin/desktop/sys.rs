@@ -5,12 +5,17 @@
 //! fixed-size event decoding), not part of the shared test-binary ABI
 //! surface.
 
+#![allow(dead_code)] // Shared applications intentionally use different subsets.
+
 use hello_user::{
-    syscall, SYS_DISPLAY_INFO, SYS_DISPLAY_PRESENT, SYS_EXIT, SYS_INPUT_POLL, SYS_MMAP, SYS_MUNMAP,
-    SYS_SPAWN, SYS_UPTIME_TICKS, SYS_YIELD,
+    syscall, SYS_CLOSE, SYS_DISPLAY_INFO, SYS_DISPLAY_PRESENT, SYS_EXIT, SYS_INPUT_POLL, SYS_MMAP,
+    SYS_MUNMAP, SYS_OPEN, SYS_PUT_FILE, SYS_READ, SYS_READDIR, SYS_SPAWN, SYS_STAT,
+    SYS_UPTIME_TICKS, SYS_YIELD,
 };
 
 pub const KEY_ESCAPE: u8 = 0x1B;
+pub const KEY_ENTER: u8 = 0x0D;
+pub const KEY_BACKSPACE: u8 = 0x08;
 
 pub const PIXEL_FORMAT_BGR: u32 = 1;
 pub const PIXEL_FORMAT_U8: u32 = 2;
@@ -120,6 +125,78 @@ pub fn yield_now() {
 pub fn spawn(path: &[u8]) -> Option<u32> {
     let result = unsafe { syscall(SYS_SPAWN, path.as_ptr() as u64, path.len() as u64, 0) };
     u32::try_from(result).ok()
+}
+
+fn buffer_spec(pointer: u64, length: usize) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&pointer.to_le_bytes());
+    bytes[8..].copy_from_slice(&(length as u64).to_le_bytes());
+    bytes
+}
+
+pub fn read_dir(path: &[u8], output: &mut [u8]) -> Option<usize> {
+    let spec = buffer_spec(output.as_mut_ptr() as u64, output.len());
+    let result = unsafe {
+        syscall(
+            SYS_READDIR,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            spec.as_ptr() as u64,
+        )
+    };
+    usize::try_from(result).ok()
+}
+
+pub fn stat(path: &[u8]) -> Option<(u64, u64)> {
+    let mut record = [0u8; 16];
+    let result = unsafe {
+        syscall(
+            SYS_STAT,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            record.as_mut_ptr() as u64,
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    Some((
+        u64::from_le_bytes(record[..8].try_into().ok()?),
+        u64::from_le_bytes(record[8..].try_into().ok()?),
+    ))
+}
+
+pub fn read_file(path: &[u8], output: &mut [u8]) -> Option<usize> {
+    let handle = unsafe { syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, 0) };
+    if handle < 3 {
+        return None;
+    }
+    let read = unsafe {
+        syscall(
+            SYS_READ,
+            handle as u64,
+            output.as_mut_ptr() as u64,
+            output.len() as u64,
+        )
+    };
+    let closed = unsafe { syscall(SYS_CLOSE, handle as u64, 0, 0) } == 0;
+    if read < 0 || !closed {
+        None
+    } else {
+        usize::try_from(read).ok()
+    }
+}
+
+pub fn put_file(path: &[u8], data: &[u8]) -> bool {
+    let spec = buffer_spec(data.as_ptr() as u64, data.len());
+    unsafe {
+        syscall(
+            SYS_PUT_FILE,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            spec.as_ptr() as u64,
+        ) == 0
+    }
 }
 
 pub fn exit(code: i64) -> ! {

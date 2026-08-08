@@ -15,11 +15,11 @@ Write-Host "=== TuwaiqOS build ===" -ForegroundColor Cyan
 Write-Host "Toolchain: $env:RUSTUP_TOOLCHAIN"
 
 Write-Host ""
-Write-Host "[1/3] Building all 23 userland ELF programs..." -ForegroundColor Yellow
+Write-Host "[1/3] Building all 25 userland ELF programs..." -ForegroundColor Yellow
 # Standalone crate, own [workspace] -- see userland/hello/Cargo.toml. Must
-# build before the kernel: kernel/src/shell.rs embeds these binaries via
-# include_bytes!. Shares this script's CARGO_TARGET_DIR so the embedded
-# paths are predictable. Invoked from *inside* the package directory
+# build before the kernel/image: shell.rs embeds explicit test fixtures and
+# build.rs packages normal applications into TuwaiqFS. Sharing CARGO_TARGET_DIR
+# keeps both consumers on the checked ELF artifacts. Invoked from *inside* the package directory
 # deliberately -- cargo's config-file discovery walks up from the current
 # working directory, not from --manifest-path, so running this from the
 # repo root would silently miss userland/hello/.cargo/config.toml (the
@@ -38,7 +38,8 @@ $UserlandBins = @(
     "hello", "bad_syscall", "bad_pointer", "bad_privileged", "bad_kernel", "bad_unmapped",
     "bad_ud2", "bad_divzero", "bad_mmap", "bad_munmap", "bad_display", "bad_input",
     "mmap_ro_fault", "mmap_nx_fault", "post_unmap_fault", "mmap_exhaustion", "mmap_partial_failure",
-    "desktop", "desktop_peer", "file_api_test", "file_mutation_test", "tuwaiq_ai", "tuwaiq_ai_fault"
+    "desktop", "desktop_peer", "file_api_test", "file_mutation_test", "file_manager", "terminal",
+    "tuwaiq_ai", "tuwaiq_ai_fault"
 )
 foreach ($bin in $UserlandBins) {
     $path = Join-Path $ProjectRoot "target\x86_64-unknown-none\release\$bin"

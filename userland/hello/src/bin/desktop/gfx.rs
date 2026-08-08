@@ -3,6 +3,8 @@
 //! `main.rs`: the finished frame only reaches the screen through
 //! `SYS_DISPLAY_PRESENT`, which the kernel validates independently).
 
+#![allow(dead_code)] // Shared applications intentionally use different subsets.
+
 use crate::font;
 use crate::sys::{DisplayInfo, PIXEL_FORMAT_BGR, PIXEL_FORMAT_U8};
 

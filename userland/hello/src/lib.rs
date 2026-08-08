@@ -30,6 +30,7 @@ pub const SYS_REMOVE: u64 = 17;
 pub const SYS_MKDIR: u64 = 18;
 pub const SYS_READDIR: u64 = 19;
 pub const SYS_STAT: u64 = 20;
+pub const SYS_SEEK: u64 = 21;
 
 /// # Safety
 /// Caller is responsible for `num`/`a1`/`a2`/`a3` meaning what the
