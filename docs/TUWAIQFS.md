@@ -71,8 +71,15 @@ mounts TuwaiqFS at `/`; paths are normalized above this on-disk layer.
 2. If magic is wrong, format the TuwaiqFS region
 3. Validate and deserialize the exact metadata blob into an in-memory tree
 4. The VFS exposes the tree without leaking TuwaiqFS nodes to applications
-5. A privileged shell mutation is built as a candidate, persisted, and only
-   then published in memory; Ring 3 has read-only handles in this milestone
+5. A mutation is built as a candidate, persisted, and only then published in
+   memory. A non-spinning writer guard rejects concurrent writers as busy.
+6. Ring 3 reads use bounded handles; whole-file replacement, deletion, basic
+   metadata, and directory operations pass through the VFS and are confined to
+   `/data/<process-name>/`
+
+The in-memory publication is transactional on validation, allocation, and ATA
+errors, but the on-disk v2 format remains a single-copy metadata region. It does
+not yet guarantee recovery from power loss partway through a sector sequence.
 
 ## Historical note
 

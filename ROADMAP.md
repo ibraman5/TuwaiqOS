@@ -142,7 +142,10 @@ lifecycle.
 - [x] Add the bounded read-only file syscall foundation (`CHDIR`, `GETCWD`,
       `OPEN`, `READ`, `CLOSE`) with validated buffers, per-process handles,
       stable offsets, and exit cleanup
-- [ ] Add capability-aware file mutation, metadata, seek, and directory APIs
+- [x] Add bounded application-private file create/replace/delete, basic
+      metadata, and directory create/list APIs with hostile-pointer coverage
+- [ ] Add seek and the Phase 8 capability/permission model for shared or
+      delegated filesystem access
 - [x] Execute native ELF binaries from files through the VFS with `SPAWN` and
       the existing validated ELF loader
 - [ ] Remove build-time embedded ELF as the normal application path; retain
@@ -151,6 +154,8 @@ lifecycle.
 - [ ] Add FAT32 read support as a VFS backend after the VFS contract is stable
 - [x] Test binary-file persistence, path traversal boundaries, process resource
       reuse, and filesystem-backed ELF relaunch after a genuine reboot
+- [x] Persist data from both a Ring 3 application and the built-in Notes app,
+      then reopen both after a genuine reboot
 - [ ] Complete injected interrupted-write, corrupt-volume, repair/recovery, and
       storage-exhaustion acceptance tests
 

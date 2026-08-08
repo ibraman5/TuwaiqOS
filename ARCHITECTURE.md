@@ -6,7 +6,7 @@ TuwaiqOS is a monolithic bare-metal kernel written in Rust (`no_std`) with
 hardware-isolated Ring 3 ELF processes. Core services remain in the kernel;
 Phase 4 added per-process address spaces, Phase 5 runs the graphical desktop
 as an unprivileged userspace process, and the first Phase 6 milestone adds a
-VFS/read-only file ABI and filesystem-backed process launch.
+VFS/file ABI, persistent application data, and filesystem-backed process launch.
 
 ```mermaid
 flowchart LR
@@ -544,7 +544,7 @@ hardware-verified evidence, not a heuristic.
   filesystem-backed executable loading. Phase 6 now supplies the initial
   filesystem path; dynamic linking and relocation remain future work.
 - At Phase 5 completion the syscall surface contained 10 calls and no file
-  API. The current Phase 6 milestone extends it to 16 calls; IPC remains future.
+  API. The current Phase 6 milestone extends it to 21 calls; IPC remains future.
 
 ### Verification performed
 
@@ -966,8 +966,9 @@ request, mouse error, or desktop lifecycle event can halt Ring 0.
 ## Phase 6 foundation: VFS, file ABI, and filesystem applications
 
 This section describes the **current first Phase 6 milestone**, not the Phase 6
-exit gate. TuwaiqFS remains the only mounted backend, Ring 3 file access is
-read-only, and embedded executables remain transitional bootstrap/test input.
+exit gate. TuwaiqFS remains the only mounted backend, mutations are confined to
+per-application data directories, and embedded executables remain transitional
+bootstrap/test input.
 
 ### Current storage and path boundary
 
@@ -1003,16 +1004,18 @@ private TuwaiqFS backend -> validated v2 serialization -> ATA PIO
   of a corrupt blob as a complete tree.
 - Readers clone one immutable `Arc` tree snapshot inside the interrupt-safe
   lock, then perform traversal and output allocation after interrupts are
-  restored. A shell mutation clones a lightweight candidate tree from that
-  snapshot (file bodies remain shared immutable buffers), mutates and persists
-  it with interrupts enabled, and publishes an already-built snapshot under
-  the VFS lock only after ATA success. An I/O failure therefore leaves the
-  prior in-memory namespace visible. The v2 single-copy disk format is not yet
-  crash-transactional; journal/recovery work remains in Phase 6.
+  restored. A mutation clones a lightweight candidate tree from that snapshot
+  (file bodies remain shared immutable buffers), mutates and persists it with
+  interrupts enabled, and publishes an already-built snapshot under the VFS
+  lock only after ATA success. A non-spinning atomic writer guard rejects a
+  concurrent writer as busy rather than deadlocking a preempted owner or losing
+  an update. An I/O failure therefore leaves the prior in-memory namespace
+  visible. The v2 single-copy disk format is not yet crash-transactional;
+  journal/recovery work remains in Phase 6.
 
 ### Current Ring 3 file/process ABI
 
-Syscalls 10-15 extend the Phase 5 ABI to 16 calls. They are an intentionally
+Syscalls 10-20 extend the Phase 5 ABI to 21 calls. They are an intentionally
 small milestone ABI, not the future stable/versioned application ABI:
 
 - `CHDIR` and `GETCWD` operate only on the calling process.
@@ -1036,10 +1039,24 @@ small milestone ABI, not the future stable/versioned application ABI:
   selected embedded recovery/test image into `/apps`; `runfs` and `SPAWN` then
   read and load the persisted file. Removing embedded ELF as the normal path
   remains an unchecked Phase 6 requirement.
+- `PUT_FILE` atomically creates or replaces a complete file, capped at 4096
+  bytes per call. `REMOVE` deletes files or empty directories, and rejects a
+  non-empty directory. `MKDIR`, `READDIR`, and `STAT` provide basic directory
+  and metadata operations. `READDIR` emits newline-delimited names; `STAT`
+  returns a fixed 16-byte kind/size record.
+- Ring 3 mutation is confined to `/data/<process-name>/`. Trusted application
+  installation provisions that directory. Normalized escape attempts,
+  `/apps` replacement, another application's namespace, invalid paths, and
+  malformed user pointers are rejected. This is a bounded early ownership
+  rule, not the future Phase 8 capability/delegation system.
+- User-copy storage is reserved before the interrupt-safe scheduler lock is
+  entered. Only bounded page validation and copying occur while the current
+  address-space reference is protected; filesystem allocation, tree cloning,
+  serialization, and ATA I/O all run with interrupts enabled and without a
+  global spin lock held.
 
-Ring 3 has no create/write/unlink/rename/directory-enumeration syscall in this
-milestone. This is deliberate until permissions, mutation rollback, offsets,
-and namespace rules are ready; applications cannot manipulate TuwaiqFS
+Ring 3 has no rename, seek, shared-directory delegation, or general writable
+handle API in this milestone, and applications cannot manipulate TuwaiqFS
 internals directly. The current interrupt-gate syscall path also remains
 non-preemptible while loading a `SPAWN` image (bounded to 65,535 bytes); moving
 filesystem reads and ELF preparation out of that interval is required before
@@ -1133,10 +1150,32 @@ The 2026-08-08 focused run actually demonstrated:
 - no kernel panic, kernel page fault, double fault, unexpected QEMU exit, or
   new compiler warning (the existing nine warnings remain).
 
-Corrupt-volume injection, interrupted-sector recovery, writable Ring 3 file
-APIs, general mounts, service IPC, capabilities, real local inference, and
-removal of normal embedded application loading remain unverified/incomplete and
-are not claimed by this milestone.
+Corrupt-volume injection, interrupted-sector recovery, general mounts, service
+IPC, capabilities, real local inference, and removal of normal embedded
+application loading remain unverified/incomplete and are not claimed by this
+milestone.
+
+### Phase 6 persistent application-data verification performed
+
+The mutable-storage milestone uses one short assertion-driven QEMU run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\phase6-storage-smoke.ps1
+```
+
+The run installs and launches the hostile `file-mutation-test` ELF through the
+VFS, proves create/replace/read/stat/list/delete behavior, rejects invalid paths,
+namespace escapes, noncanonical/kernel/unmapped/zero/overflowing/cross-page
+pointers and oversized buffers, saves a real Notes entry, and genuinely reboots
+the copied disk. It then reopens the Ring 3 file and Notes entry and relaunches
+`/apps/hello`. Missing markers, a kernel panic, kernel page fault, double fault,
+or unexpected QEMU exit fail the run. Evidence is written under
+`target/phase6-storage-smoke/<commit>-<timestamp>/`.
+
+This does not close Phase 6: the mount table/second backend, normal embedded-ELF
+removal, filesystem-launched useful applications, seek/capability delegation,
+and injected corruption/interrupted-write/recovery/exhaustion gates remain open.
 
 ## Locking invariant
 
@@ -1251,7 +1290,7 @@ Loopback driver echoes packets in RAM. `ping localhost` validates the stack. HTT
    directory (its `.cargo/config.toml` supplies the static-relocation/
    large-code-model/no-PIE flags a fixed high address like
    `0x_7000_0000_0000` requires -- running from the repo root would
-   silently miss that config). The current tree builds 22 ELF programs:
+   silently miss that config). The current tree builds 23 ELF programs:
    functional, hostile pointer/fault, VM rollback/permission, desktop, and
    concurrency coverage, including `desktop` (Phase 5's Tuwaiq Desktop --
    a multi-file binary under `src/bin/desktop/`, sharing this same crate
