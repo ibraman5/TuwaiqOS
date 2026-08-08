@@ -31,4 +31,11 @@ Please allow reasonable time for investigation and a fix before public disclosur
 
 ## Scope
 
-Security reports are welcome for the kernel, memory management, interrupts, scheduler, filesystem, drivers, build pipeline, and release artifacts.
+Security reports are welcome for the kernel, memory management, interrupts,
+scheduler, filesystem/VFS, userspace ABI, process isolation, drivers, build
+pipeline, release artifacts, and Tuwaiq AI provider/permission boundaries.
+
+Tuwaiq AI components are userspace components. A model or provider must never
+receive an undocumented privileged path, unrestricted kernel authority, or a
+permission bypass; reports of such a path are in scope even during preview
+development.

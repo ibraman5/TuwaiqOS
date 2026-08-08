@@ -54,6 +54,9 @@ Phase 11: Tuwaiq AI / Agentic OS
 Phase 12: Security, Qualification & Government Pilot
 
 Parallel Desktop Track -----------------------> Phases 6-9
+Early Tuwaiq AI Preview ----> Phase 8 IPC/capabilities
+                           ----> Phase 9 apps/tools
+                           ----> Phase 11 full Agent Runtime
 ```
 
 The numbered path is the order in which each integrated phase must meet its
@@ -132,23 +135,54 @@ give native userspace programs durable, path-based storage.
 **Depends on:** the Phase 4 process/ELF foundation and Phase 5 resource
 lifecycle.
 
-- [ ] Introduce a real VFS abstraction with mountable filesystem backends
-- [ ] Define normalized absolute/relative path semantics, working directories,
+- [x] Introduce the VFS facade/backend contract and mount TuwaiqFS at `/`
+- [ ] Add a general mount table and a second filesystem backend
+- [x] Define normalized absolute/relative path semantics, working directories,
       `cd`, and path-aware shell completion
-- [ ] Add file-oriented userspace syscalls with validated handles, buffers,
-      offsets, permissions, and lifecycle ownership
-- [ ] Execute native ELF binaries from files through the VFS
+- [x] Add the bounded read-only file syscall foundation (`CHDIR`, `GETCWD`,
+      `OPEN`, `READ`, `CLOSE`) with validated buffers, per-process handles,
+      stable offsets, and exit cleanup
+- [ ] Add capability-aware file mutation, metadata, seek, and directory APIs
+- [x] Execute native ELF binaries from files through the VFS with `SPAWN` and
+      the existing validated ELF loader
 - [ ] Remove build-time embedded ELF as the normal application path; retain
       only explicitly justified boot, recovery, or test fixtures
 - [ ] Move useful applications onto the filesystem-backed launch path
 - [ ] Add FAT32 read support as a VFS backend after the VFS contract is stable
-- [ ] Test persistence, interrupted writes, corruption detection, recovery,
-      path traversal boundaries, and reboot behavior
+- [x] Test binary-file persistence, path traversal boundaries, process resource
+      reuse, and filesystem-backed ELF relaunch after a genuine reboot
+- [ ] Complete injected interrupted-write, corrupt-volume, repair/recovery, and
+      storage-exhaustion acceptance tests
 
 **Exit gate:** after a clean boot, the shell and desktop can discover, launch,
 read, write, and relaunch native applications and their files from persistent
 storage without rebuilding the kernel image. Recovery tests must not silently
 accept corruption or data loss.
+
+### Early Tuwaiq AI Preview Track — begins alongside Phase 6
+
+This parallel preview exposes real architecture early without displacing the
+Phase 6 dependency path. Phase 11 remains the completion target for the full
+Agent Runtime and agentic operating-system experience.
+
+- [x] Run the preview assistant service as an ordinary isolated Ring 3 process
+- [x] Define a replaceable `ModelProvider` lifecycle and a local development
+      provider that reports inference unavailable instead of fabricating it
+- [x] Add a real **Tuwaiq AI — Preview** desktop launcher/window and prove
+      launch, exit, relaunch, provider-fault isolation, and resource reuse
+- [x] Keep telemetry, networking, capabilities, tools, and privileged access
+      disabled in the preview
+- [ ] Add a real local model provider only after filesystem/runtime primitives
+      can load and execute it within explicit memory/resource limits
+- [ ] Integrate service IPC and the Permission Broker in Phase 8
+- [ ] Package assistant surfaces and permissioned tools in Phase 9
+- [ ] Complete the Agent Runtime, audit log, workflows, and sovereign provider
+      architecture in Phase 11
+
+The preview security direction is fixed even while mechanisms remain future:
+**Model proposes → Agent Runtime requests → policy checks → permission checks
+→ tool executes → audit records.** A model never receives a direct privileged
+kernel path.
 
 ## Phase 7 — Hardware & Networking
 
@@ -225,6 +259,8 @@ network foundations needed by platform services from Phase 7.
 - [ ] Stabilize and version the native Tuwaiq ABI with compatibility policy
 - [ ] Add IPC with explicit endpoint ownership, bounds, and teardown behavior
 - [ ] Add permissions/capabilities and least-privilege process services
+- [ ] Move Tuwaiq AI Preview service/UI communication onto bounded IPC and
+      require the same capabilities as every other native application
 - [ ] Expand process services, including runtime memory management beyond the
       current bump-only `mmap` virtual-address arena
 - [ ] Implement Tuwaiq libc and a useful native POSIX subset
@@ -274,6 +310,8 @@ resources.
 - [ ] Support rollback, interrupted-update recovery, and storage-pressure cases
 - [ ] Expose bounded package/repository controls through Settings and local
       Owner / Developer Mode
+- [ ] Package the Tuwaiq AI application, local providers, and permissioned tool
+      adapters independently so providers remain replaceable
 
 **Exit gate:** signed native packages install, upgrade, remove, and roll back
 without breaking unrelated applications or the bootable OS. Dependency,
@@ -333,6 +371,9 @@ storage, and—only for optional remote providers—usable networking.
       providers/connectors after secure transport and permissions exist
 
 No model or Agent Runtime component executes in Ring 0.
+The Phase 6 preview is an architectural foothold, not completion of this
+phase: real inference, the Agent Runtime, Permission Broker, tools, persistent
+workflow authorization, and audit remain unchecked until demonstrated.
 
 **Exit gate:** offline workflows function without cloud services; every action
 is attributable, permission-checked, bounded, and revocable; provider

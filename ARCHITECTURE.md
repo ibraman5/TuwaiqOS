@@ -4,8 +4,9 @@
 
 TuwaiqOS is a monolithic bare-metal kernel written in Rust (`no_std`) with
 hardware-isolated Ring 3 ELF processes. Core services remain in the kernel;
-Phase 4 added per-process address spaces and Phase 5 runs the graphical desktop
-as an unprivileged userspace process.
+Phase 4 added per-process address spaces, Phase 5 runs the graphical desktop
+as an unprivileged userspace process, and the first Phase 6 milestone adds a
+VFS/read-only file ABI and filesystem-backed process launch.
 
 ```mermaid
 flowchart LR
@@ -30,7 +31,8 @@ flowchart LR
         HIST[History + tab complete]
     end
     subgraph Storage
-        FS[fs.rs API]
+        VFS[VFS + path policy]
+        FS[private TuwaiqFS backend]
         TQFS[TuwaiqFS v2]
         ATA[ATA PIO driver]
     end
@@ -38,6 +40,7 @@ flowchart LR
         TASK[Scheduler: real TCBs + context switch]
         ELF[ELF64 Ring 3 loader]
         DESK[Tuwaiq Desktop process]
+        AIP[Tuwaiq AI Preview service]
         APPS[notes / editor / monitor]
     end
     subgraph Network
@@ -50,17 +53,18 @@ flowchart LR
     IDT --> SER
     K --> FB
     K --> VGA
-    K --> FS
+    K --> VFS
     K --> TASK
     K --> NET
     KB --> IDT
     SH --> KB
-    SH --> FS
+    SH --> VFS
     SH --> ELF --> DESK
+    DESK --> AIP
     SH --> APPS
     SH --> TASK
     SH --> NET
-    FS --> TQFS --> ATA
+    VFS --> FS --> TQFS --> ATA
     SH --> APPS
     NET --> LB
     NET --> HTTP
@@ -72,7 +76,7 @@ flowchart LR
 2. `kernel_main` enables `EFER.NXE` (`paging::enable_nx`, before any page
    table exists -- see Phase 4 below), initializes the heap, then
    interrupts (GDT/TSS, IDT, PIC remap + mask, PIT timer, `sti`), then ATA,
-   TuwaiqFS, tasks, and network.
+   VFS/TuwaiqFS, tasks, and network.
 3. Framebuffer or VGA console starts; shell prints boot banner and prompt.
 
 Interrupts must come immediately after the heap: the keyboard event queue
@@ -96,7 +100,8 @@ interrupts live rather than a purely polled CPU.
 | `framebuffer_console.rs` | Scaled 8×8 font on bootloader FB |
 | `vga_buffer.rs` | 80×25 text mode fallback |
 | `shell.rs` | Command loop, history, completion |
-| `fs.rs` | In-memory tree API for shell |
+| `vfs.rs` | Path policy, root-mount dispatch, shell/process VFS facade |
+| `fs.rs` | Private TuwaiqFS-backed in-memory tree implementation |
 | `tuwaiqfs.rs` | On-disk serialization (TuwaiqFS v2) |
 | `ata.rs` | Primary master PIO sector I/O |
 | `task.rs` | Preemptive scheduler: real TCBs, per-task stacks, context switch, user-process lifecycle, CR3/RSP0 switching |
@@ -152,11 +157,16 @@ interrupts live rather than a purely polled CPU.
 
 ## TuwaiqFS v2
 
-See [docs/TUWAIQFS.md](docs/TUWAIQFS.md). The full directory tree is flattened to path records (`hello.txt`, `docs/readme.txt`) and stored in a metadata region starting at LBA 8465.
+See [docs/TUWAIQFS.md](docs/TUWAIQFS.md). The full directory tree is flattened
+to path records (`hello.txt`, `docs/readme.txt`) and stored in a metadata region
+starting at LBA 8465. Phase 6 keeps the v2 layout but makes file bodies
+binary-safe so native ELF bytes can be persisted.
 
 ## Program loader
 
-`loader.rs` dispatches `run <name>` to built-in programs in `programs/`. The registry pattern is designed so an ELF loader can replace the dispatch table later without changing shell parsing.
+`loader.rs` still dispatches `run <name>` to legacy built-in kernel programs.
+`runelf` launches embedded Ring 3 recovery/test images, while Phase 6 `runfs`
+and `SPAWN` load persisted ELF bytes through VFS and the real `elf.rs` loader.
 
 ## Shell
 
@@ -432,6 +442,12 @@ generic failure -- no `errno`-style detail channel in this minimal ABI.
 | 7 | DISPLAY_PRESENT | `ptr: *const u8, len: usize` | `0`, or `-1` |
 | 8 | INPUT_POLL | `out_ptr: *mut u8, out_len: usize` | `1`, `0`, or `-1` |
 | 9 | UPTIME_TICKS | -- | 100 Hz tick count |
+| 10 | CHDIR | `path_ptr: *const u8, path_len: usize` | `0`, or `-1` |
+| 11 | GETCWD | `out_ptr: *mut u8, out_len: usize` | path byte count, or `-1` |
+| 12 | OPEN | `path_ptr: *const u8, path_len: usize` | read handle, or `-1` |
+| 13 | READ | `handle: u32, out_ptr: *mut u8, out_len: usize` | bytes read, or `-1` |
+| 14 | CLOSE | `handle: u32` | `0`, or `-1` |
+| 15 | SPAWN | `path_ptr: *const u8, path_len: usize` | child pid, or `-1` |
 
 Any other number: `-1`, logged, the process keeps running (`syscall.rs`
 `dispatch`'s `_` arm) -- unknown syscalls fail safely rather than crashing
@@ -524,11 +540,11 @@ hardware-verified evidence, not a heuristic.
 
 - Single, fixed 1 GiB private user range per process; no ASLR or growth
   beyond it. Phase 5 adds a bounded anonymous mmap arena inside that range.
-- No dynamic linking (`ET_EXEC` only), no relocations, no filesystem-backed
-  executable loading yet (the current build embeds 19 ELF binaries).
-- The current syscall surface is intentionally minimal at 10 calls: no
-  filesystem or IPC syscalls. Phase 5 adds reaping and dedicated CPU-enforced
-  read-only, NX, and post-unmap fault tests.
+- At Phase 4 completion there was no dynamic linking, relocation, or
+  filesystem-backed executable loading. Phase 6 now supplies the initial
+  filesystem path; dynamic linking and relocation remain future work.
+- At Phase 5 completion the syscall surface contained 10 calls and no file
+  API. The current Phase 6 milestone extends it to 16 calls; IPC remains future.
 
 ### Verification performed
 
@@ -858,10 +874,10 @@ memory; fail with `-1`, never a kernel fault, on anything invalid.
   Deliberately small: this is the first window model, not a general compositor.
 - `MAX_WINDOWS = 4`, fixed at compile time, no heap in this process to grow
   it dynamically.
-- The desktop is still launched from an embedded ELF binary
+- At Phase 5 acceptance the desktop was launched from an embedded ELF binary
   (`shell.rs::embedded_program`), the same mechanism every `runelf` test
-  program already uses -- filesystem-backed executable loading remains
-  future work (tracked since Phase 4, unchanged by this phase).
+  program already used. The Phase 6 section below records the first
+  filesystem-backed replacement path; embedding is not removed yet.
 - `TIMER_HZ` (100) is duplicated as a documented assumption in the
   desktop's own clock code rather than exposed via a syscall; if the
   kernel's timer frequency ever changes, this constant needs updating
@@ -940,6 +956,179 @@ cannot address another's private subtree; failed mapping/unmapping does not
 advance or partially expose the arena; deferred unmap frames cannot be reused
 before commit; input has one foreground owner; and no user fault, display/input
 request, mouse error, or desktop lifecycle event can halt Ring 0.
+
+## Phase 6 foundation: VFS, file ABI, and filesystem applications
+
+This section describes the **current first Phase 6 milestone**, not the Phase 6
+exit gate. TuwaiqFS remains the only mounted backend, Ring 3 file access is
+read-only, and embedded executables remain transitional bootstrap/test input.
+
+### Current storage and path boundary
+
+`vfs.rs` owns path policy and dispatches the root mount through a private
+backend contract; `fs.rs` is the concrete TuwaiqFS tree and no syscall or
+application receives a backend node. Current topology is:
+
+```text
+shell / Ring 3 syscalls
+        |
+        v
+VFS path normalization + root dispatch
+        |
+        v
+private TuwaiqFS backend -> validated v2 serialization -> ATA PIO
+```
+
+- Paths are UTF-8, at most 120 bytes (the current TuwaiqFS v2 record bound),
+  with components at most 64 bytes.
+  Absolute and per-process-relative paths share one normalizer. Empty
+  components and `.` are removed; `..` pops one component and clamps at `/`.
+  NUL/control bytes and backslashes are rejected.
+- The privileged shell and every Ring 3 process own independent normalized
+  working directories. `cd` and path-aware completion use the same VFS policy
+  as syscalls; one process cannot change a peer's CWD.
+- TuwaiqFS v2's on-disk layout is unchanged, but file bodies are now opaque
+  bytes rather than UTF-8 strings. One file is capped at 65,535 bytes by the
+  existing `u16` record, and the complete metadata region remains 124 KiB.
+- Mount rejects unsupported geometry/version, metadata lengths outside the
+  reserved region, truncated/unknown records, invalid or duplicate paths, and
+  invalid UTF-8 path names. It caps metadata at 1,024 records and uses fallible
+  parser growth. It never clamps an oversized length or accepts a valid prefix
+  of a corrupt blob as a complete tree.
+- A shell mutation clones a lightweight candidate tree (file bodies are shared
+  immutable buffers), mutates and persists that candidate with interrupts
+  enabled, and publishes it under the VFS lock only after ATA success. An I/O
+  failure therefore leaves the prior in-memory namespace visible. The v2
+  single-copy disk format is not yet crash-transactional; journal/recovery
+  work remains in Phase 6.
+
+### Current Ring 3 file/process ABI
+
+Syscalls 10-15 extend the Phase 5 ABI to 16 calls. They are an intentionally
+small milestone ABI, not the future stable/versioned application ABI:
+
+- `CHDIR` and `GETCWD` operate only on the calling process.
+- `OPEN` returns a read-only process-owned handle. Handles start at 3, are
+  capped at 16 per process and 256 KiB of logical open-file content, and hold
+  immutable shared snapshots: a later privileged replacement does not change
+  bytes already opened by a process.
+- `READ` is capped at 4096 bytes per call. It validates the complete writable
+  userspace destination before observing or advancing the handle, so a bad,
+  read-only, unmapped, noncanonical, overflowing, kernel, or cross-page range
+  consumes no data. EOF is stable; `CLOSE` rejects stale/double-close handles.
+- Process exit/fault/reap drops every handle and shared snapshot reference with
+  the TCB. No filesystem lock or raw backend pointer crosses a syscall.
+- `SPAWN` resolves a VFS path, holds immutable executable bytes, applies the
+  existing ELF64 validation/permission loader, inherits the caller's CWD, and
+  returns a child pid. Executables are capped by the v2 file limit and the
+  global scheduler is capped at 64 tasks. Per-process names, CWD, handle table,
+  32 KiB kernel stack, and TCB allocation are prepared fallibly; pressure
+  returns `-1` instead of invoking Ring 0's allocation panic path.
+- `installapp` is an explicit transitional bootstrap command that copies a
+  selected embedded recovery/test image into `/apps`; `runfs` and `SPAWN` then
+  read and load the persisted file. Removing embedded ELF as the normal path
+  remains an unchecked Phase 6 requirement.
+
+Ring 3 has no create/write/unlink/rename/directory-enumeration syscall in this
+milestone. This is deliberate until permissions, mutation rollback, offsets,
+and namespace rules are ready; applications cannot manipulate TuwaiqFS
+internals directly. The current interrupt-gate syscall path also remains
+non-preemptible while loading a `SPAWN` image (bounded to 65,535 bytes); moving
+filesystem reads and ELF preparation out of that interval is required before
+larger executables or general storage backends are admitted.
+
+## Early Tuwaiq AI Preview architecture
+
+### CURRENT
+
+The preview is a product surface and isolation proof, not a simulated model:
+
+```text
+Tuwaiq Desktop UI (Ring 3)
+        | SPAWN /apps/tuwaiq-ai
+        v
+Assistant service (separate Ring 3 process)
+        v
+ModelProvider lifecycle contract
+        v
+LocalDevelopmentProvider -> Unavailable (no inference)
+```
+
+- `tuwaiq_ai` is a normal filesystem-backed Ring 3 ELF with a
+  `ModelProvider` start/generate/shutdown contract. Its development provider
+  has no model and returns `Unavailable`; there is no canned answer presented
+  as inference.
+- The desktop's **Tuwaiq AI - Preview** launcher opens a real assistant window
+  and starts the service with `SPAWN`. The window explicitly reports that the
+  local model, IPC, permissions, tools, and audit services are unavailable.
+- The provider has no telemetry, network path, capability, hardware access,
+  kernel memory access, or privileged syscall. A separate hostile provider
+  executes `UD2`; normal CPL3 fault isolation terminates only that process.
+- The UI and service currently share no IPC. Launch status is the only product
+  integration. Provider replacement is a userspace concern and requires no
+  kernel inference/model interface.
+
+### FUTURE
+
+Phase 8 supplies bounded IPC and the Permission Broker; Phase 9 packages
+assistant surfaces/providers and permissioned tools; Phase 11 remains the full
+Agent Runtime completion target. The mandatory action path is:
+
+```text
+Model proposes
+    -> Agent Runtime requests
+    -> policy validates
+    -> Permission Broker checks explicit capability
+    -> tool executes through normal OS APIs
+    -> audit records
+```
+
+Model, provider, Agent Runtime, tools, permissions, and OS APIs remain separate
+ownership domains. No model output becomes a syscall automatically. There is
+no root-equivalent capability, founder key, hidden bypass, remote dependency,
+or default data egress. Local/offline operation remains the baseline, and a
+future suitable Saudi model or another approved provider can replace the local
+provider without redesigning the kernel or UI contract.
+
+### Phase 6 focused verification performed
+
+Development uses one focused assertion-driven run after a build:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\phase6-smoke.ps1 -AllowDirty
+```
+
+`phase6-smoke.ps1` copies the image, drives QEMU through TCP monitor/serial,
+fails on missing markers or kernel faults, captures the honest preview window,
+and reboots the same copied disk. Evidence is concise ignored output under
+`target/phase6-smoke/<commit>-<timestamp>/` (`serial.log`, `results.json`, and
+one PPM).
+
+The 2026-08-08 focused run actually demonstrated:
+
+- normalized absolute/relative/dot/parent paths, independent process CWD,
+  hostile path/destination pointers, cross-page rejection, read offset
+  atomicity, EOF, handle exhaustion/double close, and exit cleanup;
+- filesystem-backed ELF load/exit and binary persistence/relaunch after a
+  genuine reboot;
+- assistant start/stop/relaunch at CPL3, an isolated invalid-opcode provider
+  exit, and continued kernel/scheduler heartbeat;
+- a real desktop click launching the separate service while the desktop stayed
+  scheduled, followed by normal desktop exit and a second warmed concurrent
+  cycle;
+- exact warmed resource reuse: VFS test tasks `3->3`, live frames `1029->1029`,
+  frame bump `1045->1045`, heap `94264->94264`; assistant lifecycle tasks
+  `3->3`, frames `1029->1029`, bump `1045->1045`, heap `116336->116336`;
+  concurrent desktop/AI returned tasks `3->3`, frames `1029->1029`, bump
+  `1735->1735`, and heap `137192->137192` after its full warm cycle;
+- no kernel panic, kernel page fault, double fault, unexpected QEMU exit, or
+  new compiler warning (the existing nine warnings remain).
+
+Corrupt-volume injection, interrupted-sector recovery, writable Ring 3 file
+APIs, general mounts, service IPC, capabilities, real local inference, and
+removal of normal embedded application loading remain unverified/incomplete and
+are not claimed by this milestone.
 
 ## Locking invariant
 
@@ -1054,14 +1243,16 @@ Loopback driver echoes packets in RAM. `ping localhost` validates the stack. HTT
    directory (its `.cargo/config.toml` supplies the static-relocation/
    large-code-model/no-PIE flags a fixed high address like
    `0x_7000_0000_0000` requires -- running from the repo root would
-   silently miss that config). The current tree builds 19 ELF programs:
+   silently miss that config). The current tree builds 22 ELF programs:
    functional, hostile pointer/fault, VM rollback/permission, desktop, and
    concurrency coverage, including `desktop` (Phase 5's Tuwaiq Desktop --
    a multi-file binary under `src/bin/desktop/`, sharing this same crate
    and build step rather than a separate one, since it needs no `alloc`
    and no fixed address different from every other binary here).
 2. `cargo build -p kernel --target x86_64-unknown-none` -- `shell.rs`
-   embeds every binary from step 1 via `include_bytes!`.
+   embeds bootstrap/recovery/test copies during the Phase 6 transition. The
+   VFS can persist those bytes and normal execution then reloads them from
+   files; removing embedding as the normal path is still a Phase 6 task.
 3. `cargo build -p tuwaiqos` → `build.rs` wraps kernel in BIOS image
 4. Output: `boot-bios-tuwaiqos.img`
 

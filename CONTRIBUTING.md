@@ -19,8 +19,8 @@ Thank you for your interest in TuwaiqOS!
 
 See [ROADMAP.md](ROADMAP.md). Good first issues:
 
-- `cd` command and path-aware tab completion
-- ELF loader prototype
+- Host-side VFS path and corrupt-volume parser tests
+- A second read-only VFS backend after the mount-table contract lands
 - e1000 network driver
 - Unit tests for TuwaiqFS serialization (host-side)
 

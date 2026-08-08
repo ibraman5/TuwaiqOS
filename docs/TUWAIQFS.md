@@ -31,7 +31,7 @@ The metadata blob begins with `TREE` followed by records:
 | path_len | 1 | Length of path string |
 | path  | variable | e.g. `hello.txt` or `docs/notes.txt` |
 | content_len | 2 | File size (files only) |
-| content | variable | UTF-8 file body |
+| content | variable | Opaque file bytes |
 
 ### Metadata length is stored explicitly, not inferred
 
@@ -53,16 +53,26 @@ scan, no guessing.
 ## Limits
 
 - Max metadata size: 124 KiB
-- Max file size: 2048 bytes per file
-- UTF-8 text files
+- Max file size: 65,535 bytes per file (the v2 `u16` record limit)
+- Max serialized path: 120 bytes; max path component: 64 bytes
+- Max metadata records: 1,024
+- File content is binary-safe; text interpretation belongs to applications
 - Nested directories supported
+
+The mount parser rejects an unsupported version/geometry, a metadata length
+outside the reserved region, truncated or unknown records, duplicate paths,
+and invalid path components. It does not clamp or partially accept corrupted
+metadata, and parser-owned buffers grow fallibly. The current Phase 6 VFS
+mounts TuwaiqFS at `/`; paths are normalized above this on-disk layer.
 
 ## Boot sequence
 
 1. ATA driver reads superblock at LBA 8192
 2. If magic is wrong, format the TuwaiqFS region
-3. Deserialize metadata blob into an in-memory tree
-4. Shell commands operate on the tree; every mutation syncs back to disk
+3. Validate and deserialize the exact metadata blob into an in-memory tree
+4. The VFS exposes the tree without leaking TuwaiqFS nodes to applications
+5. A privileged shell mutation is built as a candidate, persisted, and only
+   then published in memory; Ring 3 has read-only handles in this milestone
 
 ## Historical note
 
