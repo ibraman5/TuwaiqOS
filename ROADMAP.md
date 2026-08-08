@@ -1,141 +1,416 @@
 # TuwaiqOS Roadmap
 
-## v0.5 (current)
+> **Independent at the core. Compatible by design.**
 
-- [x] Bootloader + kernel + framebuffer/VGA console
-- [x] PS/2 keyboard with Shift and punctuation
-- [x] Shell with history, tab completion, `tuwaiq@os:~$` prompt
-- [x] Heap allocator
-- [x] TuwaiqFS v2 persistent tree filesystem
-- [x] Cooperative task scheduler (`ps`, `taskinfo`, `kill`)
-- [x] Loopback networking foundation
-- [x] AI Bridge stub (`ask`, `ai status`)
-- [x] Program loader (`run hello`, `run demo`)
-- [x] Built-in apps: `notes`, `editor`, `monitor`
+This roadmap orders work by the dependencies needed to reach a genuinely
+usable TuwaiqOS desktop. Phase numbers are integration and release gates, not a
+requirement that all engineering happen serially: Core and Desktop work proceed
+in parallel once the interfaces between them are clear.
 
-## v0.6 — in progress
+`ARCHITECTURE.md` describes the current implementation. Unchecked items here
+are plans, not claims about functionality that exists today.
 
-- [x] Real interrupt architecture: GDT/TSS, IDT with exception handlers,
-      PIC remap, PIT timer tick, interrupt-driven keyboard, real `uptime`
-- [x] Physical frame allocator + paging: real physical memory access,
-      `OffsetPageTable`, a heap backed by mapped pages instead of a static
-      array, memory diagnostics in `sysinfo`/`monitor`
-- [x] Preemptive scheduler: real per-task stacks and a hand-written
-      context switch, timer-driven preemption (50ms slices), `spawn`/
-      `yield_now`/`sleep_ticks`/`exit`; `ps`/`taskinfo`/`kill` act on real
-      scheduler state. Demonstrated with 3 concurrently-scheduled tasks
-      (shell, idle, a heartbeat task) verified live in QEMU.
-- [x] Ring 3 foundation: user code/data GDT segments, a TSS whose RSP0 can
-      be pointed at a specific kernel stack at runtime, and a real
-      `iretq`-based Ring 0 -> Ring 3 transition with a safe trap back.
-      Verified live in QEMU: CPL=3 genuinely reached (CS/SS RPL=3 on the
-      trap frame), a privileged instruction executed from Ring 3 takes a
-      General Protection Fault the kernel recovers from, and the full
-      Phase 1-3 regression still passes afterward. Superseded by the full
-      process model below -- this milestone's demo code no longer exists.
-- [x] Full user-mode process model, per-process address spaces, syscall
-      ABI, and ELF64 execution: real `Tcb`-integrated user processes (own
-      PID, state, private address space, own kernel + user stacks, exit
-      status) scheduled by the *same* Phase 3 scheduler, no second
-      scheduler built. Each process gets a genuinely private page-table
-      root (`paging::AddressSpace`) -- kernel mappings copied in without
-      `USER_ACCESSIBLE`, the process's own 1 GiB user region left entirely
-      empty for it alone -- with CR3 and the TSS's RSP0 both switched
-      correctly on every scheduler transition, so any number of processes
-      interleave safely under real preemption. `elf.rs` is a real,
-      hand-rolled ELF64 loader (documented supported subset: `ET_EXEC`,
-      `EM_X86_64`, `PT_LOAD` only, checked arithmetic throughout) that maps
-      each segment with its own real, final permissions (code RX, data
-      RW+NX, stack RW+NX, `EFER.NXE` enabled and verified before relying on
-      any of it). Phase 4 introduced EXIT/WRITE/YIELD/GETPID; the current
-      Phase 5 ABI has 10 syscalls (0-9) over the `int 0x80` gate, with every user
-      pointer validated against the caller's own page tables before the
-      kernel ever dereferences it -- an invalid pointer or an unknown
-      syscall number both fail cleanly, never crash the kernel. A user
-      fault (privileged instruction, kernel-memory access, unmapped
-      access) terminates only the offending process; a Ring 0 fault keeps
-      the kernel's unchanged, strict halt policy. Verified live in QEMU in
-      one session: a real ELF process completing a full syscall round
-      trip; each of the fault-isolation categories above triggered and
-      recovered from individually; two concurrent processes with distinct,
-      hardware-confirmed PML4 physical addresses interleaving under timer
-      preemption, one of them deliberately faulted without affecting the
-      other or the kernel; the full Phase 1-3 regression checklist; and
-      TuwaiqFS content surviving a full VM reset. See `ARCHITECTURE.md`'s
-      "Phase 4: user-mode process model" section for the complete design,
-      ABI reference, and known limitations (fixed single user-address
-      range, no dynamic linking, and no filesystem-backed executable loading
-      yet). Phase 5 has since closed the terminated-task/kernel-stack leak.
-- [ ] Real NIC driver (e1000 / virtio-net)
-- [ ] AI Bridge HTTP client wired to gateway
-- [ ] `cd` command and path-aware completion
-- [x] Process lifecycle cleanup: terminated `Tcb`s and their kernel stacks
-      are now genuinely reaped (grace-period reaping, `reap <count>` proves
-      task count and physical-frame bump cursor both stabilize across
-      repeated spawn/exit cycles) -- closes the leak Phase 4 documented and
-      deferred.
-- [x] Userspace anonymous memory: `SYS_MMAP`/`SYS_MUNMAP`, a minimal
-      TuwaiqOS-specific ABI (`mmap(len, writable)` chooses an address inside
-      the caller's arena; `munmap(ptr, len)` accepts only aligned, owned arena
-      ranges). Mapping/zeroing/permission failures roll back; unmap
-      prevalidates the complete range and commits atomically.
-- [x] Kernel display abstraction + validated present syscall
-      (`SYS_DISPLAY_INFO`/`SYS_DISPLAY_PRESENT`): userspace renders into its
-      own `mmap`'d buffer, the kernel copies it into the real framebuffer
-      only after full pointer/length/mapping validation.
-- [x] Real PS/2 mouse driver (IRQ12 via the slave-PIC cascade line) with
-      packet resync, signed relative motion, absolute screen-clamped
-      cursor position, and button-edge detection.
-- [x] Unified keyboard+mouse input queue and `SYS_INPUT_POLL`, with explicit
-      foreground ownership. Each key is routed to either the privileged shell
-      or one foreground Ring 3 process, never permanently fanned out to both;
-      ownership transitions clear stale events.
-- [x] **First Tuwaiq Desktop**: a real Ring 3 ELF64 process (`desktop`
-      shell command, same `spawn_user_process` path as every other
-      `runelf`-launched program) with a small userspace window model
-      (fixed-capacity, z-order, drag, close), a system bar with a live
-      clock, a working mouse cursor, a launcher button, and visible
-      keyboard echo, normal Escape exit, and safe relaunch. Software-rendered,
-      no GPU. See `ARCHITECTURE.md`'s
-      "Phase 5" section for the complete design, ABI additions, security
-      boundaries, and known limitations (bump-only mmap arena, no
-      `KeyUp` events, fixed `MAX_WINDOWS = 4`, still launched from an
-      embedded ELF rather than the filesystem).
-- [x] Phase 5 acceptance: repository-local clean-build/QEMU harness covers
-      hostile pointer tests, atomic display/input/VM behavior, CPU permissions,
-      mouse decode/absence/latency, exclusive foreground input, concurrent
-      Ring 3 execution, 20 present-and-exit desktop cycles, resource baselines,
-      genuine reboot persistence, and full Phase 1-5 regression. See
-      `ARCHITECTURE.md` -> "Phase 5 Verification Performed". Phase 5 closure
-      does not complete the remaining v0.6 NIC/AI Gateway/`cd` roadmap items.
+## Architectural invariants
 
-## v0.7 — planned
+- The Tuwaiq Kernel remains an independent TuwaiqOS kernel. It will not be
+  replaced by, derived from, or based on the Linux kernel.
+- Native Tuwaiq applications and the versioned Tuwaiq ABI are first-class.
+- POSIX and Linux compatibility are optional userspace layers. TuwaiqOS must
+  remain fully bootable and functional when those layers are absent.
+- Linux compatibility must be removable without breaking native TuwaiqOS.
+- Core and Desktop development proceed in parallel; visible desktop progress
+  does not wait for every Core phase to finish.
+- AI models, providers, agents, and orchestration remain outside Ring 0. The
+  kernel supplies narrow security and resource-control mechanisms, not AI
+  policy or model execution.
+- Security, testing, documentation, and measurable resource ownership are
+  continuous requirements, even where a later phase contains a formal
+  qualification gate.
 
-- [ ] Filesystem-backed executable loading (`elf.rs` already parses real
-      ELF64 bytes; the desktop and every test program are still loaded
-      from build-time-embedded binaries, not the filesystem)
-- [ ] Dynamic linking / relocations (current loader is `ET_EXEC`-only)
-- [ ] Broader syscall surface (filesystem, IPC) as real use cases justify
-      each one
-- [ ] `KeyUp` events (keyboard scancode decoder doesn't track per-key
-      release state yet, only Shift)
-- [ ] A free-list-backed `mmap` arena (current one is bump-only; a
-      `munmap`'d range's virtual addresses aren't reused within the same
-      process)
-- [ ] Dirty-rectangle presentation for the desktop compositor (the current
-      desktop redraws/presents a full frame only on input, initial display, or
-      clock changes; idle iterations yield without redrawing)
-- [ ] FAT32 read-only partition support
-- [ ] VirtualBox/VMware optimized drivers
-- [ ] Package manager for built-in apps
+## Dependency path
 
-## v1.0 — vision
+```text
+Completed foundations (Phases 0-5)
+        |
+        v
+Phase 6: Storage, VFS & Real Applications
+        |
+        v
+Phase 7: Hardware & Networking
+        |
+        v
+Phase 8: Application Platform
+        |
+        v
+Phase 9: Applications, Packages & Updates
+        |
+        v
+Phase 10: Optional Compatibility
+        |
+        v
+Phase 11: Tuwaiq AI / Agentic OS
+        |
+        v
+Phase 12: Security, Qualification & Government Pilot
 
-- [ ] Multi-user sessions
-- [ ] TLS + DNS for AI Bridge
-- [ ] Self-hosting toolchain on TuwaiqOS
-- [ ] Public SDK for TuwaiqOS applications
+Parallel Desktop Track -----------------------> Phases 6-9
+```
+
+The numbered path is the order in which each integrated phase must meet its
+exit gate. Hardware enablement, security work, SDK design, and Desktop work may
+start earlier where they do not depend on an unstable interface.
+
+## Completed foundations
+
+### Phase 0 — Bootable foundation (completed)
+
+- [x] BIOS bootloader, Rust `no_std` kernel, framebuffer/VGA console
+- [x] PS/2 keyboard, interactive shell, history, and completion
+- [x] Kernel heap and TuwaiqFS v2 persistent tree filesystem
+- [x] Cooperative task foundation and built-in programs
+- [x] Loopback networking foundation and offline AI Bridge stub
+- [x] Built-in `notes`, `editor`, and `monitor` applications
+
+### Phase 1 — Interrupt architecture (completed)
+
+- [x] GDT/TSS and IDT with exception handling
+- [x] PIC remapping, PIT at 100 Hz, interrupt-driven keyboard, and real uptime
+- [x] Serial diagnostics and live interrupt/fault verification in QEMU
+
+### Phase 2 — Physical memory and paging (completed)
+
+- [x] Boot-memory-map-backed physical frame allocator with frame reuse
+- [x] `OffsetPageTable` paging and a heap backed by mapped physical frames
+- [x] Live heap/frame diagnostics and interrupt-safe paging locks
+
+### Phase 3 — Preemptive scheduling (completed)
+
+- [x] Real task control blocks, per-task kernel stacks, and context switching
+- [x] 50 ms timer preemption, yield, sleep/wake, exit, task inspection, and kill
+- [x] Concurrent shell, idle, and heartbeat tasks verified live in QEMU
+- [x] Interrupt-safe scheduler, heap, keyboard, and paging lock discipline
+
+### Phase 4 — Ring 3 process foundation (completed)
+
+- [x] Hardware Ring 0/Ring 3 separation with a runtime TSS RSP0
+- [x] Preempted user processes in private page-table roots
+- [x] Checked ELF64 `ET_EXEC` loading with RX/RW/NX segment permissions
+- [x] Initial syscall ABI and complete caller-address-space pointer validation
+- [x] User-fault isolation, concurrent-process isolation, and spawn rollback
+- [x] QEMU verification of CPL=3, invalid syscalls/pointers, hostile faults,
+      distinct CR3 roots, scheduler regression, and reboot persistence
+
+The detailed Phase 4 design, limitations, and verification record remain in
+`ARCHITECTURE.md` under **Phase 4: user-mode process model**.
+
+### Phase 5 — Userland runtime and first Tuwaiq Desktop (completed)
+
+- [x] Reaping of terminated tasks, address spaces, frames, and kernel stacks
+- [x] Anonymous `MMAP`/`MUNMAP` with rollback and atomic full-range unmap
+- [x] Validated atomic framebuffer presentation and display information ABI
+- [x] Bounded PS/2 mouse driver and unified keyboard/mouse input events
+- [x] Exclusive foreground input ownership between shell and Ring 3 desktop
+- [x] First Ring 3 Tuwaiq Desktop with idle redraw suppression, windows,
+      launcher, focus, z-order, drag, close, keyboard input, normal exit, and
+      safe relaunch
+- [x] Repository-local acceptance harness covering hostile pointers, CPU page
+      permissions, VM rollback, display/input atomicity, mouse behavior,
+      process concurrency, 20 desktop lifecycle cycles, resource reuse,
+      scheduler regression, and genuine reboot persistence
+
+Phase 5 was accepted and merged into `main`. Reproducible commands, measured
+results, security invariants, and bounded limitations remain in
+`ARCHITECTURE.md` under **Phase 5 Verification Performed**. Completion of Phase
+5 did not imply completion of the storage, networking, SDK, package, or
+compatibility work below.
+
+## Phase 6 — Storage, VFS & Real Applications
+
+**Purpose:** replace build-time embedding as the normal application path and
+give native userspace programs durable, path-based storage.
+
+**Depends on:** the Phase 4 process/ELF foundation and Phase 5 resource
+lifecycle.
+
+- [ ] Introduce a real VFS abstraction with mountable filesystem backends
+- [ ] Define normalized absolute/relative path semantics, working directories,
+      `cd`, and path-aware shell completion
+- [ ] Add file-oriented userspace syscalls with validated handles, buffers,
+      offsets, permissions, and lifecycle ownership
+- [ ] Execute native ELF binaries from files through the VFS
+- [ ] Remove build-time embedded ELF as the normal application path; retain
+      only explicitly justified boot, recovery, or test fixtures
+- [ ] Move useful applications onto the filesystem-backed launch path
+- [ ] Add FAT32 read support as a VFS backend after the VFS contract is stable
+- [ ] Test persistence, interrupted writes, corruption detection, recovery,
+      path traversal boundaries, and reboot behavior
+
+**Exit gate:** after a clean boot, the shell and desktop can discover, launch,
+read, write, and relaunch native applications and their files from persistent
+storage without rebuilding the kernel image. Recovery tests must not silently
+accept corruption or data loss.
+
+## Phase 7 — Hardware & Networking
+
+**Purpose:** replace single-machine assumptions with discoverable hardware and
+usable networking while keeping deterministic virtual-hardware development.
+
+**Depends on:** stable resource/file interfaces from Phase 6 where drivers or
+network configuration persist state.
+
+- [ ] Define a HAL and modular driver framework with explicit device, IRQ,
+      DMA, memory, and teardown ownership
+- [ ] Add PCI enumeration and device discovery foundations
+- [ ] Implement a real NIC driver, preferably `virtio-net` first for
+      deterministic development, followed by selected real hardware
+- [ ] Build usable link, IP, DHCP, DNS, and socket-facing networking
+- [ ] Add secure transport primitives needed by future services; an AI client
+      is not part of Ring 0 or a prerequisite for native networking
+- [ ] Add appropriate VirtualBox/VMware optimized drivers without coupling the
+      OS architecture to one hypervisor
+- [ ] Begin the Tuwaiq Hardware Compatibility Program (THCP)
+
+### Tuwaiq Hardware Compatibility Program (THCP)
+
+- **Tuwaiq Lite:** low-resource reference machine
+- **Tuwaiq Standard:** mainstream reference machine
+- **Tuwaiq Pro:** workstation/high-performance reference machine
+- One TuwaiqOS image serves all profiles. Runtime capability detection selects
+  appropriate features and defaults; these are not three operating-system
+  forks.
+- Driver and HAL interfaces must allow additional architectures, buses, and
+  devices without redesigning the kernel or invalidating existing profiles.
+- Qualification publishes explicit supported/unsupported capabilities rather
+  than inferring support from a successful boot alone.
+
+**Exit gate:** deterministic virtual networking and selected real hardware can
+obtain configuration through DHCP, resolve DNS, exchange traffic reliably,
+recover from device errors, and pass isolation/resource-lifecycle tests. The
+initial THCP matrix and reproducible qualification procedure exist.
+
+## Parallel Desktop Track — Phases 6–9
+
+Desktop work proceeds alongside Core work and integrates stable interfaces as
+they land. It must not be held until every Core phase is complete.
+
+- [ ] Replace polling-oriented paths with event-driven rendering and waiting
+- [ ] Add dirty rectangles and compositor/presentation performance work
+- [ ] Implement correct `KeyUp` events and richer input/focus semantics
+- [ ] Add Arabic and English fonts, text shaping, bidirectional text, and RTL
+      layout support
+- [ ] Improve the window manager: resize, minimize, focus policy, workspace
+      behavior, recovery, and accessibility foundations
+- [ ] Evolve the launcher into a dock/application launcher
+- [ ] Build a filesystem-backed File Manager during Phase 6
+- [ ] Build a native Terminal on the Phase 6 process/file interfaces
+- [ ] Build Settings as hardware, security, account, and capability surfaces
+      become available
+- [ ] Add notifications and clipboard services on the Phase 8 IPC/capability
+      model
+- [ ] Build a System Monitor using bounded diagnostics interfaces
+- [ ] Integrate package/update discovery and status into the desktop during
+      Phase 9
+
+Each visible control must have real behavior. A placeholder must be identified
+as such and must not imply an unsupported capability.
+
+## Phase 8 — Application Platform
+
+**Purpose:** make native TuwaiqOS applications stable, secure, portable, and
+practical to develop.
+
+**Depends on:** filesystem-backed applications from Phase 6 and the device/
+network foundations needed by platform services from Phase 7.
+
+- [ ] Stabilize and version the native Tuwaiq ABI with compatibility policy
+- [ ] Add IPC with explicit endpoint ownership, bounds, and teardown behavior
+- [ ] Add permissions/capabilities and least-privilege process services
+- [ ] Expand process services, including runtime memory management beyond the
+      current bump-only `mmap` virtual-address arena
+- [ ] Implement Tuwaiq libc and a useful native POSIX subset
+- [ ] Provide Rust, C, and C++ SDKs, headers, libraries, examples, debuggers,
+      profilers, and developer tooling
+- [ ] Add native relocation/dynamic-library support only under a versioned ABI
+      and when real applications require it
+- [ ] Progress toward a self-hosting toolchain without making self-hosting a
+      prerequisite for earlier application work
+- [ ] Add multi-user/session foundations only after permissions and service
+      isolation are enforceable
+
+### TuwaiqOS Owner / Developer Mode
+
+Owner / Developer Mode is a **local device role/capability**, enforced through
+the same auditable permission model as other privileged operations. It may
+provide:
+
+- advanced diagnostics and kernel/driver/system monitoring;
+- local crash and debug logs;
+- package and repository controls;
+- model and agent controls;
+- hardware testing;
+- release-channel selection and local build-signing tools.
+
+It must never create a founder master key, universal remote access, hidden
+privilege, undocumented bypass, or backdoor. Remote administration, if later
+implemented, requires explicit device-local enrollment, revocation, audit, and
+normal capability checks.
+
+**Exit gate:** native sample applications built with supported SDKs run against
+a versioned ABI, communicate through isolated IPC, receive only declared
+capabilities, and survive service/process restart without leaked authority or
+resources.
+
+## Phase 9 — Applications, Packages & Updates
+
+**Purpose:** turn the native platform into a maintainable application ecosystem.
+
+**Depends on:** the versioned ABI, permissions, IPC, SDK, and persistent VFS.
+
+- [ ] Deliver useful native applications through filesystem-backed execution
+- [ ] Define a versioned package format and repository metadata
+- [ ] Implement a package manager and deterministic dependency handling
+- [ ] Require cryptographic package signing and verified provenance metadata
+- [ ] Implement secure, transactional OS and application updates
+- [ ] Support rollback, interrupted-update recovery, and storage-pressure cases
+- [ ] Expose bounded package/repository controls through Settings and local
+      Owner / Developer Mode
+
+**Exit gate:** signed native packages install, upgrade, remove, and roll back
+without breaking unrelated applications or the bootable OS. Dependency,
+signature, interruption, recovery, and downgrade-policy tests pass.
+
+## Phase 10 — Compatibility
+
+**Purpose:** broaden the software available to users without replacing the
+native platform or changing the kernel's identity.
+
+**Depends on:** stable native ABI, VFS, IPC, permissions, networking, packages,
+and update/recovery mechanisms.
+
+- [ ] Expand the useful userspace POSIX surface
+- [ ] Implement Linux ABI compatibility entirely in userspace
+- [ ] Start with carefully scoped static Linux ELF compatibility
+- [ ] Add Linux dynamic linking, threads, signals, sockets, futex, and epoll
+      only as required and with explicit security/resource limits
+- [ ] Add a sandboxed WASM runtime
+- [ ] Keep Win32 compatibility as long-term research only
+- [ ] Test that compatibility components can be removed from an installed
+      image without breaking boot or native TuwaiqOS applications
+
+Linux compatibility is optional and removable. TuwaiqOS remains fully usable
+with native applications when it is not installed.
+
+**Exit gate:** selected compatibility workloads run inside userspace sandboxes,
+cannot bypass native capabilities, and cannot destabilize native applications
+or the kernel. Removing all compatibility packages leaves a bootable,
+functional native system.
+
+## Phase 11 — Tuwaiq AI / Agentic OS
+
+**Purpose:** add sovereign, permissioned automation as replaceable userspace
+services after the application and security foundations can constrain them.
+
+**Depends on:** capabilities, IPC, native applications, packages/updates, audit
+storage, and—only for optional remote providers—usable networking.
+
+- [ ] Build offline-first local AI that remains useful without network access
+- [ ] Define a replaceable model-provider architecture so a future suitable
+      Saudi model can be adopted without redesigning the OS
+- [ ] Build the Tuwaiq AI assistant as an unprivileged userspace application
+- [ ] Separate the Agent Runtime, tools, policy, and audit system from the model
+- [ ] Support permissioned document, file, PDF, and spreadsheet automation
+- [ ] Support bounded system troubleshooting through diagnostic capabilities
+- [ ] Add scheduled tasks with explicit owners, limits, review, and revocation
+- [ ] Add optional email, calendar, and business connectors
+- [ ] Require explicit capability permissions with allow-once and separately
+      revocable persistent-workflow authorization
+- [ ] Maintain a complete, user-visible audit log of actions and data access
+- [ ] Deny unrestricted kernel/root access; agents receive narrow capabilities
+      like every other application
+- [ ] Allow optional cloud AI only by policy. Sovereign, offline, and
+      air-gapped operation must remain possible
+- [ ] Replace the current AI Bridge HTTP stub with policy-controlled userspace
+      providers/connectors after secure transport and permissions exist
+
+No model or Agent Runtime component executes in Ring 0.
+
+**Exit gate:** offline workflows function without cloud services; every action
+is attributable, permission-checked, bounded, and revocable; provider
+replacement does not change kernel or application APIs; hostile prompt/content
+tests cannot obtain undeclared capabilities.
+
+## Phase 12 — Security, Qualification & Government Pilot
+
+**Purpose:** convert continuous hardening into a release-quality qualification
+program suitable for controlled organizational deployment.
+
+**Depends on:** the complete intended 1.0 scope and its update/recovery paths.
+
+- [ ] Run continuous fuzzing of syscalls, parsers, protocols, filesystems,
+      package metadata, compatibility loaders, drivers, and agent boundaries
+- [ ] Harden syscall, parser, driver, DMA, and interrupt boundaries
+- [ ] Produce secure, reproducible builds and a complete SBOM
+- [ ] Establish signing-key generation, storage, rotation, revocation, and
+      incident governance
+- [ ] Qualify secure updates, rollback, disaster recovery, and factory recovery
+- [ ] Qualify hardware across Tuwaiq Lite, Standard, and Pro THCP devices
+- [ ] Run sustained stability, power-cycle, storage-fault, network-fault, and
+      resource-exhaustion testing
+- [ ] Complete independent penetration testing and remediate release blockers
+- [ ] Prepare controlled organizational/government pilot operations,
+      deployment, audit, support, and incident response
+
+**Exit gate:** release artifacts are reproducible and signed; SBOM and key
+governance are operational; update/recovery and THCP qualification pass;
+sustained stability and penetration testing leave no unresolved release
+blockers; pilot participation is controlled, auditable, and revocable.
+
+## Release gates
+
+Release names are evidence gates, not calendar promises or claims about the
+current build.
+
+### Technical Preview
+
+- Core boot, shell, isolation, storage experiments, and desktop demonstrations
+  run reproducibly on a documented virtual reference machine.
+- Known destructive limitations are explicit; recovery and evidence collection
+  are reproducible.
+
+### Developer Preview
+
+- Filesystem-backed native applications, early VFS/SDK contracts, and a usable
+  desktop development loop are available on documented reference targets.
+- Interfaces may still change, but changes and migrations are versioned.
+
+### Alpha
+
+- The intended 1.0 feature set is substantially integrated across native
+  applications, hardware/networking, permissions, packages, and updates.
+- Daily-use testing begins; known gaps are documented and no unsupported
+  feature is presented as complete.
+
+### Beta
+
+- The intended 1.0 scope is feature-complete and API-frozen except for fixes.
+- THCP qualification, upgrade/recovery testing, security review, accessibility,
+  localization, and sustained stability meet published beta thresholds.
+
+### Release Candidate (RC)
+
+- No unresolved Blocker or High security/correctness findings.
+- Reproducible signed images, SBOM, clean install, upgrade, rollback, recovery,
+  penetration testing, and qualified hardware matrices satisfy release policy.
+
+### 1.0
+
+- An RC has sustained all release gates for the required observation period.
+- Support, incident response, signing governance, update service, documentation,
+  and controlled deployment processes are operational.
 
 ## Historical note
 
-This project began as AbdullahOS (learning OS). It was renamed to TuwaiqOS at v0.5 for public release.
+The project began as AbdullahOS, a learning operating system. It was renamed to
+TuwaiqOS at v0.5 for public release. The historical version labels are retained
+in Git history; this roadmap uses dependency-based phases from the completed
+Phase 0–5 foundation onward.
