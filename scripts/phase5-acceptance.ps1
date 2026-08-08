@@ -389,6 +389,7 @@ try {
         Add-Result "bounded VM critical sections" "PASS" "average=$averageVmMilliTicks milli-ticks; max=$maxVmMilliTicks milli-ticks kind=$maxVmKind; limits=100/10000"
         $segment = Invoke-ShellCommand "runelf mmap_partial_failure" 60 @('mmap partial rollback: PASS')
         Assert-Regex "post-mutation mmap rollback" $segment 'mmap_partial_failure: injected partial map rejected -- OK[\s\S]*rollback, same-address retry, zero-fill, and cleanup -- OK'
+        Assert-Regex "post-mutation mmap exact ownership rollback" $segment 'mmap: rollback frames before=([0-9]+) after=\1'
         Assert-Regex "post-mutation mmap resource baseline" $segment 'mmap partial rollback: PASS exit_code=0 live_before=([0-9]+) live_after=\1'
     } elseif (-not $AllowDirty) {
         throw "-SkipExhaustion is permitted only for dirty development runs."

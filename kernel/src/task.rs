@@ -1101,7 +1101,12 @@ fn current_space_matches_mmap_start(process: &ProcessState, start: u64) -> bool 
     process.mmap_next == start && process.address_space.is_some()
 }
 
-fn rollback_mmap_or_exit(start: u64, mapped_pages: u64) {
+fn rollback_mmap_or_exit(
+    start: u64,
+    mapped_pages: u64,
+    requested_pages: u64,
+    owned_frames_before: usize,
+) {
     let mut rolled_back = 0u64;
     while rolled_back < mapped_pages {
         let batch = VM_BATCH_PAGES.min(mapped_pages - rolled_back);
@@ -1128,6 +1133,34 @@ fn rollback_mmap_or_exit(start: u64, mapped_pages: u64) {
         }
         rolled_back += batch;
     }
+
+    let exact = with_vm_batch(15, |slot| {
+        let Some(sched) = slot.as_mut() else {
+            return None;
+        };
+        let Some(space) = sched.tasks[sched.current]
+            .process
+            .as_mut()
+            .and_then(|process| process.address_space.as_mut())
+        else {
+            return None;
+        };
+        paging::clean_up_empty_tables_in_range(space, start, requested_pages).ok()?;
+        Some(space.frame_count())
+    });
+    let Some(owned_frames_after) = exact else {
+        crate::serial_println!("mmap: page-table rollback cleanup failed; terminating caller");
+        exit_with_code(255);
+    };
+    crate::serial_println!(
+        "mmap: rollback frames before={} after={}",
+        owned_frames_before,
+        owned_frames_after
+    );
+    if owned_frames_after != owned_frames_before {
+        crate::serial_println!("mmap: rollback ownership mismatch; terminating caller fail-closed");
+        exit_with_code(255);
+    }
 }
 
 /// `SYS_MMAP`'s implementation: grow the *currently running* user
@@ -1151,9 +1184,10 @@ fn rollback_mmap_or_exit(start: u64, mapped_pages: u64) {
 ///
 /// Mapping, zero-fill, and final-permission installation are transactional at
 /// the syscall boundary: if any step fails, every leaf page installed for the
-/// request is unmapped and reclaimed, and `mmap_next` is left unchanged. Empty
-/// paging-structure frames created while attempting the range remain valid,
-/// process-owned infrastructure and are reused by a retry at the same address.
+/// request is unmapped and reclaimed, newly empty paging-structure frames are
+/// removed and reclaimed, and `mmap_next` is left unchanged. The rollback
+/// verifies the address space owns exactly its pre-call frame count before
+/// returning failure.
 pub fn mmap_in_current_process(len: u64, writable: bool) -> Option<u64> {
     if len == 0 || len > MAX_MMAP_LEN {
         return None;
@@ -1161,7 +1195,7 @@ pub fn mmap_in_current_process(len: u64, writable: bool) -> Option<u64> {
     let pages = page_count_for(len)?;
     let region_len = pages.checked_mul(4096)?;
 
-    let (start, end, worst_case_frames) = with_vm_batch(1, |slot| {
+    let (start, end, worst_case_frames, owned_frames_before) = with_vm_batch(1, |slot| {
         let sched = slot.as_ref()?;
         let process = sched.tasks[sched.current].process.as_ref()?;
         let start = process.mmap_next;
@@ -1174,7 +1208,8 @@ pub fn mmap_in_current_process(len: u64, writable: bool) -> Option<u64> {
         let p1_tables = last_2m.checked_sub(first_2m)?.checked_add(1)?;
         let worst_case_frames = pages.checked_add(p1_tables)?.checked_add(2)?;
         let worst_case_frames = usize::try_from(worst_case_frames).ok()?;
-        Some((start, end, worst_case_frames))
+        let owned_frames_before = process.address_space.as_ref()?.frame_count();
+        Some((start, end, worst_case_frames, owned_frames_before))
     })?;
 
     // Admission control is conservative and mutation-free. A competing
@@ -1228,7 +1263,7 @@ pub fn mmap_in_current_process(len: u64, writable: bool) -> Option<u64> {
         let fail_after = MMAP_FAIL_AFTER_PAGES.load(Ordering::Acquire);
         if fail_after != u64::MAX && mapped_pages >= fail_after {
             MMAP_FAIL_AFTER_PAGES.store(u64::MAX, Ordering::Release);
-            rollback_mmap_or_exit(start, mapped_pages);
+            rollback_mmap_or_exit(start, mapped_pages, pages, owned_frames_before);
             return None;
         }
         let batch = VM_BATCH_PAGES.min(pages - mapped_pages);
@@ -1259,7 +1294,7 @@ pub fn mmap_in_current_process(len: u64, writable: bool) -> Option<u64> {
         });
         mapped_pages += mapped_now;
         if mapped_now != batch {
-            rollback_mmap_or_exit(start, mapped_pages);
+            rollback_mmap_or_exit(start, mapped_pages, pages, owned_frames_before);
             return None;
         }
     }
@@ -1284,7 +1319,7 @@ pub fn mmap_in_current_process(len: u64, writable: bool) -> Option<u64> {
             paging::zero_bytes_in_address_space(space, addr, batch * 4096).is_ok()
         });
         if !zeroed {
-            rollback_mmap_or_exit(start, mapped_pages);
+            rollback_mmap_or_exit(start, mapped_pages, pages, owned_frames_before);
             return None;
         }
         zeroed_pages += batch;
@@ -1320,7 +1355,7 @@ pub fn mmap_in_current_process(len: u64, writable: bool) -> Option<u64> {
                 true
             });
             if !protected {
-                rollback_mmap_or_exit(start, mapped_pages);
+                rollback_mmap_or_exit(start, mapped_pages, pages, owned_frames_before);
                 return None;
             }
             protected_pages += batch;
@@ -1341,7 +1376,7 @@ pub fn mmap_in_current_process(len: u64, writable: bool) -> Option<u64> {
         true
     });
     if !committed {
-        rollback_mmap_or_exit(start, mapped_pages);
+        rollback_mmap_or_exit(start, mapped_pages, pages, owned_frames_before);
         return None;
     }
     Some(start)
@@ -1497,6 +1532,32 @@ pub fn munmap_in_current_process(ptr: u64, len: u64) -> bool {
             );
             exit_with_code(255);
         }
+    }
+    let mut cleaned = 0u64;
+    const TABLE_CLEANUP_BATCH_PAGES: u64 = 512;
+    while cleaned < pages {
+        let batch = TABLE_CLEANUP_BATCH_PAGES.min(pages - cleaned);
+        let batch_start = ptr + cleaned * 4096;
+        let cleanup_ok = with_vm_batch(15, |slot| {
+            let Some(sched) = slot.as_mut() else {
+                return false;
+            };
+            let Some(space) = sched.tasks[sched.current]
+                .process
+                .as_mut()
+                .and_then(|process| process.address_space.as_mut())
+            else {
+                return false;
+            };
+            paging::clean_up_empty_tables_in_range(space, batch_start, batch).is_ok()
+        });
+        if !cleanup_ok {
+            crate::serial_println!(
+                "munmap: page-table cleanup invariant failed; terminating caller fail-closed"
+            );
+            exit_with_code(255);
+        }
+        cleaned += batch;
     }
     true
 }

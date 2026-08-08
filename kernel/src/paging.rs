@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use spin::Mutex;
-use x86_64::structures::paging::mapper::{Translate, TranslateResult};
+use x86_64::structures::paging::mapper::{CleanUp, Translate, TranslateResult};
 use x86_64::structures::paging::{
     FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
     PhysFrame, Size4KiB,
@@ -518,6 +518,31 @@ struct TrackingFrameAllocator<'a> {
     owned: &'a mut Vec<PhysFrame<Size4KiB>>,
 }
 
+/// Page-table cleanup counterpart to `TrackingFrameAllocator`. The mapper's
+/// `CleanUp` implementation clears only empty P1-P3 entries; every frame it
+/// reports must therefore be a private page-table frame owned by this address
+/// space, which is removed from ownership and returned to the same allocator.
+struct TrackingFrameDeallocator<'a> {
+    inner: &'a mut BootInfoFrameAllocator,
+    owned: &'a mut Vec<PhysFrame<Size4KiB>>,
+    released: usize,
+    ownership_mismatch: bool,
+}
+
+impl FrameDeallocator<Size4KiB> for TrackingFrameDeallocator<'_> {
+    unsafe fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
+        let Some(index) = self.owned.iter().position(|owned| *owned == frame) else {
+            self.ownership_mismatch = true;
+            return;
+        };
+        self.owned.remove(index);
+        // Safety: `CleanUp` removed the only page-table entry referencing this
+        // private, now-empty table before invoking the deallocator.
+        unsafe { self.inner.deallocate_frame(frame) };
+        self.released += 1;
+    }
+}
+
 // Safety: delegates entirely to `inner`'s own already-`unsafe impl`
 // guarantee (each frame handed out at most once until freed); recording the
 // frame in `owned` afterward doesn't affect that.
@@ -600,6 +625,57 @@ pub fn map_in_address_space(
             }
         }
         Ok(())
+    })
+}
+
+/// Reclaim empty private P1-P3 tables covering a page-aligned range.
+///
+/// Leaf mappings must already be absent. This is the final step of failed
+/// MMAP rollback and successful MUNMAP: it ensures page-table infrastructure
+/// created solely for the removed leaves does not remain as hidden process
+/// memory state or consume frames until process exit.
+pub fn clean_up_empty_tables_in_range(
+    space: &mut AddressSpace,
+    raw_start: u64,
+    page_count: u64,
+) -> Result<usize, &'static str> {
+    if page_count == 0 || raw_start % 4096 != 0 {
+        return Err("page-table cleanup range must contain aligned whole pages");
+    }
+    let byte_len = page_count
+        .checked_mul(4096)
+        .ok_or("page-table cleanup range overflow")?;
+    let raw_end = raw_start
+        .checked_add(byte_len.checked_sub(1).ok_or("empty cleanup range")?)
+        .ok_or("page-table cleanup end overflow")?;
+    let start = checked_user_virt_addr(raw_start)?;
+    let end = checked_user_virt_addr(raw_end)?;
+    let range = Page::range_inclusive(
+        Page::<Size4KiB>::containing_address(start),
+        Page::<Size4KiB>::containing_address(end),
+    );
+    let phys_offset = physical_memory_offset().ok_or("physical memory offset not set")?;
+
+    with_paging(|_, frame_allocator_slot| {
+        let frame_allocator = frame_allocator_slot
+            .as_mut()
+            .ok_or("frame allocator not active")?;
+        // Safety: `space` exclusively owns its private page-table subtree.
+        let mut mapper = unsafe { mapper_for(space.pml4_frame, phys_offset) };
+        let mut deallocator = TrackingFrameDeallocator {
+            inner: frame_allocator,
+            owned: &mut space.owned_frames,
+            released: 0,
+            ownership_mismatch: false,
+        };
+        // Safety: every user-region page-table frame belongs only to `space`;
+        // kernel mappings occupy other PML4 slots and the range is constrained
+        // to this process's private user region above.
+        unsafe { mapper.clean_up_addr_range(range, &mut deallocator) };
+        if deallocator.ownership_mismatch {
+            return Err("cleaned page-table frame was not owned by address space");
+        }
+        Ok(deallocator.released)
     })
 }
 

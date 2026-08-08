@@ -627,16 +627,18 @@ narrower ABI is easier to keep provably safe.
   never marked executable, so a process can never turn a writable buffer
   into code to run. The full destination is preflighted; mapping, zeroing,
   and final permissions run in four-page transactions with interrupts enabled
-  between lock scopes. Any failure rolls back mapped leaves and leaves
-  `mmap_next` unchanged.
+  between lock scopes. Any failure rolls back mapped leaves, reclaims newly
+  empty P1-P3 tables, verifies the exact pre-call address-space frame count,
+  and leaves `mmap_next` unchanged.
 - **Release** (`task::munmap_in_current_process(ptr, len)`): validates page
   alignment and that the entire `[ptr, ptr+len)` range falls inside
   `[USER_MMAP_BASE, mmap_next)` -- i.e., genuinely came from this process's
   own prior `mmap` calls -- before unmapping anything. The kernel records the
   complete leaf set before mutation, removes it in bounded batches while
   retaining ownership, restores earlier batches if any later removal fails,
-  and only then returns frames to the global pool. A rejected unmap therefore
-  changes no mapping or allocator ownership. Since the
+  and only then returns leaf frames to the global pool and prunes newly empty
+  P1-P3 tables in bounded ranges. A rejected unmap therefore changes no
+  mapping or allocator ownership. Since the
   arena is a bump allocator with no free list, a freed range's virtual
   addresses are not reused by later `mmap` calls in the *same* process --
   a documented, deliberate simplification, not a leak (the physical frames
@@ -660,8 +662,8 @@ narrower ABI is easier to keep provably safe.
   every current and future caller at once.
 - **Tests**: `bad_mmap`, `bad_munmap`, and `mmap_exhaustion` cover zero/huge
   lengths, rounding, bounds, zero-fill, write/read, noncanonical/overflowed/
-  partial/double unmaps, exhaustion rejection, rollback, physical-frame
-  reuse, and PIT progress during 64 MiB map/unmap. `mmap_ro_fault`,
+  partial/double unmaps, exhaustion rejection, exact leaf/page-table rollback,
+  physical-frame reuse, and PIT progress during 64 MiB map/unmap. `mmap_ro_fault`,
   `mmap_nx_fault`, and `post_unmap_fault` verify CPU permissions.
 
 ### Display subsystem
@@ -899,8 +901,9 @@ The 2026-08-08 acceptance pass exercised:
   destinations and validated invalid pointers while empty;
 - MMAP zero-fill, rounding, bounds, writable/read-only and NX enforcement,
   exhaustion rejection, injected post-mutation rollback, unchanged-address
-  retry, MUNMAP full-range atomicity, double/partial rejection, post-unmap CPU
-  fault, frame reclamation, and zero-filled reuse;
+  retry, exact leaf and page-table-frame ownership restoration, MUNMAP
+  full-range atomicity, double/partial rejection, post-unmap CPU fault, frame
+  reclamation, and zero-filled reuse;
 - automatic grace-period reap, explicit kill/reap, failed-spawn rollback, and
   20 desktop start -> successful first present -> normal Escape exit -> reap
   cycles. Task count, live frames, frame bump cursor, and kernel heap/stack
@@ -922,11 +925,11 @@ Measured dirty-candidate results before the final clean-commit rerun were:
   with adjacent move coalescing and zero dropped events;
 - the former 64 MiB VM blackout took 30.942 s with PIT suppressed. Batched VM
   transactions reduced the full allocation/rejection/unmap/reuse sequence to
-  12.957 s while PIT advanced during both large syscalls. Critical sections
-  averaged 21 milli-ticks (~0.21 ms); the observed QEMU/host tail was 5976
-  milli-ticks (~59.8 ms), under the 100 ms hard gate;
+  9.288 s while PIT advanced during both large syscalls. Critical sections
+  averaged 21 milli-ticks (~0.21 ms); the observed QEMU/host tail was 5194
+  milli-ticks (~51.9 ms), under the 100 ms hard gate;
 - after removing the redundant second page-table walk, full-frame present
-  measured 3532 milli-ticks (~35.3 ms) worst case, below one 50 ms scheduler
+  measured 2821 milli-ticks (~28.2 ms) worst case, below one 50 ms scheduler
   quantum. The desktop avoids presents entirely while idle;
 - the kernel build retained the pre-existing 9 warnings and added zero new
   warnings. Rust formatting and `git diff --check` are final gates.
