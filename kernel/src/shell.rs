@@ -345,6 +345,7 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
         "runfs" => handle_runfs(mode, args),
         "installapp" => handle_install_app(mode, args),
         "vfstest" => handle_vfs_test(mode),
+        "storagetest" => handle_storage_test(mode),
         "aipreviewtest" => handle_ai_preview_test(mode),
         "desktopaitest" => handle_desktop_ai_test(mode),
         "isolate" => handle_isolate(mode, args),
@@ -531,6 +532,10 @@ fn embedded_program(name: &str) -> Option<&'static [u8]> {
             env!("CARGO_MANIFEST_DIR"),
             "/../target/x86_64-unknown-none/release/file_api_test"
         ))),
+        "file_mutation_test" => Some(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../target/x86_64-unknown-none/release/file_mutation_test"
+        ))),
         "tuwaiq_ai" => Some(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../target/x86_64-unknown-none/release/tuwaiq_ai"
@@ -565,6 +570,7 @@ fn embedded_program_names() -> &'static [&'static str] {
         "desktop",
         "desktop_peer",
         "file_api_test",
+        "file_mutation_test",
         "tuwaiq_ai",
         "tuwaiq_ai_fault",
     ]
@@ -618,10 +624,28 @@ fn ensure_apps_directory() -> Result<(), &'static str> {
     }
 }
 
+fn ensure_directory(path: &str) -> Result<(), &'static str> {
+    match vfs::kind("/", path) {
+        Ok(vfs::NodeKind::Directory) => Ok(()),
+        Ok(vfs::NodeKind::File) => Err("expected directory is a file"),
+        Err(_) => vfs::create_dir("/", path),
+    }
+}
+
+fn ensure_app_data_directory(name: &str) -> Result<(), &'static str> {
+    ensure_directory("/data")?;
+    let mut path = String::from("/data/");
+    path.try_reserve_exact(name.len())
+        .map_err(|_| "application data path allocation failed")?;
+    path.push_str(name);
+    ensure_directory(&path)
+}
+
 fn install_app(name: &str) -> Result<&'static str, &'static str> {
     let (embedded_name, target) = match name {
         "hello" => ("hello", "/apps/hello"),
         "file-api-test" => ("file_api_test", "/apps/file-api-test"),
+        "file-mutation-test" => ("file_mutation_test", "/apps/file-mutation-test"),
         "tuwaiq-ai" => ("tuwaiq_ai", "/apps/tuwaiq-ai"),
         "tuwaiq-ai-fault" => ("tuwaiq_ai_fault", "/apps/tuwaiq-ai-fault"),
         _ => return Err("unknown provisionable application"),
@@ -629,6 +653,7 @@ fn install_app(name: &str) -> Result<&'static str, &'static str> {
     let bytes = embedded_program(embedded_name).ok_or("embedded bootstrap image missing")?;
     ensure_apps_directory()?;
     vfs::write_file("/", target, bytes)?;
+    ensure_app_data_directory(vfs::basename(target))?;
     Ok(target)
 }
 
@@ -637,7 +662,7 @@ fn handle_install_app(mode: ConsoleMode, args: &str) {
     if name.is_empty() {
         println(
             mode,
-            "Usage: installapp <hello|file-api-test|tuwaiq-ai|tuwaiq-ai-fault>",
+            "Usage: installapp <hello|file-api-test|file-mutation-test|tuwaiq-ai|tuwaiq-ai-fault>",
         );
         return;
     }
@@ -648,6 +673,35 @@ fn handle_install_app(mode: ConsoleMode, args: &str) {
         }
         Err(reason) => print_fs_error(mode, reason),
     }
+}
+
+fn handle_storage_test(mode: ConsoleMode) {
+    let path = match install_app("file-mutation-test") {
+        Ok(path) => path,
+        Err(reason) => {
+            print_fs_error(mode, reason);
+            return;
+        }
+    };
+    let id = match spawn_from_vfs(path, "/") {
+        Ok(id) => id,
+        Err(reason) => {
+            print(mode, "storage: FAIL filesystem-backed spawn: ");
+            println(mode, reason);
+            return;
+        }
+    };
+    wait_for_terminated(id);
+    let exit = task::info(id).ok().and_then(|info| info.exit_code);
+    task::reap_now();
+    println(
+        mode,
+        if exit == Some(0) {
+            "storage: PASS Ring-3 mutation ABI and filesystem-backed ELF"
+        } else {
+            "storage: FAIL Ring-3 mutation process"
+        },
+    );
 }
 
 fn spawn_from_vfs(path: &str, cwd: &str) -> Result<u32, &'static str> {
@@ -2495,7 +2549,10 @@ fn print_help(mode: ConsoleMode) {
         mode,
         "         mmap_nx_fault|post_unmap_fault|mmap_exhaustion|mmap_partial_failure|desktop|desktop_peer>",
     );
-    println(mode, "  installapp <name> | runfs <path> | vfstest");
+    println(
+        mode,
+        "  installapp <name> | runfs <path> | vfstest | storagetest",
+    );
     println(mode, "  aipreviewtest | desktopaitest");
     println(mode, "  isolate [bad_program]");
     println(mode, "  spawnfail <count>");
@@ -2614,6 +2671,7 @@ fn command_names() -> &'static [&'static str] {
         "runfs",
         "installapp",
         "vfstest",
+        "storagetest",
         "aipreviewtest",
         "desktopaitest",
         "isolate",
