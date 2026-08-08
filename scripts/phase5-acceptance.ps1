@@ -34,8 +34,9 @@ if ($LASTEXITCODE -ne 0 -or $Commit -notmatch '^[0-9a-f]{40}$') {
     throw "Unable to resolve the current Git commit."
 }
 $Branch = (& git branch --show-current).Trim()
-if ($LASTEXITCODE -ne 0 -or $Branch -ne "phase5/userland-desktop-foundation") {
-    throw "Acceptance must run on phase5/userland-desktop-foundation (current: '$Branch')."
+if ($LASTEXITCODE -ne 0 -or
+    ($Branch -ne "phase5/userland-desktop-foundation" -and $Branch -notmatch '^phase6/')) {
+    throw "Acceptance must run on the Phase 5 branch or a Phase 6 successor (current: '$Branch')."
 }
 $Dirty = @(& git status --porcelain=v1 --untracked-files=all)
 if ($LASTEXITCODE -ne 0) {
