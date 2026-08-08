@@ -2,7 +2,7 @@
 
 Experimental AI-Native Operating System written in Rust.
 
-TuwaiqOS is a bare-metal `no_std` OS that boots in QEMU, provides a terminal shell, persistent storage (TuwaiqFS v2), cooperative multitasking, loopback networking, and an AI bridge stub for future integration.
+TuwaiqOS is a bare-metal `no_std` OS that boots in QEMU, provides a terminal shell, recoverable persistent storage (TuwaiqFS v3), preemptive multitasking, loopback networking, and an AI bridge stub for future integration.
 
 ```text
 TuwaiqOS v0.5
@@ -23,7 +23,7 @@ flowchart TD
     BL[Bootloader] --> K[Kernel]
     K --> FB[Framebuffer / VGA]
     K --> SH[Shell]
-    SH --> FS[TuwaiqFS v2]
+    SH --> FS[TuwaiqFS v3]
     SH --> LD[Program Loader]
     SH --> AP[Apps: notes / editor / monitor]
     FS --> ATA[ATA Driver]

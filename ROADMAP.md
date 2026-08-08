@@ -127,7 +127,7 @@ results, security invariants, and bounded limitations remain in
 5 did not imply completion of the storage, networking, SDK, package, or
 compatibility work below.
 
-## Phase 6 — Storage, VFS & Real Applications
+## Phase 6 — Storage, VFS & Real Applications (completed)
 
 **Purpose:** replace build-time embedding as the normal application path and
 give native userspace programs durable, path-based storage.
@@ -136,7 +136,8 @@ give native userspace programs durable, path-based storage.
 lifecycle.
 
 - [x] Introduce the VFS facade/backend contract and mount TuwaiqFS at `/`
-- [ ] Add a general mount table and a second filesystem backend
+- [x] Add a general longest-prefix mount table and a genuinely independent
+      read-only FAT32 backend at `/boot`
 - [x] Define normalized absolute/relative path semantics, working directories,
       `cd`, and path-aware shell completion
 - [x] Add the bounded read-only file syscall foundation (`CHDIR`, `GETCWD`,
@@ -144,25 +145,38 @@ lifecycle.
       stable offsets, and exit cleanup
 - [x] Add bounded application-private file create/replace/delete, basic
       metadata, and directory create/list APIs with hostile-pointer coverage
-- [ ] Add seek and the Phase 8 capability/permission model for shared or
-      delegated filesystem access
+- [x] Add bounded absolute seek on process-owned read handles
 - [x] Execute native ELF binaries from files through the VFS with `SPAWN` and
       the existing validated ELF loader
-- [ ] Remove build-time embedded ELF as the normal application path; retain
+- [x] Remove build-time embedded ELF as the normal application path; retain
       only explicitly justified boot, recovery, or test fixtures
-- [ ] Move useful applications onto the filesystem-backed launch path
-- [ ] Add FAT32 read support as a VFS backend after the VFS contract is stable
+- [x] Package and normally launch the Desktop, File Manager, Terminal, and AI
+      Preview from `/apps` through the VFS and validated ELF loader
+- [x] Add validated FAT32 read support as a separate VFS backend
 - [x] Test binary-file persistence, path traversal boundaries, process resource
       reuse, and filesystem-backed ELF relaunch after a genuine reboot
 - [x] Persist data from both a Ring 3 application and the built-in Notes app,
       then reopen both after a genuine reboot
-- [ ] Complete injected interrupted-write, corrupt-volume, repair/recovery, and
-      storage-exhaustion acceptance tests
+- [x] Complete injected interrupted-write, corrupt-volume, automatic recovery,
+      fail-closed recovery-mode, and storage-exhaustion acceptance tests
+
+Shared/delegated filesystem authority is intentionally a Phase 8 dependency,
+not a Phase 6 shortcut: it requires the versioned IPC and capability model
+before applications can safely delegate access. A user-facing offline repair
+utility is moved to Phase 9, after versioned package/system tooling exists;
+Phase 6 still requires and verifies automatic checkpoint recovery plus
+fail-closed behavior when no valid generation remains.
 
 **Exit gate:** after a clean boot, the shell and desktop can discover, launch,
 read, write, and relaunch native applications and their files from persistent
 storage without rebuilding the kernel image. Recovery tests must not silently
 accept corruption or data loss.
+
+**Status:** completed and acceptance-tested. The shell and desktop discover
+the prepackaged `/apps` catalog, launch useful native applications, persist
+application-private data, genuinely reboot, reopen the same data, and relaunch
+without rebuilding the tested image. The Phase 6 verification record and
+reproducible harness are documented in `ARCHITECTURE.md`.
 
 ### Early Tuwaiq AI Preview Track — begins alongside Phase 6
 
@@ -183,6 +197,10 @@ Agent Runtime and agentic operating-system experience.
 - [ ] Package assistant surfaces and permissioned tools in Phase 9
 - [ ] Complete the Agent Runtime, audit log, workflows, and sovereign provider
       architecture in Phase 11
+
+These four unchecked preview items are explicitly owned by Phases 8, 9, and 11
+and are not Phase 6 exit requirements. Phase 6 does not add inference,
+networking, telemetry, privileged actions, or a model-to-kernel path.
 
 The preview security direction is fixed even while mechanisms remain future:
 **Model proposes → Agent Runtime requests → policy checks → permission checks
@@ -240,8 +258,8 @@ they land. It must not be held until every Core phase is complete.
 - [ ] Improve the window manager: resize, minimize, focus policy, workspace
       behavior, recovery, and accessibility foundations
 - [ ] Evolve the launcher into a dock/application launcher
-- [ ] Build a filesystem-backed File Manager during Phase 6
-- [ ] Build a native Terminal on the Phase 6 process/file interfaces
+- [x] Build a filesystem-backed File Manager during Phase 6
+- [x] Build a native Terminal on the Phase 6 process/file interfaces
 - [ ] Build Settings as hardware, security, account, and capability surfaces
       become available
 - [ ] Add notifications and clipboard services on the Phase 8 IPC/capability
@@ -313,6 +331,9 @@ resources.
 - [ ] Require cryptographic package signing and verified provenance metadata
 - [ ] Implement secure, transactional OS and application updates
 - [ ] Support rollback, interrupted-update recovery, and storage-pressure cases
+- [ ] Provide a user-facing offline TuwaiqFS inspection/repair utility using
+      versioned system-tool and authorization interfaces; Phase 6 already
+      provides automatic dual-checkpoint recovery and fail-closed detection
 - [ ] Expose bounded package/repository controls through Settings and local
       Owner / Developer Mode
 - [ ] Package the Tuwaiq AI application, local providers, and permissioned tool

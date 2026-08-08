@@ -46,3 +46,9 @@ complete buffers are validated and copied before mutation. Applications cannot
 replace `/apps`, write another application's data directory, or access backend
 filesystem nodes directly. Shared/delegated access remains future capability
 work rather than an implicit privilege.
+
+TuwaiqFS commits mutations through alternating checksummed checkpoints. A bad
+newest generation falls back only to an older valid committed generation. If
+neither checkpoint is valid, the writable root remains offline in recovery
+mode; corruption must never trigger an empty writable replacement or an
+automatic reformat. The independent FAT32 `/boot` backend is read-only.

@@ -5,8 +5,9 @@
 TuwaiqOS is a monolithic bare-metal kernel written in Rust (`no_std`) with
 hardware-isolated Ring 3 ELF processes. Core services remain in the kernel;
 Phase 4 added per-process address spaces, Phase 5 runs the graphical desktop
-as an unprivileged userspace process, and the first Phase 6 milestone adds a
-VFS/file ABI, persistent application data, and filesystem-backed process launch.
+as an unprivileged userspace process. Phase 6 adds a general VFS mount table,
+recoverable persistent application data, a read-only FAT32 resource backend,
+and filesystem-backed application launch as the normal path.
 
 ```mermaid
 flowchart LR
@@ -33,7 +34,8 @@ flowchart LR
     subgraph Storage
         VFS[VFS + path policy]
         FS[private TuwaiqFS backend]
-        TQFS[TuwaiqFS v2]
+        TQFS[TuwaiqFS v3 checkpoints]
+        FAT[FAT32 read-only backend]
         ATA[ATA PIO driver]
     end
     subgraph Runtime
@@ -65,6 +67,7 @@ flowchart LR
     SH --> TASK
     SH --> NET
     VFS --> FS --> TQFS --> ATA
+    VFS --> FAT --> ATA
     SH --> APPS
     NET --> LB
     NET --> HTTP
@@ -100,9 +103,10 @@ interrupts live rather than a purely polled CPU.
 | `framebuffer_console.rs` | Scaled 8×8 font on bootloader FB |
 | `vga_buffer.rs` | 80×25 text mode fallback |
 | `shell.rs` | Command loop, history, completion |
-| `vfs.rs` | Path policy, root-mount dispatch, shell/process VFS facade |
+| `vfs.rs` | Path policy, longest-prefix mount table, shell/process VFS facade |
 | `fs.rs` | Private TuwaiqFS-backed in-memory tree implementation |
-| `tuwaiqfs.rs` | On-disk serialization (TuwaiqFS v2) |
+| `tuwaiqfs.rs` | TuwaiqFS v3 dual-checkpoint serialization and v2 migration |
+| `fat32.rs` | Independent read-only MBR/BPB/FAT32 backend |
 | `ata.rs` | Primary master PIO sector I/O |
 | `task.rs` | Preemptive scheduler: real TCBs, per-task stacks, context switch, user-process lifecycle, CR3/RSP0 switching |
 | `usermode.rs` | Low-level `iretq` primitive that drops CPL to 3 |
@@ -155,18 +159,21 @@ interrupts live rather than a purely polled CPU.
   Phase 5 routes each decoded event exclusively to either that queue or the
   foreground Ring 3 input queue.
 
-## TuwaiqFS v2
+## TuwaiqFS v3
 
-See [docs/TUWAIQFS.md](docs/TUWAIQFS.md). The full directory tree is flattened
-to path records (`hello.txt`, `docs/readme.txt`) and stored in a metadata region
-starting at LBA 8465. Phase 6 keeps the v2 layout but makes file bodies
-binary-safe so native ELF bytes can be persisted.
+See [docs/TUWAIQFS.md](docs/TUWAIQFS.md). The binary-safe full tree is written
+to alternating checksummed checkpoints. The commit header is written last;
+mount chooses the newest valid generation or recovers the older committed
+copy. Legacy v2 volumes are read with strict geometry and upgraded only after a
+successful v3 checkpoint. Unrecoverable corruption leaves `/` offline instead
+of silently formatting or substituting an empty tree.
 
 ## Program loader
 
 `loader.rs` still dispatches `run <name>` to legacy built-in kernel programs.
-`runelf` launches embedded Ring 3 recovery/test images, while Phase 6 `runfs`
-and `SPAWN` load persisted ELF bytes through VFS and the real `elf.rs` loader.
+`runelf` launches explicitly embedded Ring 3 recovery/test fixtures. Normal
+desktop/application launch, `runfs`, and `SPAWN` read ELF bytes from `/apps`
+through the VFS and the same validated `elf.rs` loader.
 
 ## Shell
 
@@ -544,7 +551,7 @@ hardware-verified evidence, not a heuristic.
   filesystem-backed executable loading. Phase 6 now supplies the initial
   filesystem path; dynamic linking and relocation remain future work.
 - At Phase 5 completion the syscall surface contained 10 calls and no file
-  API. The current Phase 6 milestone extends it to 21 calls; IPC remains future.
+  API. Phase 6 extends it to 22 calls; IPC remains future.
 
 ### Verification performed
 
@@ -965,10 +972,10 @@ request, mouse error, or desktop lifecycle event can halt Ring 0.
 
 ## Phase 6 foundation: VFS, file ABI, and filesystem applications
 
-This section describes the **current first Phase 6 milestone**, not the Phase 6
-exit gate. TuwaiqFS remains the only mounted backend, mutations are confined to
-per-application data directories, and embedded executables remain transitional
-bootstrap/test input.
+This section describes the completed Phase 6 storage/application boundary.
+TuwaiqFS is the writable root, FAT32 is a genuinely separate read-only backend,
+mutations remain confined to per-application data directories, and embedded
+ELFs are no longer the normal application-launch path.
 
 ### Current storage and path boundary
 
@@ -980,13 +987,18 @@ application receives a backend node. Current topology is:
 shell / Ring 3 syscalls
         |
         v
-VFS path normalization + root dispatch
-        |
-        v
-private TuwaiqFS backend -> validated v2 serialization -> ATA PIO
+VFS normalization + longest-prefix mount table
+        |                              |
+        v                              v
+TuwaiqFS backend at /             FAT32 backend at /boot
+        |                              |
+        v                              v
+v3 dual checkpoints                validated read-only FAT chains
+        |                              |
+        +------------- ATA PIO --------+
 ```
 
-- Paths are UTF-8, at most 120 bytes (the current TuwaiqFS v2 record bound),
+- Paths are UTF-8, at most 120 bytes (the TuwaiqFS record bound),
   with components at most 64 bytes.
   Absolute and per-process-relative paths share one normalizer. Empty
   components and `.` are removed; `..` pops one component and clamps at `/`.
@@ -994,14 +1006,25 @@ private TuwaiqFS backend -> validated v2 serialization -> ATA PIO
 - The privileged shell and every Ring 3 process own independent normalized
   working directories. `cd` and path-aware completion use the same VFS policy
   as syscalls; one process cannot change a peer's CWD.
-- TuwaiqFS v2's on-disk layout is unchanged, but file bodies are now opaque
-  bytes rather than UTF-8 strings. One file is capped at 65,535 bytes by the
-  existing `u16` record, and the complete metadata region remains 124 KiB.
-- Mount rejects unsupported geometry/version, metadata lengths outside the
-  reserved region, truncated/unknown records, invalid or duplicate paths, and
-  invalid UTF-8 path names. It caps metadata at 1,024 records and uses fallible
-  parser growth. It never clamps an oversized length or accepts a valid prefix
-  of a corrupt blob as a complete tree.
+- The mount table accepts up to eight normalized, non-duplicate mount paths
+  and uses component-boundary-aware longest-prefix resolution. Mount metadata
+  is published as an immutable `Arc` snapshot; no backend node crosses the VFS.
+- TuwaiqFS v3 retains binary-safe v2 tree records and the 65,535-byte per-file
+  bound, while expanding total serialized metadata to 261,632 bytes. Two
+  checkpoint slots carry generation, exact length, CRC-32, and a commit marker.
+  The inactive header is uncommitted while payload sectors are written and is
+  committed last. The in-memory candidate is published only afterward.
+- Mount validates both checkpoints independently and chooses the newest valid
+  generation. An incomplete or corrupt newest copy falls back to the older
+  committed generation. If neither copy is valid, TuwaiqFS remains unavailable
+  in explicit read-only recovery mode; the kernel never silently accepts data,
+  reformats a populated checkpoint area, or substitutes an empty root. Legacy
+  v2 geometry is mounted for migration and upgraded only after a successful v3
+  checkpoint write.
+- The independent FAT32 backend scans MBR candidates, validates FAT32 BPB and
+  cluster geometry, follows bounded/loop-checked FAT chains, decodes ordinary
+  8.3 entries, and exposes `/boot` read-only. It shares neither TuwaiqFS nodes
+  nor serialization and remains usable when the writable root is offline.
 - Readers clone one immutable `Arc` tree snapshot inside the interrupt-safe
   lock, then perform traversal and output allocation after interrupts are
   restored. A mutation clones a lightweight candidate tree from that snapshot
@@ -1010,12 +1033,12 @@ private TuwaiqFS backend -> validated v2 serialization -> ATA PIO
   lock only after ATA success. A non-spinning atomic writer guard rejects a
   concurrent writer as busy rather than deadlocking a preempted owner or losing
   an update. An I/O failure therefore leaves the prior in-memory namespace
-  visible. The v2 single-copy disk format is not yet crash-transactional;
-  journal/recovery work remains in Phase 6.
+  visible. Metadata exhaustion and injected interruption are rejected before
+  publication; a later mount ignores the uncommitted slot.
 
 ### Current Ring 3 file/process ABI
 
-Syscalls 10-20 extend the Phase 5 ABI to 21 calls. They are an intentionally
+Syscalls 10-21 extend the Phase 5 ABI to 22 calls. They are an intentionally
 small milestone ABI, not the future stable/versioned application ABI:
 
 - `CHDIR` and `GETCWD` operate only on the calling process.
@@ -1027,6 +1050,9 @@ small milestone ABI, not the future stable/versioned application ABI:
   userspace destination before observing or advancing the handle, so a bad,
   read-only, unmapped, noncanonical, overflowing, kernel, or cross-page range
   consumes no data. EOF is stable; `CLOSE` rejects stale/double-close handles.
+- `SEEK` sets a process-owned read handle to a bounded absolute byte offset.
+  It rejects invalid/stale handles and offsets beyond EOF without changing the
+  current offset.
 - Process exit/fault/reap drops every handle and shared snapshot reference with
   the TCB. No filesystem lock or raw backend pointer crosses a syscall.
 - `SPAWN` resolves a VFS path, holds immutable executable bytes, applies the
@@ -1035,10 +1061,13 @@ small milestone ABI, not the future stable/versioned application ABI:
   global scheduler is capped at 64 tasks. Per-process names, CWD, handle table,
   32 KiB kernel stack, and TCB allocation are prepared fallibly; pressure
   returns `-1` instead of invoking Ring 0's allocation panic path.
-- `installapp` is an explicit transitional bootstrap command that copies a
-  selected embedded recovery/test image into `/apps`; `runfs` and `SPAWN` then
-  read and load the persisted file. Removing embedded ELF as the normal path
-  remains an unchecked Phase 6 requirement.
+- The image builder packages `desktop`, `file-manager`, `terminal`, and
+  `tuwaiq-ai` into `/apps` before first boot. The `desktop` shell command reads
+  `/apps/desktop`; desktop exit requests hand foreground ownership to the
+  filesystem-backed File Manager or Terminal, and normal exit relaunches the
+  filesystem-backed desktop. `runelf`, `installapp`, and embedded hostile
+  binaries remain explicit bootstrapping/recovery/diagnostic fixtures, not the
+  normal application path.
 - `PUT_FILE` atomically creates or replaces a complete file, capped at 4096
   bytes per call. `REMOVE` deletes files or empty directories, and rejects a
   non-empty directory. `MKDIR`, `READDIR`, and `STAT` provide basic directory
@@ -1055,9 +1084,12 @@ small milestone ABI, not the future stable/versioned application ABI:
   serialization, and ATA I/O all run with interrupts enabled and without a
   global spin lock held.
 
-Ring 3 has no rename, seek, shared-directory delegation, or general writable
-handle API in this milestone, and applications cannot manipulate TuwaiqFS
-internals directly. The current interrupt-gate syscall path also remains
+Ring 3 has no rename, shared-directory delegation, or general writable-handle
+API, and applications cannot manipulate TuwaiqFS internals directly. Delegated
+authority depends on Phase 8's versioned IPC/capability model; a user-facing
+offline repair utility is deferred to Phase 9 system tooling. FAT32 is 8.3 and
+read-only, TuwaiqFS files remain capped at 65,535 bytes, and ATA PIO is the only
+current storage transport. The current interrupt-gate syscall path also remains
 non-preemptible while loading a `SPAWN` image (bounded to 65,535 bytes); moving
 filesystem reads and ELF preparation out of that interval is required before
 larger executables or general storage backends are admitted.
@@ -1115,67 +1147,67 @@ or default data egress. Local/offline operation remains the baseline, and a
 future suitable Saudi model or another approved provider can replace the local
 provider without redesigning the kernel or UI contract.
 
-### Phase 6 focused verification performed
+### Phase 6 Verification Performed
 
-Development uses one focused assertion-driven run after a build:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\phase6-smoke.ps1 -AllowDirty
-```
-
-`phase6-smoke.ps1` copies the image, drives QEMU through TCP monitor/serial,
-fails on missing markers or kernel faults, captures the honest preview window,
-and reboots the same copied disk. Evidence is concise ignored output under
-`target/phase6-smoke/<commit>-<timestamp>/` (`serial.log`, `results.json`, and
-one PPM).
-
-The 2026-08-08 focused run actually demonstrated:
-
-- normalized absolute/relative/dot/parent paths, independent process CWD,
-  hostile path/destination pointers, cross-page rejection, read offset
-  atomicity, EOF, handle exhaustion/double close, and exit cleanup;
-- filesystem-backed ELF load/exit and binary persistence/relaunch after a
-  genuine reboot;
-- assistant start/stop/relaunch at CPL3, an isolated invalid-opcode provider
-  exit, and continued kernel/scheduler heartbeat;
-- a real desktop click launching the separate service while the desktop stayed
-  scheduled, followed by normal desktop exit and a second warmed concurrent
-  cycle;
-- exact warmed resource reuse: VFS test tasks `3->3`, live frames `1029->1029`,
-  frame bump `1045->1045`, heap `94304->94304`; assistant lifecycle tasks
-  `3->3`, frames `1029->1029`, bump `1045->1045`, heap `116376->116376`;
-  concurrent desktop/AI returned tasks `3->3`, frames `1029->1029`, bump
-  `1735->1735`, and heap `137232->137232` after its full warm cycle;
-- no kernel panic, kernel page fault, double fault, unexpected QEMU exit, or
-  new compiler warning (the existing nine warnings remain).
-
-Corrupt-volume injection, interrupted-sector recovery, general mounts, service
-IPC, capabilities, real local inference, and removal of normal embedded
-application loading remain unverified/incomplete and are not claimed by this
-milestone.
-
-### Phase 6 persistent application-data verification performed
-
-The mutable-storage milestone uses one short assertion-driven QEMU run:
+The final gate uses one repository-local assertion-driven QEMU suite after a
+clean build:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\phase6-storage-smoke.ps1
 ```
 
-The run installs and launches the hostile `file-mutation-test` ELF through the
-VFS, proves create/replace/read/stat/list/delete behavior, rejects invalid paths,
-namespace escapes, noncanonical/kernel/unmapped/zero/overflowing/cross-page
-pointers and oversized buffers, saves a real Notes entry, and genuinely reboots
-the copied disk. It then reopens the Ring 3 file and Notes entry and relaunches
-`/apps/hello`. Missing markers, a kernel panic, kernel page fault, double fault,
-or unexpected QEMU exit fail the run. Evidence is written under
-`target/phase6-storage-smoke/<commit>-<timestamp>/`.
+The harness copies the exact built image and never rebuilds it during the run.
+It drives QEMU through TCP monitor/serial, performs a genuine guest reboot,
+stops QEMU for controlled corruption of copied images, and boots the recovery
+scenarios separately. Missing markers, unexpected QEMU exit, kernel panic,
+kernel page fault, or double fault fails the suite. Concise evidence is stored
+under `target/phase6-storage-smoke/<commit>-<timestamp>/`: `serial.log`,
+`results.json`, `manifest.json`, and the small copied images needed to reproduce
+the two corruption branches.
 
-This does not close Phase 6: the mount table/second backend, normal embedded-ELF
-removal, filesystem-launched useful applications, seek/capability delegation,
-and injected corruption/interrupted-write/recovery/exhaustion gates remain open.
+The 2026-08-09 acceptance run produced 14 asserted passes:
+
+- TuwaiqFS v3 mounted read-write at `/`; the independent FAT32 backend mounted
+  read-only at `/boot`, supplied nested resources, and rejected mutation;
+- path normalization, per-process CWD, bounded handles, absolute seek, EOF,
+  handle cleanup, filesystem-backed ELF loading, and exact warmed resource
+  reuse (`tasks 3->3`, live frames `1029->1029`, bump cursor `1044->1044`,
+  heap bytes `170080->170080`);
+- hostile Ring 3 path/spec/data/output pointers including zero, noncanonical,
+  kernel, unmapped, overflowing, oversized, and cross-page ranges; invalid
+  requests failed without consuming handle data or mutating storage;
+- create, replace, read, stat, list, remove, application-private namespace
+  enforcement, binary persistence, a real Notes save/reopen, and
+  filesystem-backed ELF exit/relaunch;
+- metadata exhaustion rejected the candidate atomically, preserved earlier
+  files, and allowed reclaimed capacity to be reused;
+- Desktop loaded from `/apps/desktop`; its real File Manager loaded from
+  `/apps/file-manager` and browsed `/apps`, `/boot`, and `/boot/DOCS`; its real
+  Terminal loaded from `/apps/terminal`, wrote and reopened
+  `/data/terminal/session.txt`, exited, and relaunched through the desktop;
+- a genuine reboot of the same image preserved Ring 3 data, Notes data,
+  Terminal data, and an injected interrupted-write survivor; the Terminal and
+  filesystem ELF then relaunched without rebuilding the image;
+- corrupting only the newest checkpoint produced a checksum rejection and
+  automatic fallback to the older committed generation with the durable
+  sentinel intact;
+- corrupting both committed checkpoints kept `/` offline, logged explicit
+  read-only recovery mode, preserved scheduler/shell health, left `/boot`
+  readable, and rejected root mutation. No silent formatting, empty-tree
+  substitution, corruption acceptance, or claimed repair occurred.
+
+The build completed all 25 Ring 3 ELFs, the kernel, and the 48,234,496-byte BIOS
+disk image with the existing nine kernel warnings and zero new warnings.
+Formatting and `git diff --check` are separate final gates.
+
+Phase 6 intentionally does not implement shared/delegated capabilities, a
+general repair utility, large files, long FAT names, FAT writes, rename, or
+general writable handles. The first two depend on Phase 8 capabilities and
+Phase 9 system tooling as recorded in `ROADMAP.md`; the other bounded limits are
+documented rather than represented as completed functionality. Phase 6 adds no
+networking, driver framework, telemetry, model inference, or privileged AI
+action.
 
 ## Locking invariant
 
@@ -1290,21 +1322,24 @@ Loopback driver echoes packets in RAM. `ping localhost` validates the stack. HTT
    directory (its `.cargo/config.toml` supplies the static-relocation/
    large-code-model/no-PIE flags a fixed high address like
    `0x_7000_0000_0000` requires -- running from the repo root would
-   silently miss that config). The current tree builds 23 ELF programs:
+   silently miss that config). The current tree builds 25 ELF programs:
    functional, hostile pointer/fault, VM rollback/permission, desktop, and
    concurrency coverage, including `desktop` (Phase 5's Tuwaiq Desktop --
    a multi-file binary under `src/bin/desktop/`, sharing this same crate
    and build step rather than a separate one, since it needs no `alloc`
    and no fixed address different from every other binary here).
-2. `cargo build -p kernel --target x86_64-unknown-none` -- `shell.rs`
-   embeds bootstrap/recovery/test copies during the Phase 6 transition. The
-   VFS can persist those bytes and normal execution then reloads them from
-   files; removing embedding as the normal path is still a Phase 6 task.
-3. `cargo build -p tuwaiqos` → `build.rs` wraps kernel in BIOS image
+2. `cargo build -p kernel --target x86_64-unknown-none` -- `shell.rs` retains
+   explicitly invoked bootstrap/recovery/security-test fixtures. Normal desktop
+   and useful application launch does not read these embedded copies.
+3. `cargo build -p tuwaiqos` -> `build.rs` wraps the kernel in a BIOS image,
+   creates a clean TuwaiqFS v3 checkpoint containing the normal `/apps`
+   catalog, and adds a genuinely separate FAT32 resource partition.
 4. Output: `boot-bios-tuwaiqos.img`
 
 `scripts/build.ps1` runs all of this in order.
 
 ## Historical note
 
-Earlier versions used AbdullahOS / AbdullahFS v1 (flat root persistence only). TuwaiqOS v0.5 renamed the project and upgraded to TuwaiqFS v2.
+Earlier versions used AbdullahOS / AbdullahFS v1 (flat root persistence only).
+TuwaiqOS v0.5 renamed the project and upgraded to TuwaiqFS v2; Phase 6 adds the
+recoverable v3 checkpoint format while retaining strict v2 migration support.
