@@ -53,4 +53,3 @@ desktop, and scheduler regression gates on named hardware. Record firmware,
 PCI IDs, RAM, display/input/storage devices, and negative/unsupported results.
 Until that evidence exists, Phase 7 remains open and the post-Phase-7 kernel
 feature freeze has not started.
-
