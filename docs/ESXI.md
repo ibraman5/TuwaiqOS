@@ -29,4 +29,3 @@ ESXi validation remains **pending** until an external tester returns:
 - the complete COM1 serial log.
 
 Do not mark Phase 7B or physical qualification complete without that evidence.
-
