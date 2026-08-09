@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::ata;
+use crate::storage;
 
 const SECTOR_SIZE: usize = 512;
 const MBR_PARTITION_OFFSET: usize = 446;
@@ -59,7 +59,7 @@ enum Located {
 impl Fat32Volume {
     pub fn mount() -> Result<Self, &'static str> {
         let mut mbr = [0u8; SECTOR_SIZE];
-        ata::read_sector(0, &mut mbr)?;
+        storage::read_sector(0, &mut mbr)?;
         if mbr[510] != 0x55 || mbr[511] != 0xAA {
             return Err("FAT32: invalid MBR signature");
         }
@@ -75,7 +75,7 @@ impl Fat32Volume {
                     // small FAT16 partition also uses LBA type 0x0C. Select
                     // only a BPB with FAT32's zero root-entry/FAT16 fields.
                     let mut candidate = [0u8; SECTOR_SIZE];
-                    if ata::read_sector(start, &mut candidate).is_ok()
+                    if storage::read_sector(start, &mut candidate).is_ok()
                         && le_u16(&candidate[17..19]) == 0
                         && le_u16(&candidate[22..24]) == 0
                         && le_u32(&candidate[32..36]) != 0
@@ -90,7 +90,7 @@ impl Fat32Volume {
             partition.ok_or("FAT32: MBR partition not found")?;
 
         let mut bpb = [0u8; SECTOR_SIZE];
-        ata::read_sector(partition_start, &mut bpb)?;
+        storage::read_sector(partition_start, &mut bpb)?;
         if bpb[510] != 0x55 || bpb[511] != 0xAA || le_u16(&bpb[11..13]) != 512 {
             return Err("FAT32: invalid boot sector");
         }
@@ -230,7 +230,7 @@ impl Fat32Volume {
             }
             let first_lba = self.cluster_lba(cluster)?;
             for index in 0..u32::from(self.sectors_per_cluster) {
-                ata::read_sector(first_lba + index, &mut sector)?;
+                storage::read_sector(first_lba + index, &mut sector)?;
                 let remaining = size - bytes.len();
                 bytes.extend_from_slice(&sector[..remaining.min(SECTOR_SIZE)]);
                 if bytes.len() == size {
@@ -287,7 +287,7 @@ impl Fat32Volume {
             }
             let first_lba = self.cluster_lba(cluster)?;
             for index in 0..u32::from(self.sectors_per_cluster) {
-                ata::read_sector(first_lba + index, &mut sector)?;
+                storage::read_sector(first_lba + index, &mut sector)?;
                 for raw in sector.chunks_exact(32) {
                     if raw[0] == 0x00 {
                         return Ok(entries);
@@ -322,7 +322,7 @@ impl Fat32Volume {
             return Err("FAT32: FAT lookup outside table");
         }
         let mut sector = [0u8; SECTOR_SIZE];
-        ata::read_sector(self.fat_start + sector_offset, &mut sector)?;
+        storage::read_sector(self.fat_start + sector_offset, &mut sector)?;
         let offset = (byte_offset % SECTOR_SIZE as u32) as usize;
         let value = le_u32(&sector[offset..offset + 4]) & 0x0FFF_FFFF;
         if value >= FAT32_EOC {

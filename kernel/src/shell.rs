@@ -37,6 +37,7 @@ const HISTORY_SIZE: usize = 16;
 pub enum ConsoleMode {
     Framebuffer,
     Vga,
+    Serial,
 }
 
 struct History {
@@ -347,6 +348,7 @@ fn execute_command(boot_info: &BootInfo, mode: ConsoleMode, line: &str) {
         "installapp" => handle_install_app(mode, args),
         "vfstest" => handle_vfs_test(mode),
         "storagetest" => handle_storage_test(mode),
+        "nvmetest" => handle_nvme_test(mode),
         "fsinterrupttest" => handle_fs_interrupted_write_test(mode),
         "fsexhausttest" => handle_fs_exhaustion_test(mode),
         "aipreviewtest" => handle_ai_preview_test(mode),
@@ -724,6 +726,34 @@ fn handle_storage_test(mode: ConsoleMode) {
             "storage: FAIL Ring-3 mutation process"
         },
     );
+}
+
+fn handle_nvme_test(mode: ConsoleMode) {
+    print(mode, "NVMe boot backend: ");
+    println(mode, crate::storage::backend_name());
+    match crate::storage::nvme_self_test() {
+        Ok(report)
+            if report.invalid_lba_rejected
+                && report.malformed_namespace_rejected
+                && report.timeout_bounded
+                && report.reset_recovered
+                && report.claims_stable
+                && report.frames_stable
+                && report.heap_stable =>
+        {
+            print(
+                mode,
+                "nvme-test: PASS invalid-lba malformed-namespace timeout-reset no-leak sectors=",
+            );
+            print_u64(mode, report.sector_count);
+            println(mode, "");
+        }
+        Ok(_) => println(mode, "nvme-test: FAIL incomplete invariant result"),
+        Err(reason) => {
+            print(mode, "nvme-test: FAIL ");
+            println(mode, reason);
+        }
+    }
 }
 
 fn handle_fs_interrupted_write_test(mode: ConsoleMode) {
@@ -2735,7 +2765,7 @@ fn print_help(mode: ConsoleMode) {
         mode,
         "  installapp <name> | runfs <path> | vfstest | storagetest",
     );
-    println(mode, "  fsinterrupttest | fsexhausttest");
+    println(mode, "  fsinterrupttest | fsexhausttest | nvmetest");
     println(mode, "  aipreviewtest | desktopaitest");
     println(mode, "  isolate [bad_program]");
     println(mode, "  spawnfail <count>");
@@ -2856,6 +2886,7 @@ fn command_names() -> &'static [&'static str] {
         "installapp",
         "vfstest",
         "storagetest",
+        "nvmetest",
         "fsinterrupttest",
         "fsexhausttest",
         "aipreviewtest",
@@ -2959,6 +2990,7 @@ fn print(mode: ConsoleMode, text: &str) {
     match mode {
         ConsoleMode::Framebuffer => crate::framebuffer_console::print(text),
         ConsoleMode::Vga => crate::vga_buffer::print(text),
+        ConsoleMode::Serial => {}
     }
 }
 
@@ -2967,6 +2999,7 @@ fn println(mode: ConsoleMode, text: &str) {
     match mode {
         ConsoleMode::Framebuffer => crate::framebuffer_console::println(text),
         ConsoleMode::Vga => crate::vga_buffer::println(text),
+        ConsoleMode::Serial => {}
     }
 }
 
@@ -2979,6 +3012,7 @@ fn backspace(mode: ConsoleMode) {
     match mode {
         ConsoleMode::Framebuffer => crate::framebuffer_console::backspace(),
         ConsoleMode::Vga => crate::vga_buffer::backspace(),
+        ConsoleMode::Serial => {}
     }
 }
 
@@ -2986,6 +3020,7 @@ fn clear_screen(mode: ConsoleMode) {
     match mode {
         ConsoleMode::Framebuffer => crate::framebuffer_console::clear_screen(),
         ConsoleMode::Vga => crate::vga_buffer::clear_screen(),
+        ConsoleMode::Serial => {}
     }
 }
 
