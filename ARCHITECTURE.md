@@ -1157,28 +1157,35 @@ Current ownership and failure boundaries are:
   otherwise retains a serial shell. Missing PS/2 input is non-fatal and logged.
 
 Reproducible focused verification is provided by
-`scripts/phase7b-nvme-smoke.ps1`. `scripts/build-esxi.ps1` queries the installed
-`qemu-img` VMDK option list, takes an explicit virtual-hardware version,
-preserves the raw BIOS image, validates the generated stream-optimized VMDK,
-and emits a BIOS/NVMe VMX, SHA-256 file, and import README under
-`target/esxi/`.
+`scripts/phase7b-nvme-smoke.ps1`. The BIOS image build strips non-load kernel
+ELF metadata before `bootloader::BiosBoot` packaging: stage-2 loads the entire
+FAT file `kernel-x86_64` through BIOS INT 13h AH=42h, and an unstripped debug
+ELF (~13 MiB) was correlated with VMware Workstation NVMe boots failing at
+bootloader `fail: z` after printing `loading kernel...`. `scripts/build-esxi.ps1`
+queries the installed `qemu-img` VMDK option list, takes an explicit
+virtual-hardware version, preserves the raw BIOS image, emits the primary
+`monolithicSparse` `TuwaiqOS-VMware-BIOS.vmdk` for direct attach, optionally
+emits a distinct `streamOptimized` transport VMDK, validates both with
+`qemu-img info`/`check`, and writes companion VMX/checksum/README files under
+`target/esxi/`. SHA-256 verifies transfer integrity only.
 
 QEMU verifies the driver and artifact construction but cannot qualify VMware
-ESXi. ESXi validation remains pending an external report containing the ESXi
-version, selected VM compatibility version, complete VM settings, screenshot,
-and complete COM1 serial log. No physical NVMe hardware is qualified.
+Workstation or ESXi. External validation remains pending a report containing
+the hypervisor version, Legacy BIOS + NVMe (or noted substitute) settings,
+last visible boot message, and complete COM1 serial log when available. No
+physical NVMe hardware is qualified.
 
-The focused QEMU suite records nine fail-closed assertions: COM1 stage
+The focused QEMU suite records ten fail-closed assertions: COM1 stage
 coverage; NVMe Identify and mount; invalid-LBA, malformed-namespace, injected
 timeout/reset, and resource-baseline checks; write/read/flush; genuine reboot
 persistence; unsupported 4 KiB namespace cleanup; NVMe-absent ATA/VirtIO
-behavior; non-fatal absent PS/2 plus framebuffer-validation failure paths; and
-overall kernel health. Its source-image hash, exact commit, serial stream, and
-machine-readable results are written beneath `target/phase7b-nvme-smoke/`.
-The QEMU BIOS bootloader supplies a framebuffer even when display output is
-hidden, so the suite does not claim an actual framebuffer-absent kernel entry;
-the optional boot-info path and VGA/serial fallback remain implemented for the
-external ESXi test.
+behavior; non-fatal absent PS/2 plus framebuffer-validation failure paths;
+optional FAT32/network absence matrix; and overall kernel health. Its
+source-image hash, exact commit, serial stream, and machine-readable results
+are written beneath `target/phase7b-nvme-smoke/`. The QEMU BIOS bootloader
+supplies a framebuffer even when display output is hidden, so the suite does
+not claim an actual framebuffer-absent kernel entry; the optional boot-info
+path and VGA/serial fallback remain implemented for the external VMware test.
 
 ## Early Tuwaiq AI Preview architecture
 

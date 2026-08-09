@@ -237,6 +237,8 @@ network configuration persist state.
 
 - [x] Generate matching BIOS/NVMe VMDK and VMX artifacts with an explicit
       virtual-hardware version, checksums, and `qemu-img` validation
+- [x] Package a strip-unneeded kernel into the BIOS image and emit a primary
+      Workstation-attachable `monolithicSparse` VMDK (`TuwaiqOS-VMware-BIOS.vmdk`)
 - [x] Add a separate HAL-owned polling NVMe path for one bounded 512-byte
       namespace while preserving ATA and VirtIO block behavior
 - [x] Make TuwaiqFS/FAT32 boot storage select NVMe or ATA without changing the
@@ -245,11 +247,11 @@ network configuration persist state.
       VGA/serial fallback, and non-fatal input diagnostics
 - [x] Qualify NVMe read/write/flush/reset, reboot persistence, malformed
       namespace cleanup, and NVMe-absent fallback in QEMU
-- [ ] Validate the generated artifact on ESXi using an external tester's exact
-      ESXi build, VM compatibility, VM settings, screenshot, and complete COM1
-      log
+- [ ] Validate the generated artifact on VMware Workstation/ESXi using an
+      external tester's Legacy BIOS + NVMe settings, last visible boot message,
+      and complete COM1 log when available
 
-QEMU evidence validates the driver and artifact structure, not ESXi itself.
+QEMU evidence validates the driver and artifact structure, not VMware itself.
 Phase 7B remains open until the external evidence above is reviewed. Physical
 NIC qualification also remains independently open because no suitable test
 device is currently available.

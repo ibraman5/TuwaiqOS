@@ -58,10 +58,14 @@ bootloader used by this QEMU path still supplies a framebuffer, so an actual
 framebuffer-absent kernel entry is not claimed by this test.
 
 `scripts/build-esxi.ps1` queries the installed `qemu-img` VMDK options, uses an
-explicit virtual-hardware version, preserves the source IMG, validates the
-stream-optimized VMDK with `qemu-img info` and `check`, and emits the matching
-VMX, checksums, and README under `target/esxi/`. This is artifact validation,
-not an ESXi boot claim. ESXi status stays pending until the external evidence
+explicit virtual-hardware version, preserves the source IMG, emits the primary
+Workstation-attachable `TuwaiqOS-VMware-BIOS.vmdk` (`monolithicSparse`),
+optionally emits a distinct `streamOptimized` transport VMDK, validates both
+with `qemu-img info` and `check`, and writes companion VMX/checksum/README
+files under `target/esxi/`. The BIOS disk image packages a
+`llvm-objcopy --strip-unneeded` kernel so stage-2 does not load multi-megabyte
+debug sections over INT 13h. This is artifact validation, not a VMware boot
+claim. Workstation/ESXi status stays pending until the external evidence
 listed in `docs/ESXI.md` is returned.
 
 ## Physical qualification required to close Phase 7
