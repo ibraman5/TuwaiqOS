@@ -82,7 +82,7 @@ function Save-Evidence {
         nvme_device = 'QEMU NVMe PCI, 512-byte boot namespace'
         malformed_namespace = 'QEMU NVMe PCI, 4096-byte unsupported namespace'
         fallback = 'ATA boot plus legacy VirtIO block probe'
-        verdict = if ($Results.Count -eq 9) { 'PASS' } else { 'INCOMPLETE' }
+        verdict = if ($Results.Count -eq 10) { 'PASS' } else { 'INCOMPLETE' }
     } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $ManifestJson -Encoding UTF8
 }
 
@@ -208,10 +208,12 @@ try {
     )
     [void](Wait-Regex 'BOOT: stage=entry COM1-ready' 0 120)
     [void](Wait-Regex 'BOOT: stage=shell-entered' 0 30)
+    [void](Wait-Regex 'shell: console-ready mode=' 0 30)
     Add-Pass 'early boot diagnostics' 'COM1 recorded entry through shell stages before console dependence'
     [void](Wait-Regex 'storage: NVMe active nsid=1 sectors=[0-9]+ version=[0-9]+\.[0-9]+\.[0-9]+' 0 10)
     [void](Wait-Regex 'vfs: mounted TuwaiqFS v3 at /' 0 10)
     [void](Wait-Regex 'task heartbeat: beat #1' 0 30)
+    [void](Wait-Regex 'task heartbeat: stable \(further beats every ~30s; not shell readiness\)' 0 30)
     Add-Pass 'NVMe boot and mount' '512-byte namespace identified; TuwaiqFS and scheduler reached live state'
 
     [void](Invoke-ShellCommand 'nvmetest' @('nvme-test: PASS invalid-lba malformed-namespace timeout-reset no-leak') 60)
@@ -266,10 +268,39 @@ try {
     )
     [void](Wait-Regex 'keyboard: PS/2 controller absent/unresponsive; boot continues' 0 120)
     [void](Wait-Regex 'mouse: IRQ12 remains masked; boot continues without mouse input' 0 30)
+    [void](Wait-Regex 'BOOT-DEGRADE: component=ps2-keyboard' 0 30)
     [void](Wait-Regex 'framebuffer: validation self-test PASS' 0 30)
     [void](Wait-Regex 'BOOT: stage=shell-entered' 0 30)
+    [void](Wait-Regex 'shell: console-ready mode=' 0 30)
     [void](Wait-Regex 'task heartbeat: beat #1' 0 60)
     Add-Pass 'input and console failure paths' 'absent 8042 remained non-fatal; malformed framebuffer geometry was rejected; COM1 reached shell and scheduler'
+    Stop-TestVm
+
+    $FatBroken = Join-Path $OutDir 'fat32-broken.img'
+    Copy-Item -LiteralPath $AtaImage -Destination $FatBroken
+    $fatBytes = [IO.File]::ReadAllBytes($FatBroken)
+    # Destroy the packaged FAT32 boot-sector signature at LBA 24576 only.
+    $fatBoot = 24576 * 512
+    $fatBytes[$fatBoot + 510] = 0
+    $fatBytes[$fatBoot + 511] = 0
+    [IO.File]::WriteAllBytes($FatBroken, $fatBytes)
+
+    Start-TestVm 'OPTIONAL DEVICE ABSENCE MATRIX' @(
+        '-drive', "if=none,id=osdisk,format=raw,file=$FatBroken",
+        '-device', 'ide-hd,drive=osdisk,bus=ide.0,unit=0,bootindex=1',
+        '-nic', 'none'
+    )
+    [void](Wait-Regex 'BOOT: stage=entry COM1-ready' 0 120)
+    [void](Wait-Regex 'vfs: mounted TuwaiqFS v3 at /' 0 60)
+    [void](Wait-Regex 'vfs: FAT32 /boot mount failed:' 0 30)
+    [void](Wait-Regex 'vfs: /boot UNAVAILABLE; boot continues' 0 30)
+    [void](Wait-Regex 'BOOT-DEGRADE: component=fat32-boot' 0 30)
+    [void](Wait-Regex 'BOOT-DEGRADE: component=virtio-net reason=device-absent fallback=network-offline' 0 30)
+    [void](Wait-Regex 'BOOT: stage=shell-entered' 0 30)
+    [void](Wait-Regex 'shell: console-ready mode=.* boot=UNAVAILABLE' 0 30)
+    [void](Wait-Regex 'task heartbeat: beat #1' 0 60)
+    if ($SerialText.ToString() -match 'KERNEL PANIC|fail: z') { throw 'Optional-device matrix panicked or hit bootloader fail:z.' }
+    Add-Pass 'optional device absence matrix' 'invalid FAT32 and absent VirtIO net stayed non-fatal; shell/recovery markers reached over COM1'
     Test-Health
     Add-Pass 'kernel health' 'all scenarios completed without panic, double fault, deadlock, or unexpected exit'
     Stop-TestVm

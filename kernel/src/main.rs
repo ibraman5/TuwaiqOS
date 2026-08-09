@@ -99,6 +99,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial_println!("keyboard: PS/2 controller responded; IRQ input enabled");
     } else {
         serial_println!("keyboard: PS/2 controller absent/unresponsive; boot continues");
+        boot_diag::degrade("ps2-keyboard", "controller-absent", "serial-or-no-input");
     }
 
     // Programs the PS/2 auxiliary device, then unmasks its IRQ line only
@@ -112,6 +113,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         interrupts::enable_mouse();
     } else {
         serial_println!("mouse: IRQ12 remains masked; boot continues without mouse input");
+        boot_diag::degrade(
+            "ps2-mouse",
+            "init-failed-or-absent",
+            "keyboard-or-serial-only",
+        );
     }
     boot_diag::mark(6, "input-probed");
 
@@ -133,10 +139,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 probe.capacity_sectors,
                 probe.first_sector_checksum
             ),
-            Err(reason) => serial_println!("virtio-blk: FAILED: {}", reason),
+            Err(reason) => {
+                serial_println!("virtio-blk: FAILED: {}", reason);
+                boot_diag::degrade("virtio-blk", reason, "continue-without-virtio-blk");
+            }
         }
     } else {
         serial_println!("virtio-blk: no supported legacy PCI device; skipped cleanly");
+        boot_diag::degrade("virtio-blk", "device-absent", "continue-without-virtio-blk");
     }
     net::init();
     boot_diag::mark(11, "network-initialized");
@@ -145,6 +155,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         serial_println!("framebuffer: validation self-test PASS");
     } else {
         serial_println!("framebuffer: validation self-test FAIL");
+        boot_diag::degrade(
+            "framebuffer-validation",
+            "self-test-failed",
+            "reject-before-activation",
+        );
     }
 
     if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
@@ -168,10 +183,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             Err(reason) => {
                 serial_println!("framebuffer: rejected safely: {}; trying VGA text", reason);
+                boot_diag::degrade("framebuffer", reason, "vga-or-serial");
             }
         }
     } else {
         serial_println!("framebuffer: bootloader supplied none; trying VGA text");
+        boot_diag::degrade("framebuffer", "bootloader-supplied-none", "vga-or-serial");
     }
 
     let mode = if let Err(reason) = vga_buffer::try_init() {
@@ -179,6 +196,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             "vga: fallback unavailable: {}; continuing serial-only",
             reason
         );
+        boot_diag::degrade("vga-text", reason, "serial-recovery-console");
         ConsoleMode::Serial
     } else {
         vga_buffer::clear_screen();

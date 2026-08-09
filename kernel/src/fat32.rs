@@ -64,24 +64,29 @@ impl Fat32Volume {
             return Err("FAT32: invalid MBR signature");
         }
 
-        let mut partition = None;
+        // Prefer the largest FAT32-looking LBA partition. The bootloader's
+        // kernel FAT also uses type 0x0C but is FAT16; when multiple 0x0C
+        // candidates appear, the packaged resource volume is the large one.
+        let mut partition: Option<(u32, u32)> = None;
         for index in 0..MBR_PARTITION_COUNT {
             let offset = MBR_PARTITION_OFFSET + index * 16;
             if matches!(mbr[offset + 4], 0x0B | 0x0C) {
                 let start = le_u32(&mbr[offset + 8..offset + 12]);
                 let sectors = le_u32(&mbr[offset + 12..offset + 16]);
                 if start != 0 && sectors != 0 {
-                    // Partition type alone is only a hint: the bootloader's
-                    // small FAT16 partition also uses LBA type 0x0C. Select
-                    // only a BPB with FAT32's zero root-entry/FAT16 fields.
                     let mut candidate = [0u8; SECTOR_SIZE];
                     if storage::read_sector(start, &mut candidate).is_ok()
                         && le_u16(&candidate[17..19]) == 0
                         && le_u16(&candidate[22..24]) == 0
                         && le_u32(&candidate[32..36]) != 0
                     {
-                        partition = Some((start, sectors));
-                        break;
+                        let replace = match partition {
+                            None => true,
+                            Some((_, previous_sectors)) => sectors > previous_sectors,
+                        };
+                        if replace {
+                            partition = Some((start, sectors));
+                        }
                     }
                 }
             }

@@ -50,6 +50,22 @@ pub fn last_stage() -> &'static str {
     }
 }
 
+/// Record a non-fatal optional-device failure with an explicit fallback.
+///
+/// Format is fixed so COM1 logs remain greppable without allocation:
+/// `BOOT-DEGRADE: component=... reason=... fallback=... alive=yes`.
+pub fn degrade(component: &str, reason: &str, fallback: &str) {
+    raw_write(b"BOOT-DEGRADE: component=");
+    raw_write(component.as_bytes());
+    raw_write(b" reason=");
+    raw_write(reason.as_bytes());
+    raw_write(b" fallback=");
+    raw_write(fallback.as_bytes());
+    raw_write(b" alive=yes stage=");
+    raw_write(last_stage().as_bytes());
+    raw_write(b"\r\n");
+}
+
 pub fn raw_line(text: &str) {
     raw_write(text.as_bytes());
     raw_write(b"\r\n");

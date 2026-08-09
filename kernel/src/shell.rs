@@ -114,6 +114,31 @@ pub fn run(boot_info: &'static BootInfo, mode: ConsoleMode) -> ! {
     let mut history = History::new();
     let mut first_prompt = true;
 
+    // One-shot readiness summary: distinguishes shell/recovery entry from
+    // scheduler heartbeat spam on COM1.
+    let root_online = vfs::kind("/", "/").is_ok();
+    let boot_online = vfs::kind("/", "/boot").is_ok();
+    let storage = crate::storage::backend_name();
+    crate::serial_println!(
+        "shell: console-ready mode={} storage={} root={} boot={}",
+        match mode {
+            ConsoleMode::Framebuffer => "framebuffer",
+            ConsoleMode::Vga => "vga",
+            ConsoleMode::Serial => "serial-recovery",
+        },
+        storage,
+        if root_online {
+            "online"
+        } else {
+            "OFFLINE-recovery"
+        },
+        if boot_online { "online" } else { "UNAVAILABLE" }
+    );
+    if !root_online {
+        println(mode, "RECOVERY CONSOLE: writable root offline");
+        crate::serial_println!("shell: recovery console active; writable root offline");
+    }
+
     loop {
         if !first_prompt {
             println(mode, "");

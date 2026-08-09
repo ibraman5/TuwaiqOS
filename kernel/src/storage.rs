@@ -59,6 +59,7 @@ pub fn init() {
                     "storage: NVMe failure cleanup active_claims={}",
                     crate::hal::driver::active_claims()
                 );
+                crate::boot_diag::degrade("nvme", reason, "try-ata-or-recovery");
             }
         }
         // A single controller is the bounded Phase 7B boot-storage limit.
@@ -71,6 +72,11 @@ pub fn init() {
         crate::serial_println!("storage: ATA PIO fallback active");
     } else {
         crate::serial_println!("storage: no supported NVMe or ATA boot disk");
+        crate::boot_diag::degrade(
+            "boot-storage",
+            "no-supported-backend",
+            "recovery-console-read-only",
+        );
     }
 }
 
