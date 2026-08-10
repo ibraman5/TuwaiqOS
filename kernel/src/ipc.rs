@@ -20,6 +20,7 @@ pub const MAX_MESSAGE_BYTES: usize = 256;
 pub const MESSAGE_V1_SIZE: usize = 48 + MAX_MESSAGE_BYTES;
 pub const ENDPOINT_CREATE_V1_SIZE: usize = 16;
 pub const HANDLE_V1_SIZE: usize = 16;
+pub const CAP_QUERY_V1_SIZE: usize = 32;
 pub const ACCEPT_V1_SIZE: usize = 16;
 pub const DELEGATE_V1_SIZE: usize = 160;
 pub const FS_SCOPE_V1_SIZE: usize = 136;
@@ -1392,6 +1393,69 @@ pub fn sys_capability_close(ptr: u64, len: u64) -> i64 {
     .unwrap_or_else(|error| error)
 }
 
+/// Inspect a process-local capability without granting new authority.
+///
+/// Writes `rights` and `object_kind` into the caller's CapQueryV1 buffer after
+/// validating the complete writable structure. No kernel pointer or grant
+/// index is exposed.
+pub fn sys_capability_query(ptr: u64, len: u64) -> i64 {
+    if len != CAP_QUERY_V1_SIZE as u64 {
+        return ERR_INVALID;
+    }
+    if !task::validate_current_user_range(ptr, CAP_QUERY_V1_SIZE, true) {
+        return ERR_INVALID;
+    }
+    let bytes = match read_user_fixed::<CAP_QUERY_V1_SIZE>(ptr, len) {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
+    if let Err(error) = header(&bytes, CAP_QUERY_V1_SIZE) {
+        return error;
+    }
+    let reserved = match le_u64(&bytes, 24) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if reserved != 0 {
+        return ERR_BAD_MESSAGE;
+    }
+    let token = match le_u64(&bytes, 8) {
+        Ok(token) => token,
+        Err(error) => return error,
+    };
+    let pid = match current_pid() {
+        Ok(pid) => pid,
+        Err(error) => return error,
+    };
+    let (rights, kind) = match with_state(|state| -> Result<(u32, u32), i64> {
+        let process_index = state.process_index(pid).ok_or(ERR_BAD_HANDLE)?;
+        let cap = state.processes[process_index]
+            .caps
+            .iter()
+            .find(|cap| (cap.active || cap.revoked) && cap.token == token)
+            .copied()
+            .ok_or(ERR_BAD_HANDLE)?;
+        if cap.revoked {
+            return Err(ERR_REVOKED);
+        }
+        if !cap.active {
+            return Err(ERR_BAD_HANDLE);
+        }
+        Ok((cap.rights, u32::from(cap.object.kind as u8)))
+    }) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let mut out = [0u8; CAP_QUERY_V1_SIZE];
+    out[..CAP_QUERY_V1_SIZE].copy_from_slice(&bytes);
+    out[16..20].copy_from_slice(&rights.to_le_bytes());
+    out[20..24].copy_from_slice(&kind.to_le_bytes());
+    if !task::copy_to_current_user(ptr, &out) {
+        return ERR_INVALID;
+    }
+    OK
+}
+
 #[derive(Clone)]
 struct ScopeView {
     object: ObjectRef,
@@ -1828,7 +1892,7 @@ fn parse_fs_request(ptr: u64, len: u64) -> Result<FsRequest, i64> {
     })
 }
 
-pub fn sys_fs_open(ptr: u64, len: u64) -> i64 {
+pub fn sys_fs_read(ptr: u64, len: u64) -> i64 {
     let request = match parse_fs_request(ptr, len) {
         Ok(request) => request,
         Err(error) => return error,

@@ -40,6 +40,7 @@ pointer in `RDI`, exact structure length in `RSI`, and zero in `RDX`.
 | 34 | `fs_read` | `FsRequestV1` | bounded whole-file read through scope |
 | 35 | `fs_put` | `FsRequestV1` | bounded atomic whole-file replacement |
 | 36 | `fs_list` | `FsRequestV1` | bounded newline-delimited directory list |
+| 37 | `capability_query` | `CapQueryV1` | inspect local rights and object kind |
 
 The kernel copies and validates the complete fixed structure before object
 lookup. Receive/call additionally validate the complete writable structure
@@ -69,6 +70,20 @@ every nested buffer before VFS work.
 |---:|---|---|---|
 | 0 | header | | v1, size 16, flags 0 |
 | 8 | `u64` | `timeout_ticks` | 0 means no deadline; maximum 10,000 |
+
+### `CapQueryV1` (32 bytes)
+
+| Offset | Type | Field | Rule |
+|---:|---|---|---|
+| 0 | header | | v1, size 32, flags 0 |
+| 8 | `u64` | `handle` | process-local capability |
+| 16 | `u32` | `rights` | output: effective rights bits |
+| 20 | `u32` | `object_kind` | output: `1` endpoint, `2` VFS scope, `3` revoker |
+| 24 | `u64` | `reserved` | must be 0 on input; remains 0 |
+
+`capability_query` validates the complete writable structure before lookup and
+writes only `rights` and `object_kind`. It never exposes kernel pointers,
+slot indexes, or grant identifiers.
 
 ### `MessageV1` (304 bytes)
 

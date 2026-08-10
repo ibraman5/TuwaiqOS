@@ -315,7 +315,7 @@ reads, revocation, hostile ABI pointers/handles/paths, table exhaustion, reboot,
 and 20 measured lifecycle cycles. The measured run returned tasks, live frames,
 frame bump, heap bytes, endpoints, capabilities, calls, scopes, queued messages,
 and waiters to their exact warmed baselines (latest: tasks `3->3`, frames
-`1029->1029`, bump `1062->1062`, heap `279912->279912`, IPC counters `0->0`).
+`1029->1029`, bump `1062->1062`, heap `280520->280520`, IPC counters `0->0`).
 Phase 6 VFS/storage and the merged base's network behavior also passed.
 
 This branch is intentionally based on merged `main`; Phase 7 changes are not

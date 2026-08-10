@@ -552,7 +552,8 @@ hardware-verified evidence, not a heuristic.
   filesystem path; dynamic linking and relocation remain future work.
 - At Phase 5 completion the syscall surface contained 10 calls and no file
   API. Phase 6 extended it to 22 calls; the Phase 8 IPC/capability foundation
-  extends it to 37. The broader native ABI is not yet declared stable.
+  extends it to 37 (`docs/IPC_ABI.md`), including `capability_query`. The broader
+  native ABI is not yet declared stable.
 
 ### Verification performed
 
@@ -1100,7 +1101,7 @@ larger executables or general storage backends are admitted.
 
 ### Versioned boundary
 
-Syscalls 22-36 accept only fixed-size ABI v1 records documented in
+Syscalls 22-37 accept only fixed-size ABI v1 records documented in
 `docs/IPC_ABI.md`. Each record starts with `version`, exact structure `size`,
 and zero `flags`. Unknown versions, sizes, flags, reserved fields, or reserved
 message type zero are rejected before object state changes. Messages contain a

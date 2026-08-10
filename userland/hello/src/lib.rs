@@ -43,9 +43,14 @@ pub const SYS_CAPABILITY_CLOSE: u64 = 30;
 pub const SYS_CAPABILITY_DELEGATE: u64 = 31;
 pub const SYS_CAPABILITY_ACCEPT: u64 = 32;
 pub const SYS_FS_SCOPE_CREATE: u64 = 33;
-pub const SYS_FS_READ_CAP: u64 = 34;
-pub const SYS_FS_PUT_CAP: u64 = 35;
-pub const SYS_FS_LIST_CAP: u64 = 36;
+pub const SYS_FS_READ: u64 = 34;
+pub const SYS_FS_PUT: u64 = 35;
+pub const SYS_FS_LIST: u64 = 36;
+pub const SYS_CAPABILITY_QUERY: u64 = 37;
+/// Compatibility alias used by existing Phase 8 demos.
+pub const SYS_FS_READ_CAP: u64 = SYS_FS_READ;
+pub const SYS_FS_PUT_CAP: u64 = SYS_FS_PUT;
+pub const SYS_FS_LIST_CAP: u64 = SYS_FS_LIST;
 
 pub const IPC_ABI_VERSION: u16 = 1;
 pub const IPC_MAX_MESSAGE_BYTES: usize = 256;
@@ -144,6 +149,17 @@ pub struct IpcAcceptV1 {
 }
 
 #[repr(C)]
+pub struct IpcCapQueryV1 {
+    pub version: u16,
+    pub size: u16,
+    pub flags: u32,
+    pub handle: u64,
+    pub rights: u32,
+    pub object_kind: u32,
+    pub reserved: u64,
+}
+
+#[repr(C)]
 pub struct IpcDelegateV1 {
     pub version: u16,
     pub size: u16,
@@ -188,6 +204,7 @@ const _: [(); 304] = [(); core::mem::size_of::<IpcMessageV1>()];
 const _: [(); 16] = [(); core::mem::size_of::<IpcEndpointCreateV1>()];
 const _: [(); 16] = [(); core::mem::size_of::<IpcHandleV1>()];
 const _: [(); 16] = [(); core::mem::size_of::<IpcAcceptV1>()];
+const _: [(); 32] = [(); core::mem::size_of::<IpcCapQueryV1>()];
 const _: [(); 160] = [(); core::mem::size_of::<IpcDelegateV1>()];
 const _: [(); 136] = [(); core::mem::size_of::<IpcFsScopeV1>()];
 const _: [(); 176] = [(); core::mem::size_of::<IpcFsRequestV1>()];
@@ -236,6 +253,24 @@ pub fn ipc_accept(timeout_ticks: u64) -> i64 {
         timeout_ticks,
     };
     ipc_struct_call(SYS_CAPABILITY_ACCEPT, &mut value)
+}
+
+pub fn ipc_capability_query(handle: u64) -> Result<(u32, u32), i64> {
+    let mut value = IpcCapQueryV1 {
+        version: IPC_ABI_VERSION,
+        size: core::mem::size_of::<IpcCapQueryV1>() as u16,
+        flags: 0,
+        handle,
+        rights: 0,
+        object_kind: 0,
+        reserved: 0,
+    };
+    let result = ipc_struct_call(SYS_CAPABILITY_QUERY, &mut value);
+    if result < 0 {
+        Err(result)
+    } else {
+        Ok((value.rights, value.object_kind))
+    }
 }
 
 pub fn ipc_delegate(source: u64, target_pid: u32, rights: u32, path: &[u8]) -> i64 {

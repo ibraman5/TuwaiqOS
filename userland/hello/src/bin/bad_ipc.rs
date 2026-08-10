@@ -42,10 +42,11 @@ extern "C" fn rust_main() -> ! {
         (SYS_CAPABILITY_CLOSE, 16),
         (SYS_CAPABILITY_DELEGATE, 160),
         (SYS_CAPABILITY_ACCEPT, 16),
+        (SYS_CAPABILITY_QUERY, 32),
         (SYS_FS_SCOPE_CREATE, 136),
-        (SYS_FS_READ_CAP, 176),
-        (SYS_FS_PUT_CAP, 176),
-        (SYS_FS_LIST_CAP, 176),
+        (SYS_FS_READ, 176),
+        (SYS_FS_PUT, 176),
+        (SYS_FS_LIST, 176),
     ] {
         for pointer in [0, NONCANONICAL, KERNEL, UNMAPPED] {
             if raw(number, pointer, structure_size) != IPC_ERR_INVALID {
@@ -81,6 +82,20 @@ extern "C" fn rust_main() -> ! {
     let endpoint = structure(SYS_ENDPOINT_CREATE, &mut create);
     if endpoint <= 0 {
         fail(b"bad-ipc: endpoint create");
+    }
+    match ipc_capability_query(endpoint as u64) {
+        Ok((rights, kind))
+            if rights
+                == (IPC_RIGHT_SEND
+                    | IPC_RIGHT_RECEIVE
+                    | IPC_RIGHT_REPLY
+                    | IPC_RIGHT_DELEGATE
+                    | IPC_RIGHT_CLOSE)
+                && kind == 1 => {}
+        _ => fail(b"bad-ipc: capability query"),
+    }
+    if ipc_capability_query(0x55aa_dead_beef).is_ok() {
+        fail(b"bad-ipc: forged query handle");
     }
 
     let mut malformed = IpcMessageV1::new(endpoint as u64, 1, 0);
@@ -192,21 +207,21 @@ extern "C" fn rust_main() -> ! {
         out_len: 8,
         path: [0; 120],
     };
-    if structure(SYS_FS_READ_CAP, &mut bad_read) != IPC_ERR_INVALID {
+    if structure(SYS_FS_READ, &mut bad_read) != IPC_ERR_INVALID {
         fail(b"bad-ipc: delegated read output pointer");
     }
     bad_read.data_ptr = NONCANONICAL;
     bad_read.data_len = 1;
     bad_read.out_ptr = 0;
     bad_read.out_len = 0;
-    if structure(SYS_FS_PUT_CAP, &mut bad_read) != IPC_ERR_INVALID {
+    if structure(SYS_FS_PUT, &mut bad_read) != IPC_ERR_INVALID {
         fail(b"bad-ipc: delegated write input pointer");
     }
     bad_read.data_ptr = 0;
     bad_read.data_len = 0;
     bad_read.out_ptr = page as u64 + 4092;
     bad_read.out_len = 8;
-    if structure(SYS_FS_LIST_CAP, &mut bad_read) != IPC_ERR_INVALID {
+    if structure(SYS_FS_LIST, &mut bad_read) != IPC_ERR_INVALID {
         fail(b"bad-ipc: delegated list cross-page output");
     }
     if ipc_delegate(
