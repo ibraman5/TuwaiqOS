@@ -75,10 +75,33 @@ deb http://security.ubuntu.com/ubuntu noble-security main restricted universe mu
 EOF
 
 log "install D0 package set"
-mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "${PKG_LIST}")
-chroot "${ROOTFS}" apt-get -o Acquire::Retries=5 update
+mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "${PKG_LIST}" | tr -d '\r')
+[[ ${#PKGS[@]} -gt 0 ]] || die "empty package list: ${PKG_LIST}"
+log "packages=${#PKGS[@]} first=${PKGS[0]}"
+# Ensure chroot has basic mounts for apt/dpkg hooks
+mount --bind /dev "${ROOTFS}/dev" 2>/dev/null || true
+mount --bind /proc "${ROOTFS}/proc" 2>/dev/null || true
+mount --bind /sys "${ROOTFS}/sys" 2>/dev/null || true
+mkdir -p "${ROOTFS}/dev/pts"
+mount -t devpts devpts "${ROOTFS}/dev/pts" 2>/dev/null || true
+chroot_umount() {
+  umount "${ROOTFS}/dev/pts" 2>/dev/null || true
+  umount "${ROOTFS}/dev" 2>/dev/null || true
+  umount "${ROOTFS}/proc" 2>/dev/null || true
+  umount "${ROOTFS}/sys" 2>/dev/null || true
+}
+trap chroot_umount EXIT
+# Drop stale/partial indexes from debootstrap so apt must fetch full component lists.
+rm -rf "${ROOTFS}/var/lib/apt/lists/"*
+chroot "${ROOTFS}" apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update
+if ! ls "${ROOTFS}/var/lib/apt/lists/"*_main_binary-amd64_Packages >/dev/null 2>&1; then
+  die "apt indexes missing main amd64 Packages after update"
+fi
+chroot "${ROOTFS}" apt-cache policy linux-image-generic | head -n 8 || true
 chroot "${ROOTFS}" apt-get -o Acquire::Retries=5 install -y --no-install-recommends "${PKGS[@]}"
 chroot "${ROOTFS}" apt-get clean
+chroot_umount
+trap - EXIT
 
 log "create default user tuwaiq (password: tuwaiq) — change after first boot"
 chroot "${ROOTFS}" useradd -m -s /bin/bash -G sudo,video,audio,plugdev tuwaiq || true

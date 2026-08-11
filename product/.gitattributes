@@ -1,0 +1,4 @@
+# Keep product shell scripts and package lists LF-only for Linux builders.
+product/**/*.sh text eol=lf
+product/packages/*.list text eol=lf
+scripts/build-product.sh text eol=lf
