@@ -1,0 +1,10 @@
+[package]
+name = "tuwaiq-platform-surfaces"
+version = "0.1.0"
+edition = "2021"
+description = "D0 scaffold for Tuwaiq Platform API surface names (no runtime services yet)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"

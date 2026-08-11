@@ -2,6 +2,13 @@
 /userland/hello/target
 **/*.img
 **/*.iso
+**/*.raw
+**/*.qcow2
 **/*.pdb
 .DS_Store
 Thumbs.db
+
+# Product D0 build outputs (never commit images)
+/product/out/
+/product/build/work/
+/platform/services/target/

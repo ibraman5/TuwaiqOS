@@ -1,0 +1,45 @@
+# Packages for TuwaiqOS Product D0 (Ubuntu 24.04)
+# One package per line. Comments allowed.
+
+# Kernel / firmware
+linux-image-generic
+linux-firmware
+intel-microcode
+amd64-microcode
+
+# Display manager + Plasma (Wayland)
+sddm
+sddm-theme-breeze
+plasma-desktop
+plasma-workspace-wayland
+plasma-wayland-protocols
+kwin-wayland
+systemsettings
+plasma-nm
+plasma-pa
+dolphin
+konsole
+kate
+breeze
+breeze-icon-theme
+fonts-noto
+fonts-noto-core
+fonts-noto-ui-core
+fonts-noto-color-emoji
+
+# Base desktop utilities
+network-manager
+pipewire
+wireplumber
+mesa-vulkan-drivers
+xdg-desktop-portal-kde
+dbus-x11
+sudo
+locales
+locales-all
+
+# Arabic + English locale support
+language-pack-en
+language-pack-ar
+language-pack-kde-en
+language-pack-kde-ar
