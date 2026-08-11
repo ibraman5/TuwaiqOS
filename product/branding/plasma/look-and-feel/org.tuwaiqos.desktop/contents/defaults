@@ -1,0 +1,11 @@
+[Wallpaper]
+defaultWallpaperTheme=TuwaiqOS
+defaultFileSuffix=.svg
+defaultWidth=1920
+defaultHeight=1080
+
+[KDE]
+LookAndFeelPackage=org.tuwaiqos.desktop
+
+[org.kde.krunner.desktop]
+Enabled=true
