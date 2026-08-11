@@ -40,8 +40,18 @@ if ($src -match '^[A-Za-z]:') {
     $src = "/${drive}" + $src.Substring(2)
 }
 
+# Linux-backed volume for debootstrap/rootfs (Windows bind mounts break dpkg extract).
+Write-Host "[build-product] ensuring Docker volume tuwaiqos-d0-work"
+docker volume create tuwaiqos-d0-work | Out-Null
+
 Write-Host "[build-product] running privileged disk build (long)"
-docker run --rm --privileged -v "${src}:/src" -w /src tuwaiqos-product-builder:d0 bash product/build/build-rootfs-disk.sh
+docker run --rm --privileged `
+  -v "${src}:/src" `
+  -v "tuwaiqos-d0-work:/work" `
+  -e "TUWAIQ_WORK=/work" `
+  -w /src `
+  tuwaiqos-product-builder:d0 `
+  bash product/build/build-rootfs-disk.sh
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host "[build-product] artifacts:"

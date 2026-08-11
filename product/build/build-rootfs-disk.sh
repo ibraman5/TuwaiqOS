@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 # Build a bootable TuwaiqOS Product D0 disk image inside Linux/Docker.
 # Output: product/out/tuwaiqos-d0.raw (+ .qcow2 when qemu-img exists)
+#
+# IMPORTANT: debootstrap/rootfs must live on a Linux filesystem (Docker volume
+# or container-local path). Bind-mounted Windows/NTFS paths fail package extract
+# ("tar failed") because of device nodes / permissions.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT_DIR="${ROOT_DIR}/product/out"
-WORK="${ROOT_DIR}/product/build/work"
+# Prefer Linux-backed work dir (docker volume at /work). Fall back only for native Linux hosts.
+WORK="${TUWAIQ_WORK:-/work}"
+if [[ ! -d "${WORK}" ]] || [[ "${WORK}" == /work && ! -w /work ]]; then
+  WORK="${ROOT_DIR}/product/build/work"
+fi
 ROOTFS="${WORK}/rootfs"
+DISK_BUILD="${WORK}/tuwaiqos-d0.raw"
 DISK="${OUT_DIR}/tuwaiqos-d0.raw"
 PKG_LIST="${ROOT_DIR}/product/packages/d0-ubuntu2404.list"
-DISK_SIZE_GB="${TUWAIQ_DISK_SIZE_GB:-8}"
+DISK_SIZE_GB="${TUWAIQ_DISK_SIZE_GB:-12}"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -19,6 +28,7 @@ die() { printf '[build-product] ERROR: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
 log "repo=${ROOT_DIR}"
+log "work=${WORK} (must be Linux FS for debootstrap)"
 need debootstrap
 need chroot
 need tar
@@ -26,6 +36,7 @@ need truncate
 need parted
 need losetup
 need mkfs.ext4
+need mkfs.vfat
 need mount
 need grub-install
 need rsync
@@ -78,15 +89,15 @@ systemdBoot=false
 EOF
 chroot "${ROOTFS}" chown -R tuwaiq:tuwaiq /home/tuwaiq
 
-log "create disk image (${DISK_SIZE_GB}G)"
-rm -f "${DISK}"
-truncate -s "${DISK_SIZE_GB}G" "${DISK}"
-parted -s "${DISK}" mklabel gpt
-parted -s "${DISK}" mkpart ESP fat32 1MiB 512MiB
-parted -s "${DISK}" set 1 esp on
-parted -s "${DISK}" mkpart root ext4 512MiB 100%
+log "create disk image (${DISK_SIZE_GB}G) on Linux work volume"
+rm -f "${DISK_BUILD}"
+truncate -s "${DISK_SIZE_GB}G" "${DISK_BUILD}"
+parted -s "${DISK_BUILD}" mklabel gpt
+parted -s "${DISK_BUILD}" mkpart ESP fat32 1MiB 512MiB
+parted -s "${DISK_BUILD}" set 1 esp on
+parted -s "${DISK_BUILD}" mkpart root ext4 512MiB 100%
 
-LOOP="$(losetup --find --show --partscan "${DISK}")"
+LOOP="$(losetup --find --show --partscan "${DISK_BUILD}")"
 cleanup() {
   sync || true
   umount "${WORK}/mnt/boot/efi" 2>/dev/null || true
@@ -132,18 +143,36 @@ mount --bind /sys "${WORK}/mnt/sys"
 
 log "install GRUB (UEFI + BIOS where possible)"
 chroot "${WORK}/mnt" apt-get update
-chroot "${WORK}/mnt" apt-get install -y --no-install-recommends grub-efi-amd64 grub-pc-bin grub-efi-amd64-bin shim-signed || true
+chroot "${WORK}/mnt" apt-get install -y --no-install-recommends grub-efi-amd64 grub-pc grub-pc-bin grub-efi-amd64-bin shim-signed || true
+
+log "enable serial console for headless smoke (keeps graphical target)"
+if [[ -f "${WORK}/mnt/etc/default/grub" ]]; then
+  sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash console=tty0 console=ttyS0,115200n8"/' \
+    "${WORK}/mnt/etc/default/grub" || true
+  grep -q '^GRUB_TERMINAL=' "${WORK}/mnt/etc/default/grub" || \
+    echo 'GRUB_TERMINAL="console serial"' >> "${WORK}/mnt/etc/default/grub"
+  grep -q '^GRUB_SERIAL_COMMAND=' "${WORK}/mnt/etc/default/grub" || \
+    echo 'GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"' >> "${WORK}/mnt/etc/default/grub"
+fi
+
 chroot "${WORK}/mnt" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=tuwaiqos --recheck || true
-# BIOS fallback for QEMU -bios default
+# BIOS fallback for QEMU default SeaBIOS
 chroot "${WORK}/mnt" grub-install --target=i386-pc --recheck "${LOOP}" || true
 chroot "${WORK}/mnt" update-grub || true
 
 cleanup
 trap - EXIT
 
+log "export disk image to host-visible out/"
+mkdir -p "${OUT_DIR}"
+# Prefer hardlink when same filesystem; otherwise copy.
+if ! ln -f "${DISK_BUILD}" "${DISK}" 2>/dev/null; then
+  rsync -a --info=progress2 "${DISK_BUILD}" "${DISK}"
+fi
+
 if command -v qemu-img >/dev/null 2>&1; then
   log "writing qcow2"
-  qemu-img convert -O qcow2 "${DISK}" "${OUT_DIR}/tuwaiqos-d0.qcow2"
+  qemu-img convert -O qcow2 "${DISK_BUILD}" "${OUT_DIR}/tuwaiqos-d0.qcow2"
 fi
 
 SIZE_BYTES="$(stat -c%s "${DISK}" 2>/dev/null || wc -c < "${DISK}")"

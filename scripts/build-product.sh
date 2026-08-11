@@ -15,10 +15,15 @@ echo "[build-product] building builder image"
 docker build -t tuwaiqos-product-builder:d0 -f product/build/Dockerfile product/build
 
 mkdir -p product/out product/build/work
-# Do not commit outputs
+echo "[build-product] ensuring Docker volume tuwaiqos-d0-work"
+docker volume create tuwaiqos-d0-work >/dev/null
+
+# Debootstrap must run on a Linux filesystem volume — not a Windows bind mount.
 echo "[build-product] running privileged disk build (may take a long time)"
 docker run --rm --privileged \
   -v "${ROOT_DIR}:/src" \
+  -v tuwaiqos-d0-work:/work \
+  -e TUWAIQ_WORK=/work \
   -w /src \
   tuwaiqos-product-builder:d0 \
   bash product/build/build-rootfs-disk.sh
