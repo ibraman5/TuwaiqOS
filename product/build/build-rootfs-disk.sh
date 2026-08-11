@@ -19,6 +19,8 @@ DISK_BUILD="${WORK}/tuwaiqos-d0.raw"
 DISK="${OUT_DIR}/tuwaiqos-d0.raw"
 PKG_LIST="${ROOT_DIR}/product/packages/d0-ubuntu2404.list"
 DISK_SIZE_GB="${TUWAIQ_DISK_SIZE_GB:-12}"
+MIRROR="${TUWAIQ_UBUNTU_MIRROR:-http://archive.ubuntu.com/ubuntu}"
+DEBOOTSTRAP_RETRIES="${TUWAIQ_DEBOOTSTRAP_RETRIES:-5}"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -29,6 +31,7 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
 log "repo=${ROOT_DIR}"
 log "work=${WORK} (must be Linux FS for debootstrap)"
+log "mirror=${MIRROR}"
 need debootstrap
 need chroot
 need tar
@@ -46,22 +49,35 @@ rm -rf "${ROOTFS}"
 mkdir -p "${ROOTFS}"
 
 log "debootstrap ubuntu 24.04 (noble)"
-debootstrap --arch=amd64 --variant=minbase \
-  --components=main,universe \
-  --include=systemd-sysv,sudo,locales \
-  noble "${ROOTFS}" http://archive.ubuntu.com/ubuntu
+attempt=1
+while true; do
+  rm -rf "${ROOTFS}"
+  mkdir -p "${ROOTFS}"
+  if debootstrap --arch=amd64 --variant=minbase \
+    --components=main,universe \
+    --include=systemd-sysv,sudo,locales \
+    noble "${ROOTFS}" "${MIRROR}"; then
+    break
+  fi
+  if (( attempt >= DEBOOTSTRAP_RETRIES )); then
+    die "debootstrap failed after ${DEBOOTSTRAP_RETRIES} attempts (network/mirror)"
+  fi
+  log "debootstrap attempt ${attempt} failed; retrying in $((attempt * 15))s"
+  sleep $((attempt * 15))
+  attempt=$((attempt + 1))
+done
 
 log "configure apt sources"
-cat > "${ROOTFS}/etc/apt/sources.list" <<'EOF'
-deb http://archive.ubuntu.com/ubuntu noble main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu noble-security main restricted universe multiverse
+cat > "${ROOTFS}/etc/apt/sources.list" <<EOF
+deb ${MIRROR} noble main restricted universe multiverse
+deb ${MIRROR} noble-updates main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse
 EOF
 
 log "install D0 package set"
 mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "${PKG_LIST}")
-chroot "${ROOTFS}" apt-get update
-chroot "${ROOTFS}" apt-get install -y --no-install-recommends "${PKGS[@]}"
+chroot "${ROOTFS}" apt-get -o Acquire::Retries=5 update
+chroot "${ROOTFS}" apt-get -o Acquire::Retries=5 install -y --no-install-recommends "${PKGS[@]}"
 chroot "${ROOTFS}" apt-get clean
 
 log "create default user tuwaiq (password: tuwaiq) — change after first boot"
