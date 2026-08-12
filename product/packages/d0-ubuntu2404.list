@@ -13,12 +13,14 @@ linux-image-virtual
 # intel-microcode
 # amd64-microcode
 
-# Display manager + Plasma (Wayland)
+# Display manager + Plasma (X11 D0 path; Wayland remains installed for later)
 sddm
 sddm-theme-breeze
 plasma-desktop
+plasma-workspace
 plasma-workspace-wayland
 plasma-wayland-protocols
+kwin-x11
 kwin-wayland
 systemsettings
 plasma-nm
@@ -32,6 +34,14 @@ fonts-noto
 fonts-noto-core
 fonts-noto-ui-core
 fonts-noto-color-emoji
+
+# X11 runtime required for QEMU D0 graphical acceptance
+xserver-xorg
+xserver-xorg-core
+xserver-xorg-video-vesa
+xserver-xorg-video-fbdev
+xinit
+x11-xserver-utils
 
 # Base desktop utilities
 network-manager

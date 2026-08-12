@@ -12,7 +12,9 @@ $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
 if (-not $Image) {
-    $Image = Join-Path $Root "product\out\tuwaiqos-d0.qcow2"
+    $proof = Join-Path $Root "product\out\d0-proof.qcow2"
+    $canon = Join-Path $Root "product\out\tuwaiqos-d0.qcow2"
+    $Image = if (Test-Path $proof) { $proof } else { $canon }
 }
 if (-not (Test-Path $Image)) { throw "Image not found: $Image" }
 
@@ -30,15 +32,18 @@ $displayArgs = switch ($Display) {
     "vnc" { @("-vnc", ":1") }
 }
 
-# Use USB tablet for mouse; VGA std for broad host compatibility
+# IDE disk for SeaBIOS+GRUB reliability; virtio-vga for guest DRM (linux-image-virtual
+# has virtio-gpu but not bochs). USB tablet for mouse.
 $argList = @(
     "-machine", "q35",
-    "-m", "4096",
+    "-m", "3072",
     "-smp", "2",
-    "-drive", "format=qcow2,file=$Image,if=virtio",
+    "-drive", "file=$Image,format=qcow2,if=none,id=disk0",
+    "-device", "ich9-ahci,id=ahci",
+    "-device", "ide-hd,drive=disk0,bus=ahci.0",
+    "-device", "virtio-vga",
     "-usb",
     "-device", "usb-tablet",
-    "-vga", "std",
     "-serial", "file:$serial",
     "-monitor", "tcp:127.0.0.1:4444,server,nowait",
     "-no-reboot"
