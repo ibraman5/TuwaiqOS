@@ -57,6 +57,7 @@ cp "${CFG}/locale.conf" "${ROOT}/etc/locale.conf"
 
 # Default Plasma wallpaper hint for new users
 install -d "${ROOT}/etc/xdg/plasma-org.kde.plasma.desktop-appletsrc.d"
+install -d "${ROOT}/usr/share/tuwaiqos"
 cat > "${ROOT}/usr/share/tuwaiqos/README-branding.txt" <<'EOF'
 TuwaiqOS D0 branding applied.
 Look-and-feel: org.tuwaiqos.desktop
