@@ -142,6 +142,12 @@ mount_disk_partitions() {
   mount "${ESP_PART}" "${WORK}/mnt/boot/efi"
 }
 
+disk_image_has_rootfs() {
+  [[ -f "${WORK}/mnt/etc/os-release" ]] && \
+    [[ -d "${WORK}/mnt/usr/share/plasma" ]] && \
+    { [[ -x "${WORK}/mnt/usr/sbin/sddm" ]] || [[ -x "${WORK}/mnt/usr/bin/sddm" ]]; }
+}
+
 log "repo=${ROOT_DIR}"
 log "work=${WORK} (must be Linux FS for debootstrap)"
 log "mirror=${MIRROR} resume=${RESUME}"
@@ -307,7 +313,11 @@ else
   mount_disk_partitions
 fi
 
-copy_rootfs_to_disk
+if disk_image_has_rootfs; then
+  log "resume: rootfs already on disk image; skipping tar copy"
+else
+  copy_rootfs_to_disk
+fi
 
 # Rewrite fstab with stable PARTUUIDs
 P1="$(blkid -s PARTUUID -o value "${ESP_PART}")"
@@ -321,9 +331,9 @@ mount --bind /dev "${WORK}/mnt/dev"
 mount --bind /proc "${WORK}/mnt/proc"
 mount --bind /sys "${WORK}/mnt/sys"
 
-log "install GRUB (UEFI + BIOS where possible)"
+log "install GRUB (BIOS/SeaBIOS — D0 QEMU default)"
 chroot "${WORK}/mnt" apt-get update
-chroot "${WORK}/mnt" apt-get install -y --no-install-recommends grub-efi-amd64 grub-pc grub-pc-bin grub-efi-amd64-bin shim-signed || true
+chroot "${WORK}/mnt" apt-get install -y --no-install-recommends grub-pc grub-pc-bin
 
 log "enable serial console for headless smoke (keeps graphical target)"
 if [[ -f "${WORK}/mnt/etc/default/grub" ]]; then
@@ -335,27 +345,21 @@ if [[ -f "${WORK}/mnt/etc/default/grub" ]]; then
     echo 'GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"' >> "${WORK}/mnt/etc/default/grub"
 fi
 
-chroot "${WORK}/mnt" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=tuwaiqos --recheck || true
-# BIOS fallback for QEMU default SeaBIOS
-chroot "${WORK}/mnt" grub-install --target=i386-pc --recheck "${LOOP}" || true
-chroot "${WORK}/mnt" update-grub || true
+chroot "${WORK}/mnt" grub-install --target=i386-pc --bootloader-id=tuwaiqos --recheck "${LOOP}"
+chroot "${WORK}/mnt" update-grub
 
 cleanup
 trap - EXIT
 
-log "export disk image to host-visible out/"
-mkdir -p "${OUT_DIR}"
-# Prefer hardlink when same filesystem; otherwise copy.
-if ! ln -f "${DISK_BUILD}" "${DISK}" 2>/dev/null; then
-  rsync -a --info=progress2 "${DISK_BUILD}" "${DISK}"
-fi
-
+log "finalize disk image on work volume (host export deferred)"
 if command -v qemu-img >/dev/null 2>&1; then
-  log "writing qcow2"
-  qemu-img convert -O qcow2 "${DISK_BUILD}" "${OUT_DIR}/tuwaiqos-d0.qcow2"
+  log "writing qcow2 on work volume"
+  qemu-img convert -O qcow2 "${DISK_BUILD}" "${WORK}/tuwaiqos-d0.qcow2"
 fi
 
-SIZE_BYTES="$(stat -c%s "${DISK}" 2>/dev/null || wc -c < "${DISK}")"
-log "OUTPUT_PATH=${DISK}"
+SIZE_BYTES="$(stat -c%s "${DISK_BUILD}")"
+log "OUTPUT_PATH=${DISK_BUILD}"
 log "OUTPUT_SIZE_BYTES=${SIZE_BYTES}"
+log "HOST_EXPORT=deferred"
+echo 'disk-finalized' >> "${STAGE_FILE}"
 log "done"
