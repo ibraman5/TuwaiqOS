@@ -278,6 +278,7 @@ disk_has_gpt() {
 
 cleanup() {
   sync_disks
+  umount "${WORK}/mnt/dev/pts" 2>/dev/null || true
   umount "${WORK}/mnt/boot/efi" 2>/dev/null || true
   umount "${WORK}/mnt/dev" 2>/dev/null || true
   umount "${WORK}/mnt/proc" 2>/dev/null || true
@@ -330,6 +331,8 @@ EOF
 mount --bind /dev "${WORK}/mnt/dev"
 mount --bind /proc "${WORK}/mnt/proc"
 mount --bind /sys "${WORK}/mnt/sys"
+mkdir -p "${WORK}/mnt/dev/pts"
+mount -t devpts devpts "${WORK}/mnt/dev/pts"
 
 log "install GRUB (BIOS/SeaBIOS — D0 QEMU default)"
 chroot "${WORK}/mnt" apt-get update
