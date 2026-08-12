@@ -19,8 +19,8 @@ DISK_BUILD="${WORK}/tuwaiqos-d0.raw"
 DISK="${OUT_DIR}/tuwaiqos-d0.raw"
 PKG_LIST="${ROOT_DIR}/product/packages/d0-ubuntu2404.list"
 DISK_SIZE_GB="${TUWAIQ_DISK_SIZE_GB:-12}"
-MIRROR="${TUWAIQ_UBUNTU_MIRROR:-http://archive.ubuntu.com/ubuntu}"
-DEBOOTSTRAP_RETRIES="${TUWAIQ_DEBOOTSTRAP_RETRIES:-5}"
+MIRROR="${TUWAIQ_UBUNTU_MIRROR:-http://azure.archive.ubuntu.com/ubuntu}"
+DEBOOTSTRAP_RETRIES="${TUWAIQ_DEBOOTSTRAP_RETRIES:-8}"
 
 export DEBIAN_FRONTEND=noninteractive
 

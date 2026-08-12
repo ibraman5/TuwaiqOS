@@ -49,7 +49,8 @@ docker run --rm --privileged `
   -v "${src}:/src" `
   -v "tuwaiqos-d0-work:/work" `
   -e "TUWAIQ_WORK=/work" `
-  -e "TUWAIQ_DEBOOTSTRAP_RETRIES=5" `
+  -e "TUWAIQ_DEBOOTSTRAP_RETRIES=8" `
+  -e "TUWAIQ_UBUNTU_MIRROR=http://azure.archive.ubuntu.com/ubuntu" `
   -w /src `
   tuwaiqos-product-builder:d0 `
   bash product/build/build-rootfs-disk.sh
