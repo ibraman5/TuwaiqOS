@@ -334,9 +334,8 @@ mount --bind /sys "${WORK}/mnt/sys"
 mkdir -p "${WORK}/mnt/dev/pts"
 mount -t devpts devpts "${WORK}/mnt/dev/pts"
 
-log "install GRUB (BIOS/SeaBIOS — D0 QEMU default)"
-chroot "${WORK}/mnt" apt-get update
-chroot "${WORK}/mnt" apt-get install -y --no-install-recommends grub-pc grub-pc-bin
+log "install GRUB from builder (UEFI — ESP present on GPT disk)"
+mkdir -p "${WORK}/mnt/boot/grub" "${WORK}/mnt/boot/efi/EFI/tuwaiqos"
 
 log "enable serial console for headless smoke (keeps graphical target)"
 if [[ -f "${WORK}/mnt/etc/default/grub" ]]; then
@@ -348,8 +347,43 @@ if [[ -f "${WORK}/mnt/etc/default/grub" ]]; then
     echo 'GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"' >> "${WORK}/mnt/etc/default/grub"
 fi
 
-chroot "${WORK}/mnt" grub-install --target=i386-pc --bootloader-id=tuwaiqos --recheck "${LOOP}"
-chroot "${WORK}/mnt" update-grub
+grub-install --target=x86_64-efi --efi-directory="${WORK}/mnt/boot/efi" \
+  --boot-directory="${WORK}/mnt/boot" --root-directory="${WORK}/mnt" \
+  --bootloader-id=tuwaiqos --recheck --no-nvram || \
+  log "UEFI grub-install skipped/failed (host may lack efivars; SeaBIOS path below)"
+
+# SeaBIOS/QEMU without OVMF: embed GRUB on GPT disk (requires --force without bios_grub part).
+grub-install --target=i386-pc --boot-directory="${WORK}/mnt/boot" --root-directory="${WORK}/mnt" \
+  --force --recheck "${LOOP}"
+
+if command -v grub-mkconfig >/dev/null 2>&1; then
+  grub-mkconfig -o "${WORK}/mnt/boot/grub/grub.cfg" --root-directory="${WORK}/mnt" 2>/dev/null || \
+    grub-mkconfig -o "${WORK}/mnt/boot/grub/grub.cfg" || true
+fi
+
+if [[ ! -s "${WORK}/mnt/boot/grub/grub.cfg" ]]; then
+  VMLINUZ="$(ls -1 "${WORK}/mnt/boot"/vmlinuz-* 2>/dev/null | tail -1 || true)"
+  INITRD="$(ls -1 "${WORK}/mnt/boot"/initrd.img-* 2>/dev/null | tail -1 || true)"
+  [[ -n "${VMLINUZ}" ]] || die "no vmlinuz found under ${WORK}/mnt/boot"
+  VMLINUZ_REL="${VMLINUZ#${WORK}/mnt}"
+  INITRD_REL="${INITRD#${WORK}/mnt}"
+  log "writing minimal grub.cfg kernel=${VMLINUZ_REL}"
+  cat > "${WORK}/mnt/boot/grub/grub.cfg" <<EOF
+set timeout=5
+set default=0
+menuentry "TuwaiqOS D0" {
+  linux ${VMLINUZ_REL} root=PARTUUID=${P2} ro quiet splash console=tty0 console=ttyS0,115200n8
+  initrd ${INITRD_REL}
+}
+EOF
+fi
+
+test -s "${WORK}/mnt/boot/grub/grub.cfg" || die "grub.cfg not generated"
+if [[ ! -f "${WORK}/mnt/boot/grub/i386-pc/core.img" ]] && \
+   [[ ! -f "${WORK}/mnt/boot/efi/EFI/tuwaiqos/grubx64.efi" ]]; then
+  find "${WORK}/mnt/boot" -maxdepth 4 -type f \( -name 'core.img' -o -name 'grubx64.efi' \) -print
+  die "grub boot artifacts missing after install"
+fi
 
 cleanup
 trap - EXIT
