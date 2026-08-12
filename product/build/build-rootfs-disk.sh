@@ -55,6 +55,65 @@ chroot_umount() {
   umount "${ROOTFS}/sys" 2>/dev/null || true
 }
 
+verify_disk_partition_table() {
+  local disk="$1"
+  log "verify GPT layout on ${disk}"
+  parted -s "${disk}" unit MiB print
+  local count
+  count="$(parted -s "${disk}" unit s print | awk '/^ [0-9]+/{c++} END{print c+0}')"
+  [[ "${count}" -ge 2 ]] || die "disk image missing expected GPT partitions (found ${count})"
+}
+
+# Docker builder containers often lack udev: kernel partitions exist (lsblk) but
+# /dev/loopNpM nodes may be missing. Discover via lsblk and mknod when needed.
+ensure_partition_nodes() {
+  local loop="$1"
+  if command -v partx >/dev/null 2>&1; then
+    partx -a "${loop}" 2>/dev/null || partx -u "${loop}" 2>/dev/null || true
+  fi
+  blockdev --rereadpt "${loop}" 2>/dev/null || true
+  partprobe "${loop}" 2>/dev/null || true
+
+  while read -r name majmin type; do
+    [[ "${type}" == "part" ]] || continue
+    local node="/dev/${name}"
+    if [[ ! -e "${node}" ]]; then
+      local maj="${majmin%%:*}" min="${majmin##*:}"
+      mknod "${node}" b "${maj}" "${min}"
+      log "created missing partition node ${node} (${maj}:${min})"
+    fi
+  done < <(lsblk -ln -o NAME,MAJ:MIN,TYPE "${loop}")
+}
+
+discover_loop_partitions() {
+  local disk="$1"
+  local attempt=1
+  local loop=""
+  while (( attempt <= 3 )); do
+    loop="$(losetup --find --show --partscan "${disk}")"
+    log "attached loop ${loop} (attempt ${attempt}/3)"
+    log "losetup -l:"; losetup -l "${loop}" || losetup -a || true
+    ensure_partition_nodes "${loop}"
+    mapfile -t _parts < <(lsblk -ln -o NAME,TYPE "${loop}" | awk '$2=="part"{print "/dev/" $1}')
+    if ((${#_parts[@]} >= 2)) && [[ -e "${_parts[0]}" && -e "${_parts[1]}" ]]; then
+      LOOP="${loop}"
+      ESP_PART="${_parts[0]}"
+      ROOT_PART="${_parts[1]}"
+      log "partition map ESP=${ESP_PART} ROOT=${ROOT_PART}"
+      lsblk -ln -o NAME,MAJ:MIN,TYPE,SIZE "${loop}"
+      return 0
+    fi
+    log "partition nodes not ready; lsblk for ${loop}:"
+    lsblk "${loop}" || lsblk || true
+    ls -la "${loop}"* 2>/dev/null || true
+    losetup -d "${loop}" 2>/dev/null || true
+    loop=""
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+  die "loop partitions not found for disk image (no usable /dev nodes after 3 attempts)"
+}
+
 log "repo=${ROOT_DIR}"
 log "work=${WORK} (must be Linux FS for debootstrap)"
 log "mirror=${MIRROR} resume=${RESUME}"
@@ -185,30 +244,12 @@ parted -s "${DISK_BUILD}" mklabel gpt
 parted -s "${DISK_BUILD}" mkpart ESP fat32 1MiB 512MiB
 parted -s "${DISK_BUILD}" set 1 esp on
 parted -s "${DISK_BUILD}" mkpart root ext4 512MiB 100%
+verify_disk_partition_table "${DISK_BUILD}"
 
-LOOP=""
-loop_attempt=1
-while (( loop_attempt <= 3 )); do
-  LOOP="$(losetup --find --show --partscan "${DISK_BUILD}")"
-  partprobe "${LOOP}" 2>/dev/null || true
-  blockdev --rereadpt "${LOOP}" 2>/dev/null || true
-  if command -v partx >/dev/null 2>&1; then
-    partx -u "${LOOP}" 2>/dev/null || true
-  fi
-  for _ in $(seq 1 60); do
-    [[ -e "${LOOP}p1" && -e "${LOOP}p2" ]] && break
-    sleep 0.5
-  done
-  if [[ -e "${LOOP}p2" ]]; then
-    break
-  fi
-  log "loop partitions not ready for ${LOOP} (attempt ${loop_attempt}/3)"
-  losetup -d "${LOOP}" 2>/dev/null || true
-  LOOP=""
-  loop_attempt=$((loop_attempt + 1))
-  sleep 2
-done
-[[ -n "${LOOP}" && -e "${LOOP}p2" ]] || die "loop partitions not found for disk image"
+ESP_PART=""
+ROOT_PART=""
+discover_loop_partitions "${DISK_BUILD}"
+
 cleanup() {
   sync || true
   umount "${WORK}/mnt/boot/efi" 2>/dev/null || true
@@ -220,22 +261,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkfs.vfat -F32 "${LOOP}p1"
-mkfs.ext4 -F "${LOOP}p2"
+mkfs.vfat -F32 "${ESP_PART}"
+mkfs.ext4 -F "${ROOT_PART}"
 
 mkdir -p "${WORK}/mnt"
-mount "${LOOP}p2" "${WORK}/mnt"
+mount "${ROOT_PART}" "${WORK}/mnt"
 mkdir -p "${WORK}/mnt/boot/efi"
-mount "${LOOP}p1" "${WORK}/mnt/boot/efi"
+mount "${ESP_PART}" "${WORK}/mnt/boot/efi"
 
 log "copy rootfs"
 rsync -aHAX --info=progress2 "${ROOTFS}/" "${WORK}/mnt/"
 
-echo "${LOOP}p2 / ext4 defaults 0 1" > "${WORK}/mnt/etc/fstab"
-echo "${LOOP}p1 /boot/efi vfat umask=0077 0 1" >> "${WORK}/mnt/etc/fstab"
 # Rewrite fstab with stable PARTUUIDs
-P1="$(blkid -s PARTUUID -o value "${LOOP}p1")"
-P2="$(blkid -s PARTUUID -o value "${LOOP}p2")"
+P1="$(blkid -s PARTUUID -o value "${ESP_PART}")"
+P2="$(blkid -s PARTUUID -o value "${ROOT_PART}")"
 cat > "${WORK}/mnt/etc/fstab" <<EOF
 PARTUUID=${P2} / ext4 defaults 0 1
 PARTUUID=${P1} /boot/efi vfat umask=0077 0 1
