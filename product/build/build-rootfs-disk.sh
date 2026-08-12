@@ -186,7 +186,29 @@ parted -s "${DISK_BUILD}" mkpart ESP fat32 1MiB 512MiB
 parted -s "${DISK_BUILD}" set 1 esp on
 parted -s "${DISK_BUILD}" mkpart root ext4 512MiB 100%
 
-LOOP="$(losetup --find --show --partscan "${DISK_BUILD}")"
+LOOP=""
+loop_attempt=1
+while (( loop_attempt <= 3 )); do
+  LOOP="$(losetup --find --show --partscan "${DISK_BUILD}")"
+  partprobe "${LOOP}" 2>/dev/null || true
+  blockdev --rereadpt "${LOOP}" 2>/dev/null || true
+  if command -v partx >/dev/null 2>&1; then
+    partx -u "${LOOP}" 2>/dev/null || true
+  fi
+  for _ in $(seq 1 60); do
+    [[ -e "${LOOP}p1" && -e "${LOOP}p2" ]] && break
+    sleep 0.5
+  done
+  if [[ -e "${LOOP}p2" ]]; then
+    break
+  fi
+  log "loop partitions not ready for ${LOOP} (attempt ${loop_attempt}/3)"
+  losetup -d "${LOOP}" 2>/dev/null || true
+  LOOP=""
+  loop_attempt=$((loop_attempt + 1))
+  sleep 2
+done
+[[ -n "${LOOP}" && -e "${LOOP}p2" ]] || die "loop partitions not found for disk image"
 cleanup() {
   sync || true
   umount "${WORK}/mnt/boot/efi" 2>/dev/null || true
@@ -197,13 +219,6 @@ cleanup() {
   losetup -d "${LOOP}" 2>/dev/null || true
 }
 trap cleanup EXIT
-
-# Wait for partition nodes
-for _ in $(seq 1 20); do
-  [[ -e "${LOOP}p1" && -e "${LOOP}p2" ]] && break
-  sleep 0.2
-done
-[[ -e "${LOOP}p2" ]] || die "loop partitions not found for ${LOOP}"
 
 mkfs.vfat -F32 "${LOOP}p1"
 mkfs.ext4 -F "${LOOP}p2"
