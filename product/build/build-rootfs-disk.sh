@@ -20,7 +20,9 @@ DISK="${OUT_DIR}/tuwaiqos-d0.raw"
 PKG_LIST="${ROOT_DIR}/product/packages/d0-ubuntu2404.list"
 DISK_SIZE_GB="${TUWAIQ_DISK_SIZE_GB:-12}"
 MIRROR="${TUWAIQ_UBUNTU_MIRROR:-http://azure.archive.ubuntu.com/ubuntu}"
-DEBOOTSTRAP_RETRIES="${TUWAIQ_DEBOOTSTRAP_RETRIES:-8}"
+DEBOOTSTRAP_RETRIES="${TUWAIQ_DEBOOTSTRAP_RETRIES:-3}"
+RESUME="${TUWAIQ_RESUME:-auto}"
+STAGE_FILE="${WORK}/.d0-stage"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -29,9 +31,33 @@ die() { printf '[build-product] ERROR: %s\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
+rootfs_ready() {
+  [[ -f "${ROOTFS}/etc/os-release" && -f "${ROOTFS}/var/lib/dpkg/status" ]]
+}
+
+packages_ready() {
+  [[ -f "${STAGE_FILE}" ]] && grep -qx 'packages-installed' "${STAGE_FILE}" && \
+    chroot "${ROOTFS}" dpkg-query -W plasma-desktop sddm linux-image-virtual >/dev/null 2>&1
+}
+
+chroot_mount() {
+  mount --bind /dev "${ROOTFS}/dev" 2>/dev/null || true
+  mount --bind /proc "${ROOTFS}/proc" 2>/dev/null || true
+  mount --bind /sys "${ROOTFS}/sys" 2>/dev/null || true
+  mkdir -p "${ROOTFS}/dev/pts"
+  mount -t devpts devpts "${ROOTFS}/dev/pts" 2>/dev/null || true
+}
+
+chroot_umount() {
+  umount "${ROOTFS}/dev/pts" 2>/dev/null || true
+  umount "${ROOTFS}/dev" 2>/dev/null || true
+  umount "${ROOTFS}/proc" 2>/dev/null || true
+  umount "${ROOTFS}/sys" 2>/dev/null || true
+}
+
 log "repo=${ROOT_DIR}"
 log "work=${WORK} (must be Linux FS for debootstrap)"
-log "mirror=${MIRROR}"
+log "mirror=${MIRROR} resume=${RESUME}"
 need debootstrap
 need chroot
 need tar
@@ -45,63 +71,87 @@ need grub-install
 need rsync
 
 mkdir -p "${OUT_DIR}" "${WORK}"
-rm -rf "${ROOTFS}"
-mkdir -p "${ROOTFS}"
 
-log "debootstrap ubuntu 24.04 (noble)"
-attempt=1
-while true; do
+if [[ "${RESUME}" == "auto" ]] && rootfs_ready; then
+  log "resume: reusing existing rootfs at ${ROOTFS}"
+else
   rm -rf "${ROOTFS}"
   mkdir -p "${ROOTFS}"
-  if debootstrap --arch=amd64 --variant=minbase \
-    --components=main,universe \
-    --include=systemd-sysv,sudo,locales \
-    noble "${ROOTFS}" "${MIRROR}"; then
-    break
-  fi
-  if (( attempt >= DEBOOTSTRAP_RETRIES )); then
-    die "debootstrap failed after ${DEBOOTSTRAP_RETRIES} attempts (network/mirror)"
-  fi
-  log "debootstrap attempt ${attempt} failed; retrying in $((attempt * 15))s"
-  sleep $((attempt * 15))
-  attempt=$((attempt + 1))
-done
 
-log "configure apt sources"
-cat > "${ROOTFS}/etc/apt/sources.list" <<EOF
+  log "debootstrap ubuntu 24.04 (noble)"
+  attempt=1
+  while true; do
+    rm -rf "${ROOTFS}"
+    mkdir -p "${ROOTFS}"
+    if debootstrap --arch=amd64 --variant=minbase \
+      --components=main,universe \
+      --include=systemd-sysv,sudo,locales \
+      noble "${ROOTFS}" "${MIRROR}"; then
+      break
+    fi
+    if (( attempt >= DEBOOTSTRAP_RETRIES )); then
+      die "debootstrap failed after ${DEBOOTSTRAP_RETRIES} attempts (network/mirror)"
+    fi
+    log "debootstrap attempt ${attempt} failed; retrying in $((attempt * 15))s"
+    sleep $((attempt * 15))
+    attempt=$((attempt + 1))
+  done
+
+  log "configure apt sources"
+  cat > "${ROOTFS}/etc/apt/sources.list" <<EOF
 deb ${MIRROR} noble main restricted universe multiverse
 deb ${MIRROR} noble-updates main restricted universe multiverse
 deb http://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse
 EOF
-
-log "install D0 package set"
-mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "${PKG_LIST}" | tr -d '\r')
-[[ ${#PKGS[@]} -gt 0 ]] || die "empty package list: ${PKG_LIST}"
-log "packages=${#PKGS[@]} first=${PKGS[0]}"
-# Ensure chroot has basic mounts for apt/dpkg hooks
-mount --bind /dev "${ROOTFS}/dev" 2>/dev/null || true
-mount --bind /proc "${ROOTFS}/proc" 2>/dev/null || true
-mount --bind /sys "${ROOTFS}/sys" 2>/dev/null || true
-mkdir -p "${ROOTFS}/dev/pts"
-mount -t devpts devpts "${ROOTFS}/dev/pts" 2>/dev/null || true
-chroot_umount() {
-  umount "${ROOTFS}/dev/pts" 2>/dev/null || true
-  umount "${ROOTFS}/dev" 2>/dev/null || true
-  umount "${ROOTFS}/proc" 2>/dev/null || true
-  umount "${ROOTFS}/sys" 2>/dev/null || true
-}
-trap chroot_umount EXIT
-# Drop stale/partial indexes from debootstrap so apt must fetch full component lists.
-rm -rf "${ROOTFS}/var/lib/apt/lists/"*
-chroot "${ROOTFS}" apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update
-if ! ls "${ROOTFS}/var/lib/apt/lists/"*_main_binary-amd64_Packages >/dev/null 2>&1; then
-  die "apt indexes missing main amd64 Packages after update"
 fi
-chroot "${ROOTFS}" apt-cache policy linux-image-generic | head -n 8 || true
-chroot "${ROOTFS}" apt-get -o Acquire::Retries=5 install -y --no-install-recommends "${PKGS[@]}"
-chroot "${ROOTFS}" apt-get clean
-chroot_umount
-trap - EXIT
+
+if ! packages_ready; then
+  log "install D0 package set"
+  mapfile -t PKGS < <(grep -vE '^\s*(#|$)' "${PKG_LIST}" | tr -d '\r')
+  [[ ${#PKGS[@]} -gt 0 ]] || die "empty package list: ${PKG_LIST}"
+  log "packages=${#PKGS[@]} first=${PKGS[0]}"
+
+  chroot_mount
+  trap chroot_umount EXIT
+
+  # Ensure sources exist when resuming an interrupted build.
+  if [[ ! -f "${ROOTFS}/etc/apt/sources.list" ]]; then
+    cat > "${ROOTFS}/etc/apt/sources.list" <<EOF
+deb ${MIRROR} noble main restricted universe multiverse
+deb ${MIRROR} noble-updates main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse
+EOF
+  fi
+
+  chroot "${ROOTFS}" dpkg --configure -a || true
+  chroot "${ROOTFS}" apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=60 update
+  if ! ls "${ROOTFS}/var/lib/apt/lists/"*_main_binary-amd64_Packages >/dev/null 2>&1; then
+    die "apt indexes missing main amd64 Packages after update"
+  fi
+  chroot "${ROOTFS}" apt-cache policy linux-image-virtual | head -n 8 || true
+
+  attempt=1
+  while true; do
+    if chroot "${ROOTFS}" apt-get -o Acquire::Retries=3 install -y --no-install-recommends "${PKGS[@]}"; then
+      break
+    fi
+    if (( attempt >= 3 )); then
+      die "apt install failed after 3 attempts"
+    fi
+    log "apt install attempt ${attempt} failed; running fix-broken then retrying"
+    chroot "${ROOTFS}" apt-get -o Acquire::Retries=3 -f install -y || true
+    chroot "${ROOTFS}" dpkg --configure -a || true
+    attempt=$((attempt + 1))
+    sleep $((attempt * 10))
+  done
+
+  chroot "${ROOTFS}" apt-get clean
+  chroot_umount
+  trap - EXIT
+  echo 'packages-installed' > "${STAGE_FILE}"
+else
+  log "resume: D0 package set already installed"
+fi
 
 log "create default user tuwaiq (password: tuwaiq) — change after first boot"
 chroot "${ROOTFS}" useradd -m -s /bin/bash -G sudo,video,audio,plugdev tuwaiq || true

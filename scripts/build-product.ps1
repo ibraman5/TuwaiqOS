@@ -49,7 +49,8 @@ docker run --rm --privileged `
   -v "${src}:/src" `
   -v "tuwaiqos-d0-work:/work" `
   -e "TUWAIQ_WORK=/work" `
-  -e "TUWAIQ_DEBOOTSTRAP_RETRIES=8" `
+  -e "TUWAIQ_DEBOOTSTRAP_RETRIES=3" `
+  -e "TUWAIQ_RESUME=auto" `
   -e "TUWAIQ_UBUNTU_MIRROR=http://azure.archive.ubuntu.com/ubuntu" `
   -w /src `
   tuwaiqos-product-builder:d0 `
