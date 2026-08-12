@@ -1,11 +1,17 @@
 # Packages for TuwaiqOS Product D0 (Ubuntu 24.04)
 # One package per line. Comments allowed.
+# D0 targets a bootable QEMU/desktop foundation image. Full OEM firmware
+# packs are optional (see HARDWARE note below) to keep the first image build
+# reproducible on constrained networks.
 
-# Kernel / firmware
-linux-image-generic
-linux-firmware
-intel-microcode
-amd64-microcode
+# Kernel (virtual guest profile — swap to linux-image-generic for bare metal)
+linux-image-virtual
+
+# HARDWARE (optional for bare-metal D0 images; omit for QEMU foundation):
+# linux-image-generic
+# linux-firmware
+# intel-microcode
+# amd64-microcode
 
 # Display manager + Plasma (Wayland)
 sddm
