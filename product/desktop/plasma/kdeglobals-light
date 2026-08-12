@@ -1,0 +1,14 @@
+# Tuwaiq Light defaults for Plasma (applied via look-and-feel package org.tuwaiqos.light.desktop)
+# Users switch in System Settings → Appearance → Global Theme → Tuwaiq Light
+[General]
+ColorScheme=TuwaiqLight
+Name=Tuwaiq Light
+widgetStyle=Breeze
+
+[Icons]
+Theme=breeze
+
+[KDE]
+LookAndFeelPackage=org.tuwaiqos.light.desktop
+SingleClick=false
+widgetStyle=Breeze

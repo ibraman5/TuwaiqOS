@@ -1,19 +1,20 @@
-# Packages for TuwaiqOS Product D0 (Ubuntu 24.04)
+# Packages for TuwaiqOS Product D1 (Ubuntu 24.04)
+# Extends D0 set. Identity + connectivity foundation.
 # One package per line. Comments allowed.
-# D0 targets a bootable QEMU/desktop foundation image. Full OEM firmware
-# packs are optional (see HARDWARE note below) to keep the first image build
-# reproducible on constrained networks.
 
 # Kernel (virtual guest profile — swap to linux-image-generic for bare metal)
 linux-image-virtual
 
-# HARDWARE (optional for bare-metal D0 images; omit for QEMU foundation):
+# HARDWARE (optional for bare-metal images; omit for QEMU foundation):
 # linux-image-generic
 # linux-firmware
 # intel-microcode
 # amd64-microcode
+# wpasupplicant
+# wireless-regdb
+# iw
 
-# Display manager + Plasma (X11 D0 path; Wayland remains installed for later)
+# Display manager + Plasma (X11 D0 path preserved; Wayland remains installed for later)
 sddm
 sddm-theme-breeze
 plasma-desktop
@@ -35,7 +36,7 @@ fonts-noto-core
 fonts-noto-ui-core
 fonts-noto-color-emoji
 
-# X11 runtime required for QEMU D0 graphical acceptance
+# X11 runtime required for QEMU graphical acceptance
 xserver-xorg
 xserver-xorg-core
 xserver-xorg-video-vesa
@@ -43,8 +44,13 @@ xserver-xorg-video-fbdev
 xinit
 x11-xserver-utils
 
-# Base desktop utilities
+# Base desktop utilities + connectivity
 network-manager
+ufw
+curl
+iputils-ping
+dnsutils
+iproute2
 pipewire
 wireplumber
 mesa-vulkan-drivers
@@ -54,16 +60,10 @@ sudo
 locales
 locales-all
 
-# Arabic + English locale support
+# Arabic + English locale support (RTL-ready packaging)
 language-pack-en
 language-pack-ar
 language-pack-kde-en
 language-pack-kde-ar
 
 initramfs-tools
-
-# D1 additions (identity/connectivity)
-ufw
-curl
-iputils-ping
-dnsutils

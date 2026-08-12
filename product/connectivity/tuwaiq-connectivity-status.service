@@ -1,0 +1,12 @@
+[Unit]
+Description=Tuwaiq connectivity status snapshot
+After=NetworkManager.service network-online.target
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/tuwaiq/tuwaiq-connectivity-status.sh
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

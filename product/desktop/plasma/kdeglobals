@@ -1,0 +1,20 @@
+[General]
+ColorScheme=TuwaiqDark
+Name=Tuwaiq Dark
+widgetStyle=Breeze
+
+[Icons]
+Theme=breeze-dark
+
+[KDE]
+LookAndFeelPackage=org.tuwaiqos.desktop
+SingleClick=false
+widgetStyle=Breeze
+
+[KScreen]
+ScreenScaleFactors=
+
+[General]
+BrowserApplication=firefox.desktop
+TerminalApplication=konsole
+TerminalService=org.kde.konsole.desktop

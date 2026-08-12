@@ -1,15 +1,43 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#0B1F17"/>
-      <stop offset="55%" stop-color="#143D2B"/>
-      <stop offset="100%" stop-color="#1C5A3A"/>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0A0A0C"/>
+      <stop offset="45%" stop-color="#121418"/>
+      <stop offset="100%" stop-color="#1A1612"/>
+    </linearGradient>
+    <linearGradient id="ridgeA" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#2A2C30"/>
+      <stop offset="100%" stop-color="#16181C"/>
+    </linearGradient>
+    <linearGradient id="ridgeB" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3A2E26"/>
+      <stop offset="100%" stop-color="#181410"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#C8783A" stop-opacity="0"/>
+      <stop offset="50%" stop-color="#C8783A" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#C8783A" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="tealBand" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#2A4A4E" stop-opacity="0"/>
+      <stop offset="40%" stop-color="#2A4A4E" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#2A4A4E" stop-opacity="0"/>
     </linearGradient>
   </defs>
-  <rect width="1920" height="1080" fill="url(#bg)"/>
-  <circle cx="1480" cy="280" r="220" fill="#C4A35A" opacity="0.18"/>
-  <circle cx="420" cy="820" r="300" fill="#2F6B4F" opacity="0.35"/>
-  <text x="160" y="520" font-family="Segoe UI, DejaVu Sans, sans-serif" font-size="96" fill="#F4F7F5" font-weight="600">TuwaiqOS</text>
-  <text x="160" y="600" font-family="Segoe UI, DejaVu Sans, sans-serif" font-size="40" fill="#D7E5DD">7HJB #H %3</text>
-  <text x="160" y="680" font-family="Segoe UI, DejaVu Sans, sans-serif" font-size="28" fill="#A9C2B4">Desktop Foundation · D0</text>
+  <rect width="1920" height="1080" fill="url(#sky)"/>
+  <ellipse cx="1480" cy="220" rx="320" ry="90" fill="url(#glow)"/>
+  <ellipse cx="420" cy="260" rx="260" ry="70" fill="url(#tealBand)"/>
+  <!-- distant escarpment silhouette (geometric, not illustrative) -->
+  <path d="M0,620 L180,540 L340,580 L520,470 L700,560 L880,430 L1060,520 L1240,400 L1420,490 L1600,380 L1780,460 L1920,410 L1920,1080 L0,1080 Z" fill="url(#ridgeA)" opacity="0.85"/>
+  <path d="M0,740 L220,680 L400,720 L620,610 L840,700 L1080,580 L1300,670 L1520,560 L1740,650 L1920,600 L1920,1080 L0,1080 Z" fill="url(#ridgeB)"/>
+  <path d="M0,860 L260,820 L480,850 L760,780 L1040,840 L1320,760 L1600,820 L1920,780 L1920,1080 L0,1080 Z" fill="#0E0E10"/>
+  <!-- copper accent ridge line -->
+  <path d="M0,740 L220,680 L400,720 L620,610 L840,700 L1080,580 L1300,670 L1520,560 L1740,650 L1920,600" fill="none" stroke="#C8783A" stroke-width="2" opacity="0.45"/>
+  <!-- geometric system mark -->
+  <g transform="translate(160,180)">
+    <polygon points="0,72 36,0 72,72" fill="none" stroke="#F5F2EB" stroke-width="3"/>
+    <polygon points="18,72 36,36 54,72" fill="#C8783A"/>
+  </g>
+  <text x="250" y="230" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="64" fill="#F5F2EB" font-weight="600" letter-spacing="6">TUWAIQ OS</text>
+  <text x="250" y="280" font-family="DejaVu Sans, Noto Sans, sans-serif" font-size="22" fill="#A8A59C" letter-spacing="3">DESKTOP ï¿½ D1</text>
 </svg>

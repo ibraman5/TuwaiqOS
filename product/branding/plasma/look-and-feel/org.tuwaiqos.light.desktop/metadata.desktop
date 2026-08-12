@@ -1,9 +1,9 @@
 [Desktop Entry]
-Name=Tuwaiq Dark
-Name[ar]=طويق داكن
-Comment=TuwaiqOS dark desktop identity
-Comment[ar]=هوية سطح مكتب طويق الداكنة
-X-KDE-PluginInfo-Name=org.tuwaiqos.desktop
+Name=Tuwaiq Light
+Name[ar]=طويق فاتح
+Comment=TuwaiqOS light desktop identity
+Comment[ar]=هوية سطح مكتب طويق الفاتحة
+X-KDE-PluginInfo-Name=org.tuwaiqos.light.desktop
 X-KDE-PluginInfo-Author=TuwaiqOS
 X-KDE-PluginInfo-License=See branding LICENSE
 X-KDE-PluginInfo-EnabledByDefault=true

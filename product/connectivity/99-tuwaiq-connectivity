@@ -1,0 +1,8 @@
+#!/bin/sh
+# NetworkManager dispatcher — refresh structured connectivity status (no secrets).
+case "$2" in
+  up|down|connectivity-change|dhcp4-change|dhcp6-change)
+    /usr/libexec/tuwaiq/tuwaiq-connectivity-status.sh >/dev/null 2>&1 || true
+    ;;
+esac
+exit 0

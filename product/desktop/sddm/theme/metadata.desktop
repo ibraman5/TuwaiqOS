@@ -1,0 +1,17 @@
+[General]
+Name=TuwaiqOS
+Name[ar]=طويق أو إس
+Author=TuwaiqOS
+Copyright=TuwaiqOS
+Description=TuwaiqOS SDDM greeter (Breeze-compatible)
+Description[ar]=شاشة تسجيل دخول طويق أو إس
+License=See product/branding/LICENSE
+Type=sddm-theme
+Version=1.0
+Website=https://github.com/italamrii/TuwaiqOS
+Screenshot=preview.png
+MainScript=Main.qml
+ConfigFile=theme.conf
+Theme-Id=tuwaiqos
+Theme-API=2.0
+QtVersion=6

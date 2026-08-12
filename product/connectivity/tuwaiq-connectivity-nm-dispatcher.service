@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Tuwaiq connectivity status on NetworkManager changes
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/tuwaiq/tuwaiq-connectivity-status.sh
+
+[Install]
+WantedBy=multi-user.target

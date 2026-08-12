@@ -1,0 +1,7 @@
+[Greeter]
+Wallpaper=/usr/share/wallpapers/TuwaiqOS/contents/images/1920x1080.svg
+
+[Daemon]
+Autolock=true
+Timeout=10
+LockOnResume=true

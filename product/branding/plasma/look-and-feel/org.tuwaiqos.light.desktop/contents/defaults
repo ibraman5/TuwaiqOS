@@ -1,12 +1,12 @@
 [kdeglobals][General]
-ColorScheme=TuwaiqDark
+ColorScheme=TuwaiqLight
 
 [kdeglobals][KDE]
-LookAndFeelPackage=org.tuwaiqos.desktop
+LookAndFeelPackage=org.tuwaiqos.light.desktop
 widgetStyle=Breeze
 
 [kdeglobals][Icons]
-Theme=breeze-dark
+Theme=breeze
 
 [kdeglobals][KScreen]
 ScreenScaleFactors=
@@ -26,6 +26,3 @@ cursorTheme=breeze_cursors
 [kwinrc][org.kde.kdecoration2]
 library=org.kde.breeze
 theme=Breeze
-
-[Desktop][org.kde.plasma.desktop]
-ToolBoxButton=false
