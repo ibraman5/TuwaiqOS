@@ -55,6 +55,27 @@ chroot_umount() {
   umount "${ROOTFS}/sys" 2>/dev/null || true
 }
 
+sync_disks() {
+  if command -v sync >/dev/null 2>&1; then
+    sync
+  fi
+}
+
+copy_rootfs_to_disk() {
+  local attempt=1
+  while (( attempt <= 3 )); do
+    log "copy rootfs to disk (attempt ${attempt}/3 via tar)"
+    if tar -C "${ROOTFS}" -cpf - . | tar -C "${WORK}/mnt" -xpf - ; then
+      sync_disks
+      return 0
+    fi
+    log "tar copy failed on attempt ${attempt}"
+    attempt=$((attempt + 1))
+    sleep 5
+  done
+  die "rootfs copy failed after 3 attempts"
+}
+
 verify_disk_partition_table() {
   local disk="$1"
   log "verify GPT layout on ${disk}"
@@ -251,7 +272,7 @@ ROOT_PART=""
 discover_loop_partitions "${DISK_BUILD}"
 
 cleanup() {
-  sync || true
+  sync_disks
   umount "${WORK}/mnt/boot/efi" 2>/dev/null || true
   umount "${WORK}/mnt/dev" 2>/dev/null || true
   umount "${WORK}/mnt/proc" 2>/dev/null || true
@@ -270,7 +291,7 @@ mkdir -p "${WORK}/mnt/boot/efi"
 mount "${ESP_PART}" "${WORK}/mnt/boot/efi"
 
 log "copy rootfs"
-rsync -aHAX --info=progress2 "${ROOTFS}/" "${WORK}/mnt/"
+copy_rootfs_to_disk
 
 # Rewrite fstab with stable PARTUUIDs
 P1="$(blkid -s PARTUUID -o value "${ESP_PART}")"
