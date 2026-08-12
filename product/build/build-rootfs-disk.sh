@@ -67,6 +67,7 @@ copy_rootfs_to_disk() {
     log "copy rootfs to disk (attempt ${attempt}/3 via tar)"
     if tar -C "${ROOTFS}" -cpf - . | tar -C "${WORK}/mnt" -xpf - ; then
       sync_disks
+      echo "rootfs-on-disk" > "${WORK}/.d0-rootfs-on-disk"
       return 0
     fi
     log "tar copy failed on attempt ${attempt}"
@@ -80,9 +81,19 @@ verify_disk_partition_table() {
   local disk="$1"
   log "verify GPT layout on ${disk}"
   parted -s "${disk}" unit MiB print
+  parted -s "${disk}" print 2>/dev/null | grep -qi 'bios_grub' || \
+    die "missing bios_grub partition (required for SeaBIOS+GPT)"
   local count
   count="$(parted -s "${disk}" unit s print | awk '/^ [0-9]+/{c++} END{print c+0}')"
-  [[ "${count}" -ge 2 ]] || die "disk image missing expected GPT partitions (found ${count})"
+  [[ "${count}" -ge 3 ]] || die "disk image missing expected 3 GPT partitions (found ${count})"
+}
+
+disk_layout_valid() {
+  [[ -f "${DISK_BUILD}" ]] || return 1
+  parted -s "${DISK_BUILD}" print 2>/dev/null | grep -qi 'bios_grub' || return 1
+  local count
+  count="$(parted -s "${DISK_BUILD}" unit s print 2>/dev/null | awk '/^ [0-9]+/{c++} END{print c+0}')"
+  [[ "${count}" -ge 3 ]]
 }
 
 # Docker builder containers often lack udev: kernel partitions exist (lsblk) but
@@ -115,14 +126,19 @@ discover_loop_partitions() {
     log "attached loop ${loop} (attempt ${attempt}/3)"
     log "losetup -l:"; losetup -l "${loop}" || losetup -a || true
     ensure_partition_nodes "${loop}"
-    mapfile -t _parts < <(lsblk -ln -o NAME,TYPE "${loop}" | awk '$2=="part"{print "/dev/" $1}')
-    if ((${#_parts[@]} >= 2)) && [[ -e "${_parts[0]}" && -e "${_parts[1]}" ]]; then
+    # Sort by name so p1/p2/p3 order is stable (unsorted lsblk can reorder).
+    mapfile -t _parts < <(lsblk -ln -o NAME,TYPE "${loop}" | awk '$2=="part"{print "/dev/" $1}' | sort)
+    if ((${#_parts[@]} >= 3)) && [[ -e "${_parts[0]}" && -e "${_parts[1]}" && -e "${_parts[2]}" ]]; then
       LOOP="${loop}"
-      ESP_PART="${_parts[0]}"
-      ROOT_PART="${_parts[1]}"
-      log "partition map ESP=${ESP_PART} ROOT=${ROOT_PART}"
+      BIOS_PART="${_parts[0]}"
+      ESP_PART="${_parts[1]}"
+      ROOT_PART="${_parts[2]}"
+      log "partition map BIOS=${BIOS_PART} ESP=${ESP_PART} ROOT=${ROOT_PART}"
       lsblk -ln -o NAME,MAJ:MIN,TYPE,SIZE "${loop}"
       return 0
+    fi
+    if ((${#_parts[@]} >= 2)) && [[ -e "${_parts[0]}" && -e "${_parts[1]}" ]]; then
+      log "WARN: only ${#_parts[@]} partitions (legacy layout without bios_grub)"
     fi
     log "partition nodes not ready; lsblk for ${loop}:"
     lsblk "${loop}" || lsblk || true
@@ -143,9 +159,15 @@ mount_disk_partitions() {
 }
 
 disk_image_has_rootfs() {
-  [[ -f "${WORK}/mnt/etc/os-release" ]] && \
+  [[ -f "${WORK}/.d0-rootfs-on-disk" ]] && \
+    [[ -f "${WORK}/mnt/etc/os-release" ]] && \
     [[ -d "${WORK}/mnt/usr/share/plasma" ]] && \
     { [[ -x "${WORK}/mnt/usr/sbin/sddm" ]] || [[ -x "${WORK}/mnt/usr/bin/sddm" ]]; }
+}
+
+force_rootfs_recopy() {
+  [[ "${TUWAIQ_FORCE_ROOTFS_RECOPY:-0}" == "1" ]] && return 0
+  [[ ! -f "${WORK}/.d0-rootfs-on-disk" ]]
 }
 
 log "repo=${ROOT_DIR}"
@@ -271,10 +293,7 @@ systemdBoot=false
 EOF
 chroot "${ROOTFS}" chown -R tuwaiq:tuwaiq /home/tuwaiq
 
-log "create disk image (${DISK_SIZE_GB}G) on Linux work volume"
-disk_has_gpt() {
-  [[ -f "${DISK_BUILD}" ]] && parted -s "${DISK_BUILD}" print 2>/dev/null | grep -qE '^ [12] '
-}
+log "create disk image (${DISK_SIZE_GB}G) on Linux work volume — GPT bios_grub + ESP + root"
 
 cleanup() {
   sync_disks
@@ -287,23 +306,43 @@ cleanup() {
   losetup -d "${LOOP}" 2>/dev/null || true
 }
 
-if disk_has_gpt; then
-  log "resume: reusing existing disk image ${DISK_BUILD}"
+if disk_layout_valid; then
+  log "resume: reusing bios_grub GPT disk ${DISK_BUILD}"
   verify_disk_partition_table "${DISK_BUILD}"
+  BIOS_PART=""
   ESP_PART=""
   ROOT_PART=""
   discover_loop_partitions "${DISK_BUILD}"
   trap cleanup EXIT
   mount_disk_partitions
+  if disk_image_has_rootfs && ! force_rootfs_recopy; then
+    log "resume: verified rootfs already on disk image; skipping tar copy"
+  else
+    if force_rootfs_recopy; then
+      log "force recopy: wiping root partition and copying rootfs via tar"
+      umount "${WORK}/mnt/boot/efi" 2>/dev/null || true
+      umount "${WORK}/mnt" 2>/dev/null || true
+      mkfs.ext4 -F "${ROOT_PART}"
+      mount "${ROOT_PART}" "${WORK}/mnt"
+      mkdir -p "${WORK}/mnt/boot/efi"
+      mount "${ESP_PART}" "${WORK}/mnt/boot/efi"
+      rm -f "${WORK}/.d0-rootfs-on-disk"
+    fi
+    copy_rootfs_to_disk
+  fi
 else
-  rm -f "${DISK_BUILD}"
+  log "creating new bios_grub GPT disk (legacy layout missing or absent)"
+  rm -f "${DISK_BUILD}" "${WORK}/tuwaiqos-d0.qcow2"
   truncate -s "${DISK_SIZE_GB}G" "${DISK_BUILD}"
   parted -s "${DISK_BUILD}" mklabel gpt
-  parted -s "${DISK_BUILD}" mkpart ESP fat32 1MiB 512MiB
-  parted -s "${DISK_BUILD}" set 1 esp on
-  parted -s "${DISK_BUILD}" mkpart root ext4 512MiB 100%
+  parted -s "${DISK_BUILD}" mkpart bios_grub 1MiB 2MiB
+  parted -s "${DISK_BUILD}" set 1 bios_grub on
+  parted -s "${DISK_BUILD}" mkpart ESP fat32 2MiB 514MiB
+  parted -s "${DISK_BUILD}" set 2 esp on
+  parted -s "${DISK_BUILD}" mkpart root ext4 514MiB 100%
   verify_disk_partition_table "${DISK_BUILD}"
 
+  BIOS_PART=""
   ESP_PART=""
   ROOT_PART=""
   discover_loop_partitions "${DISK_BUILD}"
@@ -312,11 +351,6 @@ else
   mkfs.vfat -F32 "${ESP_PART}"
   mkfs.ext4 -F "${ROOT_PART}"
   mount_disk_partitions
-fi
-
-if disk_image_has_rootfs; then
-  log "resume: rootfs already on disk image; skipping tar copy"
-else
   copy_rootfs_to_disk
 fi
 
@@ -334,10 +368,10 @@ mount --bind /sys "${WORK}/mnt/sys"
 mkdir -p "${WORK}/mnt/dev/pts"
 mount -t devpts devpts "${WORK}/mnt/dev/pts"
 
-log "install GRUB from builder (UEFI — ESP present on GPT disk)"
-mkdir -p "${WORK}/mnt/boot/grub" "${WORK}/mnt/boot/efi/EFI/tuwaiqos"
+log "install GRUB BIOS (SeaBIOS + bios_grub — no blocklist --force)"
+mkdir -p "${WORK}/mnt/boot/grub"
 
-log "enable serial console for headless smoke (keeps graphical target)"
+log "enable serial console for diagnostics (keeps graphical target)"
 if [[ -f "${WORK}/mnt/etc/default/grub" ]]; then
   sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash console=tty0 console=ttyS0,115200n8"/' \
     "${WORK}/mnt/etc/default/grub" || true
@@ -347,43 +381,42 @@ if [[ -f "${WORK}/mnt/etc/default/grub" ]]; then
     echo 'GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"' >> "${WORK}/mnt/etc/default/grub"
 fi
 
-grub-install --target=x86_64-efi --efi-directory="${WORK}/mnt/boot/efi" \
-  --boot-directory="${WORK}/mnt/boot" --root-directory="${WORK}/mnt" \
-  --bootloader-id=tuwaiqos --recheck --no-nvram || \
-  log "UEFI grub-install skipped/failed (host may lack efivars; SeaBIOS path below)"
-
-# SeaBIOS/QEMU without OVMF: embed GRUB on GPT disk (requires --force without bios_grub part).
 grub-install --target=i386-pc --boot-directory="${WORK}/mnt/boot" --root-directory="${WORK}/mnt" \
-  --force --recheck "${LOOP}"
+  --recheck "${LOOP}"
 
-if command -v grub-mkconfig >/dev/null 2>&1; then
-  grub-mkconfig -o "${WORK}/mnt/boot/grub/grub.cfg" --root-directory="${WORK}/mnt" 2>/dev/null || \
-    grub-mkconfig -o "${WORK}/mnt/boot/grub/grub.cfg" || true
+# Ensure initrd exists (minbase/package resumes can leave /boot without initrd.img).
+if ! ls "${WORK}/mnt/boot"/initrd.img-* >/dev/null 2>&1; then
+  log "generating initramfs (missing initrd.img-*)"
+  chroot "${WORK}/mnt" update-initramfs -c -k all || \
+    chroot "${WORK}/mnt" update-initramfs -u -k all || \
+    die "update-initramfs failed and no initrd present"
 fi
 
-if [[ ! -s "${WORK}/mnt/boot/grub/grub.cfg" ]]; then
-  VMLINUZ="$(ls -1 "${WORK}/mnt/boot"/vmlinuz-* 2>/dev/null | tail -1 || true)"
-  INITRD="$(ls -1 "${WORK}/mnt/boot"/initrd.img-* 2>/dev/null | tail -1 || true)"
-  [[ -n "${VMLINUZ}" ]] || die "no vmlinuz found under ${WORK}/mnt/boot"
-  VMLINUZ_REL="${VMLINUZ#${WORK}/mnt}"
-  INITRD_REL="${INITRD#${WORK}/mnt}"
-  log "writing minimal grub.cfg kernel=${VMLINUZ_REL}"
-  cat > "${WORK}/mnt/boot/grub/grub.cfg" <<EOF
-set timeout=5
+VMLINUZ="$(ls -1 "${WORK}/mnt/boot"/vmlinuz-* 2>/dev/null | tail -1 || true)"
+INITRD="$(ls -1 "${WORK}/mnt/boot"/initrd.img-* 2>/dev/null | tail -1 || true)"
+[[ -n "${VMLINUZ}" ]] || die "no vmlinuz found under ${WORK}/mnt/boot"
+[[ -n "${INITRD}" && -s "${INITRD}" ]] || die "no initrd.img found under ${WORK}/mnt/boot"
+VMLINUZ_REL="${VMLINUZ#${WORK}/mnt}"
+INITRD_REL="${INITRD#${WORK}/mnt}"
+log "writing grub.cfg kernel=${VMLINUZ_REL} initrd=${INITRD_REL} root=PARTUUID=${P2}"
+cat > "${WORK}/mnt/boot/grub/grub.cfg" <<EOF
+set timeout=3
 set default=0
+serial --unit=0 --speed=115200
+terminal_input console serial
+terminal_output console serial
 menuentry "TuwaiqOS D0" {
   linux ${VMLINUZ_REL} root=PARTUUID=${P2} ro quiet splash console=tty0 console=ttyS0,115200n8
   initrd ${INITRD_REL}
 }
 EOF
-fi
 
 test -s "${WORK}/mnt/boot/grub/grub.cfg" || die "grub.cfg not generated"
-if [[ ! -f "${WORK}/mnt/boot/grub/i386-pc/core.img" ]] && \
-   [[ ! -f "${WORK}/mnt/boot/efi/EFI/tuwaiqos/grubx64.efi" ]]; then
-  find "${WORK}/mnt/boot" -maxdepth 4 -type f \( -name 'core.img' -o -name 'grubx64.efi' \) -print
-  die "grub boot artifacts missing after install"
-fi
+grep -q "initrd ${INITRD_REL}" "${WORK}/mnt/boot/grub/grub.cfg" || die "grub.cfg missing initrd path"
+grep -q "PARTUUID=${P2}" "${WORK}/mnt/boot/grub/grub.cfg" || die "grub.cfg missing root PARTUUID"
+test -f "${WORK}/mnt/boot/grub/i386-pc/core.img" || die "grub core.img missing after BIOS install"
+log "grub.cfg:"; head -20 "${WORK}/mnt/boot/grub/grub.cfg"
+log "GRUB BIOS install OK (core.img present, no --force)"
 
 cleanup
 trap - EXIT

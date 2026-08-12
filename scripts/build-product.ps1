@@ -57,17 +57,13 @@ docker run --rm --privileged `
   bash product/build/build-rootfs-disk.sh
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host "[build-product] exporting disk image from docker volume"
-$outDir = Join-Path $Root "product\out"
-New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-$qcow = Join-Path $outDir "tuwaiqos-d0.qcow2"
-$raw = Join-Path $outDir "tuwaiqos-d0.raw"
-
-# Prefer qcow2 (sparse) — large raw copies to Windows bind mounts often hit I/O errors.
-docker run --rm -v "tuwaiqos-d0-work:/work" -v "${src}:/src" tuwaiqos-product-builder:d0 bash -lc `
-  "test -f /work/tuwaiqos-d0.qcow2 && cp -f /work/tuwaiqos-d0.qcow2 /src/product/out/tuwaiqos-d0.qcow2 || `
-   (test -f /work/tuwaiqos-d0.raw && dd if=/work/tuwaiqos-d0.raw of=/src/product/out/tuwaiqos-d0.raw bs=64M conv=fsync status=progress)"
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+Write-Host "[build-product] exporting qcow2 from docker volume (sparse; avoids 12G raw on NTFS)"
+$exportCmd = 'test -f /work/tuwaiqos-d0.qcow2 || qemu-img convert -O qcow2 /work/tuwaiqos-d0.raw /work/tuwaiqos-d0.qcow2; cp -f /work/tuwaiqos-d0.qcow2 /src/product/out/tuwaiqos-d0.qcow2; ls -lh /src/product/out/tuwaiqos-d0.qcow2'
+docker run --rm -v "tuwaiqos-d0-work:/work" -v "${src}:/src" tuwaiqos-product-builder:d0 bash -lc $exportCmd
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[build-product] ERROR: qcow2 export failed (check host disk space and Docker volume tuwaiqos-d0-work)"
+    exit $LASTEXITCODE
+}
 
 Write-Host "[build-product] artifacts:"
 Get-ChildItem (Join-Path $Root "product\out") -ErrorAction SilentlyContinue | Format-Table Name, Length
