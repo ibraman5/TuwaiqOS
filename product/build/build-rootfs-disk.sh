@@ -135,6 +135,13 @@ discover_loop_partitions() {
   die "loop partitions not found for disk image (no usable /dev nodes after 3 attempts)"
 }
 
+mount_disk_partitions() {
+  mkdir -p "${WORK}/mnt"
+  mount "${ROOT_PART}" "${WORK}/mnt"
+  mkdir -p "${WORK}/mnt/boot/efi"
+  mount "${ESP_PART}" "${WORK}/mnt/boot/efi"
+}
+
 log "repo=${ROOT_DIR}"
 log "work=${WORK} (must be Linux FS for debootstrap)"
 log "mirror=${MIRROR} resume=${RESUME}"
@@ -259,17 +266,9 @@ EOF
 chroot "${ROOTFS}" chown -R tuwaiq:tuwaiq /home/tuwaiq
 
 log "create disk image (${DISK_SIZE_GB}G) on Linux work volume"
-rm -f "${DISK_BUILD}"
-truncate -s "${DISK_SIZE_GB}G" "${DISK_BUILD}"
-parted -s "${DISK_BUILD}" mklabel gpt
-parted -s "${DISK_BUILD}" mkpart ESP fat32 1MiB 512MiB
-parted -s "${DISK_BUILD}" set 1 esp on
-parted -s "${DISK_BUILD}" mkpart root ext4 512MiB 100%
-verify_disk_partition_table "${DISK_BUILD}"
-
-ESP_PART=""
-ROOT_PART=""
-discover_loop_partitions "${DISK_BUILD}"
+disk_has_gpt() {
+  [[ -f "${DISK_BUILD}" ]] && parted -s "${DISK_BUILD}" print 2>/dev/null | grep -qE '^ [12] '
+}
 
 cleanup() {
   sync_disks
@@ -280,17 +279,34 @@ cleanup() {
   umount "${WORK}/mnt" 2>/dev/null || true
   losetup -d "${LOOP}" 2>/dev/null || true
 }
-trap cleanup EXIT
 
-mkfs.vfat -F32 "${ESP_PART}"
-mkfs.ext4 -F "${ROOT_PART}"
+if disk_has_gpt; then
+  log "resume: reusing existing disk image ${DISK_BUILD}"
+  verify_disk_partition_table "${DISK_BUILD}"
+  ESP_PART=""
+  ROOT_PART=""
+  discover_loop_partitions "${DISK_BUILD}"
+  trap cleanup EXIT
+  mount_disk_partitions
+else
+  rm -f "${DISK_BUILD}"
+  truncate -s "${DISK_SIZE_GB}G" "${DISK_BUILD}"
+  parted -s "${DISK_BUILD}" mklabel gpt
+  parted -s "${DISK_BUILD}" mkpart ESP fat32 1MiB 512MiB
+  parted -s "${DISK_BUILD}" set 1 esp on
+  parted -s "${DISK_BUILD}" mkpart root ext4 512MiB 100%
+  verify_disk_partition_table "${DISK_BUILD}"
 
-mkdir -p "${WORK}/mnt"
-mount "${ROOT_PART}" "${WORK}/mnt"
-mkdir -p "${WORK}/mnt/boot/efi"
-mount "${ESP_PART}" "${WORK}/mnt/boot/efi"
+  ESP_PART=""
+  ROOT_PART=""
+  discover_loop_partitions "${DISK_BUILD}"
+  trap cleanup EXIT
 
-log "copy rootfs"
+  mkfs.vfat -F32 "${ESP_PART}"
+  mkfs.ext4 -F "${ROOT_PART}"
+  mount_disk_partitions
+fi
+
 copy_rootfs_to_disk
 
 # Rewrite fstab with stable PARTUUIDs
