@@ -9,11 +9,7 @@ autoconnect-priority=200
 
 [ipv4]
 method=auto
-dns=1.1.1.1;8.8.8.8
-ignore-auto-dns=true
 
 [ipv6]
 method=auto
 ip6-privacy=2
-ignore-auto-dns=true
-dns=2606:4700:4700::1111;

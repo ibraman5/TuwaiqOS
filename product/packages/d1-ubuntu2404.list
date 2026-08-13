@@ -46,6 +46,8 @@ x11-xserver-utils
 
 # Base desktop utilities + connectivity
 network-manager
+systemd-resolved
+libnss-resolve
 ufw
 curl
 iputils-ping

@@ -166,10 +166,18 @@ install -m 0755 "${CONN}/measure-network.sh" \
   "${ROOT}/usr/libexec/tuwaiq/measure-network.sh"
 install -m 0755 "${CONN}/d1-acceptance-collect.sh" \
   "${ROOT}/usr/libexec/tuwaiq/d1-acceptance-collect.sh"
+install -m 0755 "${CONN}/d1-dns-closure.sh" \
+  "${ROOT}/usr/libexec/tuwaiq/d1-dns-closure.sh"
+install -m 0755 "${CONN}/d1-theme-visual.sh" \
+  "${ROOT}/usr/libexec/tuwaiq/d1-theme-visual.sh"
 install -d "${ROOT}/usr/lib/systemd/system"
 cp "${CONN}/tuwaiq-connectivity-status.service" "${ROOT}/usr/lib/systemd/system/"
 cp "${CONN}/tuwaiq-connectivity-status.timer" "${ROOT}/usr/lib/systemd/system/"
 cp "${CONN}/tuwaiq-d1-acceptance.service" "${ROOT}/usr/lib/systemd/system/"
+cp "${CONN}/tuwaiq-d1-dns-closure.service" "${ROOT}/usr/lib/systemd/system/"
+cp "${CONN}/tuwaiq-d1-theme-visual.service" "${ROOT}/usr/lib/systemd/system/"
+chmod 0644 "${ROOT}/usr/lib/systemd/system/tuwaiq-"*.service \
+           "${ROOT}/usr/lib/systemd/system/tuwaiq-"*.timer 2>/dev/null || true
 install -d "${ROOT}/etc/NetworkManager"
 cp "${CONN}/NetworkManager.conf" "${ROOT}/etc/NetworkManager/NetworkManager.conf"
 install -d "${ROOT}/etc/NetworkManager/system-connections"
@@ -185,29 +193,61 @@ install -m 0644 "${CONN}/tuwaiq-resolved.conf" \
 # Ensure systemd units are not marked executable (avoids systemd warnings)
 chmod 0644 "${ROOT}/usr/lib/systemd/system/tuwaiq-connectivity-status.service" \
            "${ROOT}/usr/lib/systemd/system/tuwaiq-connectivity-status.timer" \
-           "${ROOT}/usr/lib/systemd/system/tuwaiq-d1-acceptance.service" 2>/dev/null || true
+           "${ROOT}/usr/lib/systemd/system/tuwaiq-d1-acceptance.service" \
+           "${ROOT}/usr/lib/systemd/system/tuwaiq-d1-dns-closure.service" \
+           "${ROOT}/usr/lib/systemd/system/tuwaiq-d1-theme-visual.service" 2>/dev/null || true
+# Windows checkouts may copy CRLF; systemd unit parser requires LF
+sed -i 's/\r$//' "${ROOT}/usr/lib/systemd/system/tuwaiq-"*.service \
+                 "${ROOT}/usr/lib/systemd/system/tuwaiq-"*.timer \
+                 "${ROOT}/usr/libexec/tuwaiq/"*.sh 2>/dev/null || true
+# Normal getaddrinfo via nss-resolve when the package is present
+if [[ -f "${ROOT}/usr/lib/x86_64-linux-gnu/libnss_resolve.so.2" ]] || \
+   [[ -f "${ROOT}/lib/x86_64-linux-gnu/libnss_resolve.so.2" ]]; then
+  sed -i 's/^hosts:.*/hosts: files resolve [!UNAVAIL=return] dns/' \
+    "${ROOT}/etc/nsswitch.conf"
+fi
 install -d "${ROOT}/etc/NetworkManager/dispatcher.d"
 install -m 0755 "${CONN}/99-tuwaiq-connectivity" \
   "${ROOT}/etc/NetworkManager/dispatcher.d/99-tuwaiq-connectivity"
 install -d "${ROOT}/var/lib/tuwaiq/connectivity"
 chmod 0755 "${ROOT}/var/lib/tuwaiq" "${ROOT}/var/lib/tuwaiq/connectivity"
-# Clear prior one-shot done marker so collector can run after fix boots
-rm -f "${ROOT}/var/lib/tuwaiq/connectivity/d1-acceptance.done"
+# Clear one-shot markers so clean-boot proofs re-run
+rm -f "${ROOT}/var/lib/tuwaiq/connectivity/d1-acceptance.done" \
+      "${ROOT}/var/lib/tuwaiq/connectivity/d1-dns-closure.done" \
+      "${ROOT}/var/lib/tuwaiq/connectivity/d1-theme-visual.done"
 
-# Enable connectivity timer + NetworkManager + one-shot acceptance collector
+# Enable connectivity timer + NetworkManager + resolved + closure collectors
 mkdir -p "${ROOT}/etc/systemd/system/timers.target.wants" \
-         "${ROOT}/etc/systemd/system/multi-user.target.wants"
+         "${ROOT}/etc/systemd/system/multi-user.target.wants" \
+         "${ROOT}/etc/systemd/system/network-online.target.wants"
 ln -sf /usr/lib/systemd/system/tuwaiq-connectivity-status.timer \
   "${ROOT}/etc/systemd/system/timers.target.wants/tuwaiq-connectivity-status.timer"
 ln -sf /usr/lib/systemd/system/tuwaiq-d1-acceptance.service \
   "${ROOT}/etc/systemd/system/multi-user.target.wants/tuwaiq-d1-acceptance.service"
+ln -sf /usr/lib/systemd/system/tuwaiq-d1-dns-closure.service \
+  "${ROOT}/etc/systemd/system/multi-user.target.wants/tuwaiq-d1-dns-closure.service"
+ln -sf /usr/lib/systemd/system/tuwaiq-d1-theme-visual.service \
+  "${ROOT}/etc/systemd/system/multi-user.target.wants/tuwaiq-d1-theme-visual.service"
 ln -sf /lib/systemd/system/NetworkManager.service \
   "${ROOT}/etc/systemd/system/multi-user.target.wants/NetworkManager.service" 2>/dev/null || true
+# systemd-resolved owns the stub resolver (required for normal getaddrinfo via /etc/resolv.conf)
+if [[ -f "${ROOT}/lib/systemd/system/systemd-resolved.service" ]]; then
+  RESOLVED_UNIT=/lib/systemd/system/systemd-resolved.service
+elif [[ -f "${ROOT}/usr/lib/systemd/system/systemd-resolved.service" ]]; then
+  RESOLVED_UNIT=/usr/lib/systemd/system/systemd-resolved.service
+else
+  RESOLVED_UNIT=""
+fi
+if [[ -n "${RESOLVED_UNIT}" ]]; then
+  ln -sf "${RESOLVED_UNIT}" \
+    "${ROOT}/etc/systemd/system/multi-user.target.wants/systemd-resolved.service"
+  ln -sf "${RESOLVED_UNIT}" \
+    "${ROOT}/etc/systemd/system/dbus-org.freedesktop.resolve1.service"
+fi
 ln -sf /lib/systemd/system/NetworkManager-wait-online.service \
   "${ROOT}/etc/systemd/system/network-online.target.wants/NetworkManager-wait-online.service" 2>/dev/null || \
-  (mkdir -p "${ROOT}/etc/systemd/system/network-online.target.wants" && \
-   ln -sf /lib/systemd/system/NetworkManager-wait-online.service \
-     "${ROOT}/etc/systemd/system/network-online.target.wants/NetworkManager-wait-online.service")
+  ln -sf /usr/lib/systemd/system/NetworkManager-wait-online.service \
+    "${ROOT}/etc/systemd/system/network-online.target.wants/NetworkManager-wait-online.service" 2>/dev/null || true
 
 # Default-deny firewall (ufw) when package present — do not fail branding if absent
 if [[ -x "${ROOT}/usr/sbin/ufw" ]] || [[ -e "${ROOT}/usr/sbin/ufw" ]]; then

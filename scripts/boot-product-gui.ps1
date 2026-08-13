@@ -69,7 +69,7 @@ Write-Host "[boot-product-gui] serial=$serial (wait ${Seconds}s)"
 $proc = Start-Process -FilePath $qemu -ArgumentList $argList -PassThru
 $shots = New-Object System.Collections.Generic.List[string]
 $prev = 0
-foreach ($t in @(20, 45, 75, 110, 150, 190, 230)) {
+foreach ($t in @(20, 45, 75, 110, 150, 190, 230, 270, 310)) {
     if ($t -ge $Seconds) { break }
     $wait = $t - $prev
     if ($wait -gt 0) { Start-Sleep -Seconds $wait }

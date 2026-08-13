@@ -1,0 +1,14 @@
+[Unit]
+Description=Tuwaiq D1 DNS clean-boot closure proof
+After=NetworkManager-wait-online.service network-online.target systemd-resolved.service
+Wants=NetworkManager-wait-online.service systemd-resolved.service
+ConditionPathExists=!/var/lib/tuwaiq/connectivity/d1-dns-closure.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/tuwaiq/d1-dns-closure.sh
+ExecStartPost=/bin/touch /var/lib/tuwaiq/connectivity/d1-dns-closure.done
+TimeoutStartSec=240
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Tuwaiq D1 Light/Dark visual proof helper
+After=multi-user.target
+ConditionPathExists=!/var/lib/tuwaiq/connectivity/d1-theme-visual.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/tuwaiq/d1-theme-visual.sh
+TimeoutStartSec=480
+
+[Install]
+WantedBy=multi-user.target
