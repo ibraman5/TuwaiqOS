@@ -1,7 +1,0 @@
-/target
-/userland/hello/target
-**/*.img
-**/*.iso
-**/*.pdb
-.DS_Store
-Thumbs.db

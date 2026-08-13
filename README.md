@@ -1,122 +1,137 @@
-# TuwaiqOS
+# Tuwaiq AI System Assistant + AI System Intelligence (Prototype)
 
-Experimental AI-Native Operating System written in Rust.
+This directory contains an independent prototype for future AI-native capabilities in TuwaiqOS.
+It is isolated from the current TuwaiqOS runtime and does not modify kernel code.
 
-TuwaiqOS is a bare-metal `no_std` OS that boots in QEMU, provides a terminal shell, recoverable persistent storage (TuwaiqFS v3), preemptive multitasking, loopback networking, and an AI bridge stub for future integration.
+## Purpose
 
-```text
-TuwaiqOS v0.5
-AI-Native Experimental Operating System
+Two conceptual components are defined:
 
-tuwaiq@os:~$
-```
+1. Tuwaiq AI Assistant (future)
+- Maps user questions into structured system-information requests.
+- Enforces policy and permission boundaries before any system access.
 
-## Screenshots
+2. Tuwaiq AI System Intelligence (implemented prototype focus)
+- Collects telemetry (synthetic for now).
+- Validates and processes telemetry.
+- Trains an anomaly-detection baseline (Isolation Forest).
+- Exports model artifacts and metadata.
+- Supports standalone inference and evaluation.
 
-> Add screenshots of the boot screen and shell after running in QEMU.
-> Suggested captures: boot banner, `monitor`, `run hello`, filesystem persistence test.
+## Current Implementation Status
 
-## Architecture
+Implemented now:
+- Synthetic telemetry generation (deterministic, seed-based).
+- Telemetry schema and validation.
+- Standalone collector abstraction.
+- Training pipeline using Isolation Forest.
+- Exported model + metadata.
+- Standalone inference engine with structured output.
+- Evaluation pipeline and report generation.
+- Automated tests for schema, preprocessing, inference, model reload, and interface readiness.
 
-```mermaid
-flowchart TD
-    BL[Bootloader] --> K[Kernel]
-    K --> FB[Framebuffer / VGA]
-    K --> SH[Shell]
-    SH --> FS[TuwaiqFS v3]
-    SH --> LD[Program Loader]
-    SH --> AP[Apps: notes / editor / monitor]
-    FS --> ATA[ATA Driver]
-    SH --> TS[Task Scheduler]
-    SH --> NET[Network Loopback]
-    SH --> AI[AI Bridge Stub]
-```
+Planned/future:
+- Real telemetry integration from TuwaiqOS APIs.
+- Assistant-to-intelligence orchestration with LLM tool-calling.
+- Policy engine integration with runtime permissions.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for subsystem details.
+## Directory Structure
 
-## Requirements
+- data_collection: telemetry schema, validation, collector abstraction
+- data: synthetic/raw/processed datasets
+- training: configs, scripts, experiments
+- models: checkpoints, exported artifacts, metadata
+- inference: model inference engine, examples, tests
+- evaluation: reports and benchmark outputs
+- system_interface: conceptual integration schemas and API specs
+- docs: architecture, dataset, training, model, integration docs
 
-- Rust nightly (`nightly-2026-06-01`, pinned in `rust-toolchain.toml`)
-- QEMU (`qemu-system-x86_64`)
-- Windows: MSVC Build Tools
-- `rust-src` and `llvm-tools-preview` components
+## Setup
 
-## Build
-
-```powershell
-cd path\to\TuwaiqOS
-.\scripts\build.ps1
-```
-
-Output: `target\debug\boot-bios-tuwaiqos.img`
-
-## Run in QEMU
+From the ai_development directory:
 
 ```powershell
-.\scripts\run-qemu.ps1
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-Manual:
+## Generate Synthetic Data
 
 ```powershell
-qemu-system-x86_64 -drive format=raw,file=target\debug\boot-bios-tuwaiqos.img -m 128M
+python training\scripts\generate_synthetic_data.py --rows 2400 --seed 42 --normal-ratio 0.85 --sampling-interval 5
 ```
 
-## Run in VirtualBox
+Output:
+- data/raw/telemetry_synthetic_v1.jsonl
+- data/processed/telemetry_synthetic_v1.csv
 
-1. Create a new VM (Other/Unknown 64-bit, 128 MB RAM).
-2. **Do not** attach an ISO — use the raw disk image instead.
-3. Settings → Storage → Add hard disk → choose `boot-bios-tuwaiqos.img`.
-4. Display: VMSVGA or default; 1280×720 works well with the framebuffer console.
-5. Start the VM.
+Important:
+- Data is synthetic and intended for development only.
+- It is not real TuwaiqOS telemetry.
 
-Alternatively convert the image to VDI:
+## Train
 
 ```powershell
-VBoxManage convertfromraw target\debug\boot-bios-tuwaiqos.img target\debug\tuwaiqos.vdi --format VDI
+python training\scripts\train.py
 ```
 
-## Validation checklist
+Outputs:
+- models/exported/*.pkl
+- models/metadata/*.json
+- training/experiments/*.json
 
-```text
-help
-ls
-touch hello.txt
-write hello.txt hello
-cat hello.txt
-reboot
-cat hello.txt          # must show: hello
-ps
-sysinfo
-notes create todo
-notes list
-monitor
-run hello
+## Evaluate
+
+```powershell
+python training\scripts\evaluate.py
 ```
 
-## Project layout
+Outputs:
+- evaluation/reports/*.md
+- evaluation/benchmarks/*.json
 
-```text
-TuwaiqOS/
-├── kernel/src/       # Bare-metal kernel
-├── scripts/          # build.ps1, run-qemu.ps1
-├── docs/             # Architecture and filesystem docs
-├── build.rs          # Disk image builder
-└── Cargo.toml        # Workspace root (tuwaiqos package)
+Note:
+- Evaluation metrics are based on synthetic labeled scenarios.
+
+## Run Inference
+
+Single input JSON file:
+
+```powershell
+python inference\predict.py --input-json inference\examples\normal_input.json
 ```
 
-## Roadmap
+Example batch scenarios:
 
-See [ROADMAP.md](ROADMAP.md).
+```powershell
+python inference\examples\run_examples.py
+```
 
-## Contributing
+## Run Tests
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+```powershell
+pytest
+```
 
-## License
+## Integration Direction
 
-MIT — see [LICENSE](LICENSE).
+This prototype does not integrate with kernel code yet.
+See docs/INTEGRATION.md and system_interface/api_specs/future_integration_spec.md.
 
-## Release
+## Security and Safety Principles
 
-Current version: **TuwaiqOS v0.5** — see [RELEASE_NOTES.md](RELEASE_NOTES.md).
+- Read-only intelligence behavior in current prototype.
+- No automatic destructive actions.
+- No automatic process termination.
+- No direct model-to-kernel communication.
+- No telemetry network transmission unless explicitly configured in future work.
+- No intentional collection of personal user data.
+
+## Assistant Security Boundary (future)
+
+User -> AI Assistant -> Context Manager -> AI Policy Layer -> Tuwaiq System API -> System Information
+
+LLM -> Structured request/tool call -> Permission validation -> System API -> Kernel
+
+The LLM must not receive direct kernel access.
