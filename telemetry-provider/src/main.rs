@@ -1,5 +1,17 @@
 //! tuwaiq-telemetry-provider -- Stage 1 read-only System Telemetry
 //! Provider.
+//!
+//! Emits exactly one JSON object on stdout, matching
+//! `ai_development/system_interface/schemas/telemetry_input.schema.json`,
+//! built entirely from real host system data via `sysinfo` (works on both
+//! Windows and Linux -- see `readers.rs`'s module docs for why an earlier
+//! `/proc`-only implementation was replaced). Intended to be piped into a
+//! file and consumed by the existing `inference/predict.py --input-json
+//! <file>` pipeline -- see `README.md` in this directory for the full
+//! round-trip demo.
+//!
+//! This binary is read-only: it does not accept any input, take any
+//! action, or write anything except its own stdout snapshot.
 
 mod readers;
 mod service_state;

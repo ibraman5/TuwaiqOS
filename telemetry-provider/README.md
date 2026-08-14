@@ -1,14 +1,15 @@
 # tuwaiq-telemetry-provider
 
 Stage 1 (per `ai_development/docs/INTEGRATION.md`'s staging) System
-Telemetry Provider. Emits one JSON object on stdout, built entirely from
-real host `/proc` data, that conforms to
-`ai_development/system_interface/schemas/telemetry_input.schema.json`.
+Telemetry Provider. Emits one JSON object on stdout, built from real host
+system data via the `sysinfo` crate (works on both Windows and Linux), that
+conforms to `ai_development/system_interface/schemas/telemetry_input.schema.json`.
 
 This is the piece the integration guide calls "future integration
 requirement" — it now exists, is read-only, and its output has been
 verified (see `test_schema_conformance.py`) against the exact schema
-already checked into the repo.
+already checked into the repo, on Windows (the platform this project's own
+setup instructions target).
 
 ## Build
 
@@ -47,13 +48,13 @@ data.
 
 | Field | Source | Notes |
 |---|---|---|
-| `cpu_utilization_pct` | `/proc/stat`, 500ms sample | |
-| `ram_utilization_pct`, `available_ram_mb` | `/proc/meminfo` | |
-| `process_count` | count of numeric entries in `/proc` | |
-| `disk_read_kbps`, `disk_write_kbps` | `/proc/diskstats`, 500ms sample | KB/s (kilobytes), excludes partitions/loop/ram devices to avoid double-counting |
-| `network_in_kbps`, `network_out_kbps` | `/proc/net/dev`, 500ms sample | KB/s (kilobytes), excludes loopback |
-| `uptime_seconds` | `/proc/uptime` | |
-| `error_event_count` | `dmesg --level=err,warn --since=-2min` | **Best-effort.** Returns `0` if `dmesg` is unavailable or unreadable without privilege — `0` here means "no error source was sampled," not necessarily "no errors occurred." See `INTEGRATION.md`'s own convention for unavailable metrics. |
+| `cpu_utilization_pct` | `sysinfo` global CPU usage, 600ms two-sample window | |
+| `ram_utilization_pct`, `available_ram_mb` | `sysinfo` memory | |
+| `process_count` | `sysinfo` process list length | |
+| `disk_read_kbps`, `disk_write_kbps` | Sum of `Process::disk_usage()` (bytes since last refresh) across all processes | `sysinfo` does not expose per-device throughput cross-platform; this is the standard `sysinfo` pattern for aggregate system I/O (Linux via `/proc/<pid>/io`, Windows via `GetProcessIoCounters`) |
+| `network_in_kbps`, `network_out_kbps` | `sysinfo` per-interface received/transmitted bytes since last refresh, summed, excluding loopback-like interfaces | |
+| `uptime_seconds` | `sysinfo::System::uptime()` | |
+| `error_event_count` | Unix: `dmesg --level=err,warn --since=-2min` line count. **Windows: not yet implemented — always 0.** | `0` means "no error source was sampled," not necessarily "no errors occurred." A real Windows implementation needs a Windows Event Log (System log, Error/Warning) query via the `windows` crate — documented here as a known gap, consistent with `INTEGRATION.md`'s own convention for unavailable metrics, rather than shipped as if it were real. |
 | `service_state` | threshold heuristic (`service_state.rs`) | v1 only — CPU/RAM/error-count thresholds, not a learned classifier. Documented as future work, same as `INTEGRATION.md` already anticipates. |
 
 ## Tests

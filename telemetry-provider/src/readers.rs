@@ -1,9 +1,22 @@
 //! Cross-platform system readers, built on the `sysinfo` crate.
+//!
+//! Replaces an earlier Linux-only `/proc`-parsing implementation: this
+//! project's actual dev/setup instructions (`ai_development/README.md`)
+//! run natively on Windows, so this file must work there too, not just on
+//! Linux. `sysinfo` gives one API surface for both, at the cost of one
+//! extra dependency versus hand-rolled `/proc` parsing -- an acceptable
+//! trade here since correctness on the real target platform matters more
+//! than minimizing dependency count for this particular binary (unlike the
+//! kernel/broker's own `/proc` reader, this one is not part of a
+//! security-sensitive trust boundary).
 
 use std::time::Duration;
 
 use sysinfo::{Networks, System};
 
+/// Two full samples separated by this window, for every rate-based metric
+/// (CPU%, disk I/O, network I/O) -- see `main.rs` for why they share one
+/// window rather than being sampled independently.
 pub const SAMPLE_WINDOW: Duration = Duration::from_millis(600);
 
 pub struct Samples {
@@ -18,10 +31,16 @@ pub struct Samples {
     pub uptime_seconds: f64,
 }
 
+/// Take one complete, internally-consistent snapshot. All rate metrics
+/// (CPU/disk/network) are measured across the *same* `SAMPLE_WINDOW`, using
+/// `sysinfo`'s own recommended two-refresh-with-a-wait pattern for a
+/// meaningful (non-zero-on-first-read) percentage.
 pub fn take_samples() -> Samples {
     let mut sys = System::new_all();
     let mut networks = Networks::new_with_refreshed_list();
 
+    // First refresh establishes a baseline; sysinfo's CPU/network deltas
+    // are meaningless (or zero) without a prior sample to diff against.
     sys.refresh_cpu_usage();
     networks.refresh();
 
@@ -48,6 +67,12 @@ pub fn take_samples() -> Samples {
 
     let secs = SAMPLE_WINDOW.as_secs_f64().max(0.001);
 
+    // sysinfo's `Disk` type does not expose read/write byte counters in
+    // this version -- aggregate I/O instead via `Process::disk_usage()`
+    // (delta bytes since each process's last refresh), summed across every
+    // process. This is the standard sysinfo pattern for system-wide disk
+    // throughput and is implemented cross-platform (Linux `/proc/<pid>/io`,
+    // Windows `GetProcessIoCounters`), unlike a per-device counter.
     let (mut read_bytes, mut write_bytes) = (0u64, 0u64);
     for process in sys.processes().values() {
         let usage = process.disk_usage();
@@ -57,6 +82,10 @@ pub fn take_samples() -> Samples {
     let disk_read_kbps = (read_bytes as f64 / 1024.0) / secs;
     let disk_write_kbps = (write_bytes as f64 / 1024.0) / secs;
 
+    // Same "since last refresh" delta semantics for network counters.
+    // Loopback-style interfaces are excluded by name where recognizable on
+    // the current platform, matching the intent (not raw host traffic
+    // reflected back at itself) of the schema's network fields.
     let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
     for (name, data) in networks.iter() {
         if is_loopback_like(name) {
@@ -86,6 +115,16 @@ fn is_loopback_like(interface_name: &str) -> bool {
     lower == "lo" || lower.starts_with("loopback") || lower.contains("loopback")
 }
 
+/// Best-effort recent error/warning count. Unix: counts recent
+/// `dmesg --level=err,warn` lines (fixed, argument-free invocation --
+/// no user input reaches this command). Windows: not yet implemented --
+/// the correct equivalent is a Windows Event Log query (System log,
+/// Error/Warning levels), which needs the `windows` crate's Event Log
+/// APIs; deliberately left as a documented gap (returns 0, meaning "not
+/// sampled," not "zero errors observed") rather than shipping something
+/// that only *looks* implemented, consistent with
+/// `ai_development/system_interface/docs/INTEGRATION.md`'s own convention
+/// for metrics without a real source yet.
 pub fn read_recent_error_event_count() -> u64 {
     #[cfg(unix)]
     {
