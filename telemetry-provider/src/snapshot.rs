@@ -20,6 +20,9 @@ pub struct TelemetrySnapshot {
     pub uptime_seconds: f64,
     pub error_event_count: u64,
     pub service_state: ServiceState,
+    pub source: &'static str,
+    pub scenario_label: &'static str,
+    pub is_synthetic_anomaly: bool,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
