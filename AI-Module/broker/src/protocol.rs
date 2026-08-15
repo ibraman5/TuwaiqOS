@@ -58,6 +58,17 @@ pub enum ErrorCode {
     InternalError,
 }
 
+/// Risk class for broker policy decisions. Mirrored by the Python agent for
+/// confirmation UX; enforcement remains in Rust.
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RiskClass {
+    Read,
+    LowRiskAction,
+    SensitiveAction,
+    Forbidden,
+}
+
 impl ToolResponse {
     pub fn ok(request_id: &str, result: serde_json::Value) -> Self {
         Self {

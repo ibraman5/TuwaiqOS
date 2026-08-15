@@ -86,17 +86,27 @@ fn handle_line(line: &str) -> ToolResponse {
         );
     }
 
+    let decision = registry::policy_decision(&request.tool);
     match registry::dispatch(&request.tool, &request.arguments) {
         Ok(result) => {
-            audit::record(&request.request_id, &request.tool, &request.arguments, "ok");
+            audit::record_with_policy(
+                &request.request_id,
+                &request.tool,
+                &request.arguments,
+                "ok",
+                &decision,
+                Some(false),
+            );
             ToolResponse::ok(&request.request_id, result)
         }
         Err((code, message)) => {
-            audit::record(
+            audit::record_with_policy(
                 &request.request_id,
                 &request.tool,
                 &request.arguments,
                 &format!("error:{code:?}"),
+                &decision,
+                Some(decision.requires_confirmation),
             );
             ToolResponse::error(&request.request_id, code, message)
         }

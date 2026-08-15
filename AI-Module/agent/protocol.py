@@ -16,7 +16,8 @@ PROTOCOL_VERSION = "1.0"
 
 # The exact, closed set of tool names the broker will accept. Kept here too
 # (not just in the broker) so the Python side can fail fast locally on a
-# typo'd tool name before ever forming a request.
+# typo'd tool name before ever forming a request. Must stay aligned with
+# broker/src/registry.rs and agent/tool_catalog.py.
 KNOWN_TOOLS = frozenset(
     {
         "get_system_info",

@@ -1,11 +1,9 @@
-//! Unit tests for `registry::dispatch` covering the required failure modes:
-//! unknown tool, invalid arguments, and (via `tools::launch_application`)
-//! denied/not-allowlisted action.
+//! Unit tests for registry dispatch and policy classification.
 
 #[cfg(test)]
 mod tests {
-    use crate::protocol::ErrorCode;
-    use crate::registry::dispatch;
+    use crate::protocol::{ErrorCode, RiskClass};
+    use crate::registry::{classify, dispatch, policy_decision, tool_catalog_json};
     use serde_json::json;
 
     #[test]
@@ -14,6 +12,27 @@ mod tests {
         assert!(result.is_err());
         let (code, _) = result.unwrap_err();
         assert_eq!(code, ErrorCode::UnknownTool);
+    }
+
+    #[test]
+    fn forbidden_shell_tool_is_permission_denied() {
+        let result = dispatch("run_shell", &json!({"cmd": "rm -rf /"}));
+        assert!(result.is_err());
+        let (code, _) = result.unwrap_err();
+        assert_eq!(code, ErrorCode::PermissionDenied);
+        assert_eq!(classify("run_shell"), RiskClass::Forbidden);
+    }
+
+    #[test]
+    fn terminate_process_is_sensitive_and_not_executed() {
+        let decision = policy_decision("terminate_process");
+        assert!(!decision.allowed);
+        assert!(decision.requires_confirmation);
+        assert_eq!(decision.risk, RiskClass::SensitiveAction);
+        let result = dispatch("terminate_process", &json!({"pid": 1}));
+        assert!(result.is_err());
+        let (code, _) = result.unwrap_err();
+        assert_eq!(code, ErrorCode::PermissionDenied);
     }
 
     #[test]
@@ -55,10 +74,6 @@ mod tests {
 
     #[test]
     fn launch_application_never_treats_app_id_as_a_shell_command() {
-        // A hostile/hallucinated request trying to smuggle a shell command
-        // through app_id must fail as not_allowlisted, exactly like any
-        // other unrecognized string -- there is no code path that would
-        // ever pass this value to a shell.
         let result = dispatch(
             "launch_application",
             &json!({"app_id": "firefox; rm -rf /"}),
@@ -74,5 +89,27 @@ mod tests {
         assert!(result.is_err());
         let (code, _) = result.unwrap_err();
         assert_eq!(code, ErrorCode::InvalidArguments);
+    }
+
+    #[test]
+    fn catalog_lists_exactly_the_six_phase1_tools() {
+        let catalog = tool_catalog_json();
+        let tools = catalog.get("tools").and_then(|t| t.as_array()).unwrap();
+        assert_eq!(tools.len(), 6);
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t.get("name").and_then(|n| n.as_str()).unwrap())
+            .collect();
+        assert!(names.contains(&"get_memory_info"));
+        assert!(names.contains(&"launch_application"));
+        assert!(!names.contains(&"terminate_process"));
+        assert!(!names.contains(&"run_shell"));
+    }
+
+    #[test]
+    fn read_tools_are_classified_as_read() {
+        assert_eq!(classify("get_cpu_info"), RiskClass::Read);
+        assert_eq!(classify("list_processes"), RiskClass::Read);
+        assert_eq!(classify("launch_application"), RiskClass::LowRiskAction);
     }
 }

@@ -231,6 +231,7 @@ pub fn list_disk_volumes() -> Vec<DiskVolume> {
     out
 }
 
+#[cfg(target_os = "linux")]
 fn statvfs_bytes(path: &str) -> Option<(u64, u64)> {
     use std::ffi::CString;
     use std::mem::MaybeUninit;
@@ -251,4 +252,13 @@ fn statvfs_bytes(path: &str) -> Option<(u64, u64)> {
     let total = stat.f_blocks as u64 * block_size;
     let free = stat.f_bfree as u64 * block_size;
     Some((total, total.saturating_sub(free)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn statvfs_bytes(path: &str) -> Option<(u64, u64)> {
+    // Broker telemetry is Linux `/proc` + `statvfs`-oriented. Non-Linux
+    // hosts can still compile/run policy unit tests; live volume stats are
+    // unavailable here.
+    let _ = path;
+    None
 }
