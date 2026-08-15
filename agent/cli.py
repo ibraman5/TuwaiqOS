@@ -1,11 +1,8 @@
-"""Minimal CLI for the Tuwaiq AI agent prototype.
+"""Minimal CLI for the grounded Tuwaiq AI agent V1.
 
-Per the task requirements: "Start with CLI or minimal UI. Do NOT spend time
-building the final graphical assistant yet." This is intentionally a plain
-REPL -- the point of Phase 1 is proving the agent/broker/protocol
-architecture works end to end, not the UI.
-
-Run: python cli.py
+Run from AI-Module/agent:
+  TUWAIQ_AI_PROVIDER=rule python cli.py
+  TUWAIQ_AI_PROVIDER=local python cli.py
 """
 
 from __future__ import annotations
@@ -15,16 +12,25 @@ import sys
 
 from agent import Agent
 from broker_client import BrokerClient
-from model_provider import RuleBasedProvider
+from config import AgentConfig
+from model_provider import build_provider
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
 
 
 def main() -> None:
-    print("Tuwaiq AI (prototype) — type 'exit' to quit.\n")
-    broker = BrokerClient()
-    model = RuleBasedProvider()
-    agent = Agent(model=model, broker=broker)
+    config = AgentConfig.from_environ()
+    print(
+        "Tuwaiq AI grounded agent V1 — type 'exit' to quit.\n"
+        f"provider={config.provider} model={config.model_id} "
+        f"max_iterations={config.max_iterations}\n"
+    )
+    broker = BrokerClient(config.resolve_broker_path())
+    model = build_provider(config)
+    agent = Agent(model=model, broker=broker, config=config)
 
     try:
         while True:

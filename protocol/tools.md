@@ -112,3 +112,15 @@ Every tool, on failure, returns one of the `error.code` values defined in
 `schema.json`. Python never receives a raw OS error string, stack trace, or
 internal file path — the broker translates internal failures into one of the
 fixed codes plus a safe, generic message before returning.
+
+## Risk classes (V1)
+
+| Class | Tools | Broker behavior |
+|---|---|---|
+| `READ` | five telemetry tools | Allowed |
+| `LOW_RISK_ACTION` | `launch_application` | Allowed after allowlist check |
+| `SENSITIVE_ACTION` | `terminate_process` (reserved, not registered) | Denied; confirmation/deferred handled in the Python agent |
+| `FORBIDDEN` | shell-shaped names | `permission_denied` |
+
+There is still **no** process-termination or arbitrary-shell tool in the
+callable registry.

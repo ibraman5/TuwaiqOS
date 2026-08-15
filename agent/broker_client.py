@@ -37,6 +37,15 @@ CALL_TIMEOUT_SECONDS = 10.0
 MAX_RESTART_ATTEMPTS = 3
 
 
+def _normalize_broker_path(path: Path) -> Path:
+    """Prefer a platform-native broker binary name when present."""
+    if path.exists():
+        return path
+    exe = path.with_suffix(".exe")
+    if exe.exists():
+        return exe
+    return path
+
 class BrokerUnavailableError(RuntimeError):
     """Raised when the broker cannot be started or kept alive after
     MAX_RESTART_ATTEMPTS -- the agent should surface this to the user as
@@ -45,7 +54,7 @@ class BrokerUnavailableError(RuntimeError):
 
 class BrokerClient:
     def __init__(self, broker_path: Path | str = DEFAULT_BROKER_PATH):
-        self._broker_path = Path(broker_path)
+        self._broker_path = _normalize_broker_path(Path(broker_path))
         self._proc: subprocess.Popen | None = None
         self._restart_count = 0
 
