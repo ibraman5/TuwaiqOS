@@ -79,7 +79,9 @@ EOF
   # live-boot gives boot=live overlay support for the already-configured rootfs.
   # live-config is deliberately NOT installed: this rootfs is already configured
   # (tuwaiq user, SDDM autologin, Tuwaiq branding) and live-config would fight it.
-  PKGS=(live-boot live-boot-initramfs-tools git openssh-client nano vim less htop unzip wget ca-certificates)
+  # Only add live-image/developer dependencies absent from the existing D1
+  # rootfs. Keep the installed Plasma package set intact.
+  PKGS=(live-boot live-boot-initramfs-tools git openssh-client nano vim less htop unzip wget ca-certificates systemd-resolved libnss-resolve)
   log "install: ${PKGS[*]}"
   attempt=1
   until chroot "${ISO_ROOT}" apt-get -o Acquire::Retries=5 install -y --no-install-recommends "${PKGS[@]}"; do
@@ -97,6 +99,26 @@ fi
 
 # ------------------------------------------------------------- live tailoring
 log "tailor rootfs for live boot"
+
+# Apply the same D1 identity and NetworkManager/netplan configuration used by
+# the qualified product disk. This operates only on ISO_ROOT, never SRC_ROOTFS.
+log "apply existing D1 branding and NetworkManager configuration"
+apply_branding_backup="$(mktemp)"
+cp /src/product/scripts/apply-branding.sh "${apply_branding_backup}"
+sed -i 's/\r$//' /src/product/scripts/apply-branding.sh
+if ! bash /src/product/scripts/apply-branding.sh "${ISO_ROOT}"; then
+  cp "${apply_branding_backup}" /src/product/scripts/apply-branding.sh
+  rm -f "${apply_branding_backup}"
+  die "apply-branding failed"
+fi
+cp "${apply_branding_backup}" /src/product/scripts/apply-branding.sh
+rm -f "${apply_branding_backup}"
+
+# `apply-branding.sh` installs the resolver stub symlink when it exists; make
+# the live-image contract explicit after the resolver packages are installed.
+rm -f "${ISO_ROOT}/etc/resolv.conf"
+ln -s ../run/systemd/resolve/stub-resolv.conf "${ISO_ROOT}/etc/resolv.conf"
+chroot "${ISO_ROOT}" systemctl enable NetworkManager.service systemd-resolved.service >/dev/null 2>&1 || true
 
 # Live root comes from the squashfs overlay; disk PARTUUID entries would fail.
 cat > "${ISO_ROOT}/etc/fstab" <<'EOF'
@@ -117,11 +139,20 @@ sed -i 's/^127\.0\.1\.1.*/127.0.1.1\ttuwaiqos-dev/' "${ISO_ROOT}/etc/hosts" 2>/d
 # Graphical target + autologin so the ISO lands on the desktop unattended.
 chroot "${ISO_ROOT}" systemctl set-default graphical.target >/dev/null 2>&1 || true
 mkdir -p "${ISO_ROOT}/etc/sddm.conf.d"
+# Match the D0/D1-qualified identifier. The X11 session file is
+# /usr/share/xsessions/plasma.desktop; SDDM's Session= value is "plasma".
 cat > "${ISO_ROOT}/etc/sddm.conf.d/autologin.conf" <<'EOF'
 [Autologin]
 User=tuwaiq
-Session=plasmax11
+Session=plasma
 EOF
+
+# Ensure the user's shipped panel/wallpaper configuration wins over stale
+# runtime cache from the source rootfs.
+rm -rf "${ISO_ROOT}/home/tuwaiq/.cache/plasmashell" \
+       "${ISO_ROOT}/home/tuwaiq/.cache/plasma"* \
+       "${ISO_ROOT}/home/tuwaiq/.local/share/plasma"
+chroot "${ISO_ROOT}" chown -R tuwaiq:tuwaiq /home/tuwaiq >/dev/null 2>&1 || true
 
 # ------------------------------------------------- contributor docs on the ISO
 log "install contributor documentation"
