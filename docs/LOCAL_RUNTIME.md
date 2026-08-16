@@ -1,40 +1,43 @@
 # Local runtime measurements (Grounded Agent V1)
 
-Record only what is demonstrated on this host. Do not invent numbers for
-models that were not loaded.
+Record only what is demonstrated on this host.
 
-## Host capacity (planning context)
+## Host capacity
 
 - System RAM: ~16 GiB
-- NVIDIA VRAM: ~8 GiB (RTX 5050 class)
-- Primary product target model: `Qwen/Qwen3.5-9B` (Apache-2.0) — **not**
-  verified unquantized on this host.
-- Development verification model: official `Qwen/Qwen3.5-4B` (Apache-2.0)
-  when a compatible OpenAI-style local runtime with tool-call support is up.
+- NVIDIA VRAM: 8151 MiB (RTX 5050 Laptop GPU)
+- Runtime: Ollama 0.32.13 (OpenAI-compatible at `http://127.0.0.1:11434/v1`)
 
-## Measurement template / current status (2026-08-16)
+## Installed model (live verification 2026-08-16/17)
 
 | Field | Value |
 |---|---|
-| Runtime | Ollama installed; HTTP API reachable at `127.0.0.1:11434` |
-| Endpoint | `http://127.0.0.1:11434/v1` (OpenAI-compatible path configured) |
-| Model id | **none pulled** (`ollama list` empty) |
-| Source / license | N/A for this pass — no weights downloaded |
-| Precision / quantization | N/A |
-| Startup latency | N/A |
-| First-token latency | N/A |
-| Full response latency (Arabic slow-system) | Exercised via `RuleBasedProvider` harness (deterministic), not live Qwen |
-| Tool calls / iterations | Up to 4 (config default); Arabic slow path used memory+cpu+processes |
-| Host RAM used (agent+runtime) | Python pytest suite only; no LLM resident |
-| VRAM used | 0 (no model loaded) |
-| Provider used for automated tests | `rule` (deterministic) |
-| Broker unit tests | 12 passed (`cargo +stable test` outside kernel `build-std` tree) |
-| Agent unit/e2e tests | 15 passed (`pytest AI-Module/agent/tests`) |
+| Identifier | `qwen3.5:9b` |
+| Digest / ID | `6488c96fa5fa` |
+| Source | Official Ollama library (`ollama pull qwen3.5:9b`) corresponding to Qwen3.5-9B |
+| License | Apache-2.0 |
+| Parameters | 9.7B |
+| Quantization | Q4_K_M |
+| Package size | 6.6 GB (model blob 6594462816 bytes) |
+| Capabilities | completion, vision, tools, thinking |
+| Backend | NVIDIA GPU offload (measured ~6500–6570 MiB VRAM in use while loaded) |
+
+## Live Arabic acceptance measurements
+
+| Metric | Measured value |
+|---|---|
+| Warmup / first local response | 111.829 s |
+| Primary request `ليش جهازي بطيء؟` | 100.987 s |
+| Agent iterations (primary) | 4 (budget) |
+| Tool calls (primary) | `get_cpu_info` → `get_memory_info` → `get_disk_info` → `list_processes` |
+| Follow-up `وش أكثر برنامج مستهلك؟` | 18.644 s; reused fresh evidence (0 new tools) |
+| Close intent `سكره` | confirmation required for `tuwaiq-agent-br` (pid 1); no termination executed |
+| Provider outage | bounded `provider_unavailable` in 2.04 s; no crash; no false answer |
+| Provider class | `LocalModelProvider` (not `RuleBasedProvider`) |
+| Broker | Linux `tuwaiq-agent-broker:live` via Docker for real `/proc` telemetry |
 
 ## Notes
 
-- Live Qwen tool-call verification is deferred until a quantized/compatible
-  OpenAI-compatible runtime with `Qwen/Qwen3.5-4B` (or 9B) is installed.
-- Broker live `/proc` telemetry is Linux-oriented; Windows hosts can still
-  compile and run policy/registry unit tests.
-- This agent stack is **not production-ready**.
+- Broker telemetry in this Windows-host verification is the Docker Linux broker environment (real `/proc` evidence), not a rewritten agent architecture.
+- Model weights remain outside Git under the Ollama store.
+- This stack is still **not production-ready**.
