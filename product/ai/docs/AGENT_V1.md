@@ -28,7 +28,7 @@ User → BoundedAgent (max 4 iterations)
 | `TUWAIQ_AI_PROVIDER` | `local` | `local` or `rule` |
 | `TUWAIQ_AI_OPENAI_BASE_URL` | `http://127.0.0.1:11434/v1` | OpenAI-compatible base URL |
 | `TUWAIQ_AI_OPENAI_API_KEY` | `local` | Bearer token for local runtimes |
-| `TUWAIQ_AI_MODEL` | `Qwen/Qwen3.5-4B` | Model id (9B is the product target; 4B for host verification) |
+| `TUWAIQ_AI_MODEL` | `qwen3.5:9b` | Ollama / OpenAI-compatible model id |
 | `TUWAIQ_AI_TIMEOUT_SECONDS` | `60` | Provider HTTP timeout |
 | `TUWAIQ_AI_MAX_ITERATIONS` | `4` | Tool/decision loop budget |
 | `TUWAIQ_AI_EVIDENCE_TTL_SECONDS` | `120` | Evidence freshness |
@@ -87,9 +87,17 @@ calls, point `TUWAIQ_AI_OPENAI_BASE_URL` / `TUWAIQ_AI_MODEL` at it, and set
 See `docs/LOCAL_RUNTIME.md` for host measurements (model id, license,
 latency, RAM/VRAM). Values are recorded only for what actually runs.
 
+## Product packaging
+
+See `docs/PRODUCT_INTEGRATION.md`. Product installs under `/usr/lib/tuwaiq/ai`
+with `tuwaiq-ai.service` + `tuwaiq-agent-broker.service`. The CLI
+`tuwaiq-ai` is a socket client only. Default Product model id is
+`qwen3.5:9b` (not embedded in the ISO).
+
 ## Non-goals / honesty
 
 - Not production-ready.
-- Not integrated into OS GUI or kernel AI bridge.
+- Not integrated into OS GUI chrome (CLI + socket API only in this drop).
+- Kernel AI bridge remains untouched.
 - Process termination is intentionally unavailable.
 - Model weights and broker `target/` artifacts must not be committed.

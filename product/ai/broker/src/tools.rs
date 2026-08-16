@@ -19,13 +19,38 @@ const MAX_PROCESSES_RETURNED: usize = 50;
 const CPU_SAMPLE_WINDOW: Duration = Duration::from_millis(200);
 
 pub fn get_system_info(_args: &serde_json::Value) -> ToolResult {
-    Ok(json!({
+    let mut payload = json!({
         "os_name": "TuwaiqOS",
         "os_version": "v0.5",
         "kernel_version": procinfo::kernel_version(),
         "hostname": procinfo::hostname(),
         "uptime_seconds": procinfo::uptime_seconds(),
-    }))
+    });
+    if let Some(connectivity) = optional_connectivity_status() {
+        payload
+            .as_object_mut()
+            .expect("system info object")
+            .insert("connectivity".to_string(), connectivity);
+    }
+    Ok(payload)
+}
+
+/// Read-only NetworkManager status JSON written by D1 connectivity helpers.
+/// Absent or unreadable files are ignored — never an error.
+fn optional_connectivity_status() -> Option<serde_json::Value> {
+    const CANDIDATES: &[&str] = &[
+        "/var/lib/tuwaiq/connectivity/status.json",
+        "/run/tuwaiq/connectivity.json",
+    ];
+    for path in CANDIDATES {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            return Some(value);
+        }
+    }
+    None
 }
 
 pub fn get_cpu_info(_args: &serde_json::Value) -> ToolResult {

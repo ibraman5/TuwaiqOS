@@ -33,9 +33,8 @@ class AgentConfig:
     # OpenAI-compatible local endpoint (vLLM / SGLang / Ollama / etc.)
     openai_base_url: str = "http://127.0.0.1:11434/v1"
     openai_api_key: str = "local"
-    # Primary target is Qwen/Qwen3.5-9B; default here is the official smaller
-    # development verification identifier when the host cannot host 9B.
-    model_id: str = "Qwen/Qwen3.5-4B"
+    # Product default is the accepted Ollama tag; host-only 4B may override via env.
+    model_id: str = "qwen3.5:9b"
     request_timeout_seconds: float = 60.0
     max_context_chars: int = 24_000
     max_iterations: int = 4
@@ -52,7 +51,7 @@ class AgentConfig:
                 "TUWAIQ_AI_OPENAI_BASE_URL", "http://127.0.0.1:11434/v1"
             ).rstrip("/"),
             openai_api_key=os.environ.get("TUWAIQ_AI_OPENAI_API_KEY", "local"),
-            model_id=os.environ.get("TUWAIQ_AI_MODEL", "Qwen/Qwen3.5-4B"),
+            model_id=os.environ.get("TUWAIQ_AI_MODEL", "qwen3.5:9b"),
             request_timeout_seconds=_env_float("TUWAIQ_AI_TIMEOUT_SECONDS", 60.0),
             max_context_chars=_env_int("TUWAIQ_AI_MAX_CONTEXT_CHARS", 24_000),
             max_iterations=_env_int("TUWAIQ_AI_MAX_ITERATIONS", 4),
@@ -65,16 +64,23 @@ class AgentConfig:
     def resolve_broker_path(self) -> Path:
         if self.broker_path:
             return Path(self.broker_path)
-        base = (
+        # Product install path first, then local debug build.
+        for candidate in (
+            Path("/usr/libexec/tuwaiq/tuwaiq-agent-broker"),
+            Path(__file__).resolve().parent.parent
+            / "broker"
+            / "target"
+            / "release"
+            / "tuwaiq-agent-broker",
             Path(__file__).resolve().parent.parent
             / "broker"
             / "target"
             / "debug"
-            / "tuwaiq-agent-broker"
-        )
-        if base.exists():
-            return base
-        exe = base.with_suffix(".exe")
-        if exe.exists():
-            return exe
-        return base
+            / "tuwaiq-agent-broker",
+        ):
+            if candidate.exists():
+                return candidate
+            exe = candidate.with_suffix(".exe")
+            if exe.exists():
+                return exe
+        return Path("/usr/libexec/tuwaiq/tuwaiq-agent-broker")

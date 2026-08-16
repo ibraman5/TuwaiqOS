@@ -1,29 +1,20 @@
-"""Manages the tuwaiq-agent-broker subprocess and the request/response
-exchange over its stdin/stdout.
+"""Manages the tuwaiq-agent-broker connection.
+
+Two modes:
+1. Subprocess stdin/stdout (dev/tests) — default when no socket env is set.
+2. Unix-domain socket to a systemd-managed broker (Product) when
+   TUWAIQ_AI_BROKER_SOCKET is set.
 
 This is the *only* file in the Python codebase that spawns a process or
-knows the broker's binary path. `agent.py` and `tools.py` never see a
-subprocess handle -- they only ever call `BrokerClient.call(tool, args)` and
-get back a `ToolResponse`.
-
-Crash handling: if the broker process has died (crashed, was killed, or
-exited), the next `call()` transparently restarts it before sending the
-request. This directly satisfies requirement 15 ("if Python/AI crashes, the
-broker and OS must remain usable") from the other direction that matters for
-this prototype: even if the *broker* dies, the agent recovers on the next
-call rather than wedging forever. In the real deployed system the broker
-would be a systemd-supervised service the AI process does not own the
-lifecycle of at all -- see architecture.md's "Process supervision" section
-for why that matters for the reverse direction (Python/model crashing must
-never be able to take the broker down, which is trivially true here since
-Python never sends the broker anything but well-formed JSON on a pipe it
-does not control the broker's exit with).
+opens the broker transport. `agent.py` never sees a subprocess handle.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -46,9 +37,10 @@ def _normalize_broker_path(path: Path) -> Path:
         return exe
     return path
 
+
 class BrokerUnavailableError(RuntimeError):
     """Raised when the broker cannot be started or kept alive after
-    MAX_RESTART_ATTEMPTS -- the agent should surface this to the user as
+    MAX_RESTART_ATTEMPTS — the agent should surface this to the user as
     "system tools are temporarily unavailable," not crash itself."""
 
 
@@ -57,18 +49,28 @@ class BrokerClient:
         self._broker_path = _normalize_broker_path(Path(broker_path))
         self._proc: subprocess.Popen | None = None
         self._restart_count = 0
+        self._socket_path = os.environ.get("TUWAIQ_AI_BROKER_SOCKET") or None
+        self._sock: socket.socket | None = None
+        self._sock_file = None
+
+    @property
+    def uses_socket(self) -> bool:
+        return bool(self._socket_path)
 
     def _is_alive(self) -> bool:
+        if self._socket_path:
+            return self._sock is not None
         return self._proc is not None and self._proc.poll() is None
 
     def _start(self) -> None:
+        if self._socket_path:
+            self._connect_socket()
+            return
         if not self._broker_path.exists():
             raise BrokerUnavailableError(
                 f"broker binary not found at {self._broker_path}; run `cargo build` in broker/"
             )
         logger.info("starting broker subprocess: %s", self._broker_path)
-        # Windows live verification may point at a .cmd wrapper (e.g. Docker
-        # Linux broker). Launch via cmd.exe so stdin/stdout pipes still work.
         if self._broker_path.suffix.lower() in {".cmd", ".bat"}:
             argv = ["cmd.exe", "/c", str(self._broker_path)]
         else:
@@ -79,11 +81,38 @@ class BrokerClient:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            bufsize=1,  # line-buffered
+            bufsize=1,
         )
+
+    def _connect_socket(self) -> None:
+        assert self._socket_path is not None
+        path = Path(self._socket_path)
+        if not path.exists():
+            raise BrokerUnavailableError(
+                f"broker socket not found at {path}; is tuwaiq-agent-broker.service running?"
+            )
+        logger.info("connecting to broker socket: %s", path)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(CALL_TIMEOUT_SECONDS)
+        try:
+            sock.connect(str(path))
+        except OSError as exc:
+            sock.close()
+            raise BrokerUnavailableError(f"broker socket connect failed: {exc}") from exc
+        self._sock = sock
+        self._sock_file = sock.makefile("rwb", buffering=0)
 
     def _ensure_alive(self) -> None:
         if self._is_alive():
+            return
+        if self._socket_path:
+            if self._restart_count >= MAX_RESTART_ATTEMPTS:
+                raise BrokerUnavailableError(
+                    f"broker socket failed after {MAX_RESTART_ATTEMPTS} reconnect attempts"
+                )
+            self._restart_count += 1
+            self._close_socket()
+            self._connect_socket()
             return
         if self._proc is not None:
             logger.warning(
@@ -98,19 +127,15 @@ class BrokerClient:
         self._start()
 
     def call(self, tool: str, arguments: dict | None = None) -> ToolResponse:
-        """Send one tool request and block for the matching response.
-
-        Phase 1 is strictly synchronous/single-in-flight: the CLI prototype
-        never has two requests outstanding at once, so a line-in/line-out
-        exchange is sufficient and request_id correlation is trivial (there
-        is only ever one candidate line to read). A concurrent multi-client
-        broker is out of scope for Phase 1 -- see architecture.md.
-        """
+        """Send one tool request and block for the matching response."""
         request = ToolRequest(tool=tool, arguments=arguments or {})
         self._ensure_alive()
-        assert self._proc is not None and self._proc.stdin is not None and self._proc.stdout is not None
-
         line = json.dumps(request.to_wire_dict())
+
+        if self._socket_path:
+            return self._call_socket(request, line)
+
+        assert self._proc is not None and self._proc.stdin is not None and self._proc.stdout is not None
         try:
             self._proc.stdin.write(line + "\n")
             self._proc.stdin.flush()
@@ -124,10 +149,6 @@ class BrokerClient:
 
         response_line = self._read_response_line(request.request_id)
         if response_line is None:
-            # The broker died mid-request (crashed) rather than answering.
-            # Surface this as a structured error the agent can explain to
-            # the user, rather than letting the caller hang or raising an
-            # unhandled exception up through the agent loop.
             return ToolResponse(
                 protocol_version=request.protocol_version,
                 request_id=request.request_id,
@@ -151,6 +172,45 @@ class BrokerClient:
             )
         return ToolResponse.from_wire_dict(data)
 
+    def _call_socket(self, request: ToolRequest, line: str) -> ToolResponse:
+        assert self._sock_file is not None
+        try:
+            self._sock_file.write((line + "\n").encode("utf-8"))
+            self._sock_file.flush()
+            raw = self._sock_file.readline()
+        except OSError as exc:
+            logger.warning("broker socket I/O failed (%s); reconnecting once", exc)
+            self._close_socket()
+            self._ensure_alive()
+            assert self._sock_file is not None
+            self._sock_file.write((line + "\n").encode("utf-8"))
+            self._sock_file.flush()
+            raw = self._sock_file.readline()
+
+        if not raw:
+            self._close_socket()
+            return ToolResponse(
+                protocol_version=request.protocol_version,
+                request_id=request.request_id,
+                timestamp=request.timestamp,
+                status="error",
+                error={
+                    "code": "internal_error",
+                    "message": "broker socket closed without a response",
+                },
+            )
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return ToolResponse(
+                protocol_version=request.protocol_version,
+                request_id=request.request_id,
+                timestamp=request.timestamp,
+                status="error",
+                error={"code": "internal_error", "message": "broker returned unparseable output"},
+            )
+        return ToolResponse.from_wire_dict(data)
+
     def _read_response_line(self, expected_request_id: str) -> str | None:
         assert self._proc is not None and self._proc.stdout is not None
         deadline = time.monotonic() + CALL_TIMEOUT_SECONDS
@@ -159,7 +219,6 @@ class BrokerClient:
                 return None
             line = self._proc.stdout.readline()
             if not line:
-                # EOF on stdout -- broker exited.
                 return None
             line = line.strip()
             if not line:
@@ -168,7 +227,24 @@ class BrokerClient:
         logger.warning("timed out waiting for broker response to request_id=%s", expected_request_id)
         return None
 
+    def _close_socket(self) -> None:
+        if self._sock_file is not None:
+            try:
+                self._sock_file.close()
+            except Exception:
+                pass
+        self._sock_file = None
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+        self._sock = None
+
     def shutdown(self) -> None:
+        if self._socket_path:
+            self._close_socket()
+            return
         if self._proc is not None and self._is_alive():
             try:
                 self._proc.stdin.close()  # type: ignore[union-attr]
