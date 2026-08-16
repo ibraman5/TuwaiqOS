@@ -60,7 +60,11 @@ TOOL_CATALOG: dict[str, dict[str, Any]] = {
 RESERVED_SENSITIVE_TOOLS: dict[str, dict[str, Any]] = {
     "terminate_process": {
         "risk": RiskClass.SENSITIVE_ACTION.value,
-        "description": "Reserved. Process termination is not implemented by the V1 broker.",
+        "description": (
+            "Request ending/closing a running process by pid and/or name. "
+            "Use this when the user asks to close, stop, kill, or سكر/سكره a process. "
+            "This only submits a sensitive request; never claim it already executed."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -76,9 +80,13 @@ FORBIDDEN_TOOLS = frozenset({"run_shell", "execute_command", "shell", "bash"})
 
 
 def openai_tool_definitions() -> list[dict[str, Any]]:
-    """OpenAI-compatible tool schema list for local chat-completions APIs."""
+    """OpenAI-compatible tool schema list for local chat-completions APIs.
+
+    Includes reserved sensitive intents so the model can *request* them; the
+    Agent/broker still refuse execution and require external confirmation.
+    """
     tools: list[dict[str, Any]] = []
-    for name, meta in TOOL_CATALOG.items():
+    for name, meta in {**TOOL_CATALOG, **RESERVED_SENSITIVE_TOOLS}.items():
         tools.append(
             {
                 "type": "function",
