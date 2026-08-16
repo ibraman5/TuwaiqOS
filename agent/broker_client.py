@@ -33,7 +33,7 @@ from protocol import ToolRequest, ToolResponse
 logger = logging.getLogger("tuwaiq_agent.broker_client")
 
 DEFAULT_BROKER_PATH = Path(__file__).resolve().parent.parent / "broker" / "target" / "debug" / "tuwaiq-agent-broker"
-CALL_TIMEOUT_SECONDS = 10.0
+CALL_TIMEOUT_SECONDS = 30.0
 MAX_RESTART_ATTEMPTS = 3
 
 
@@ -67,8 +67,14 @@ class BrokerClient:
                 f"broker binary not found at {self._broker_path}; run `cargo build` in broker/"
             )
         logger.info("starting broker subprocess: %s", self._broker_path)
+        # Windows live verification may point at a .cmd wrapper (e.g. Docker
+        # Linux broker). Launch via cmd.exe so stdin/stdout pipes still work.
+        if self._broker_path.suffix.lower() in {".cmd", ".bat"}:
+            argv = ["cmd.exe", "/c", str(self._broker_path)]
+        else:
+            argv = [str(self._broker_path)]
         self._proc = subprocess.Popen(
-            [str(self._broker_path)],
+            argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

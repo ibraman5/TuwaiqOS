@@ -416,7 +416,11 @@ class LocalModelProvider(ModelProvider):
             "Use tools for live system state. Never invent process/CPU/memory facts. "
             "Never claim approval for sensitive actions. "
             "Never ask for or run shell commands. "
-            "If evidence is already provided and sufficient, answer without more tools."
+            "If evidence is already provided and sufficient, answer without more tools. "
+            "Gulf/Arabic close intents such as سكره، سكر، أغلق، اقفل، أوقف about a "
+            "process/app mean request terminate_process for the focused process from "
+            "trusted evidence (name/pid). Do not confuse سكره with screen/display settings. "
+            "Never claim a process was killed; the broker will not execute termination in V1."
         )
         messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         if history:
