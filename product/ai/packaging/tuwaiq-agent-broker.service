@@ -10,6 +10,9 @@ Type=simple
 ExecStart=/usr/libexec/tuwaiq/tuwaiq-agent-broker --unix-socket /run/tuwaiq/ai-broker.sock
 RuntimeDirectory=tuwaiq
 RuntimeDirectoryMode=0755
+# Shared with tuwaiq-ai.service. Without Preserve, stopping AI deletes
+# /run/tuwaiq and unlinks the still-running broker socket.
+RuntimeDirectoryPreserve=yes
 Restart=on-failure
 RestartSec=2s
 StartLimitIntervalSec=60

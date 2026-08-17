@@ -17,6 +17,9 @@ Environment=PYTHONPATH=/usr/lib/tuwaiq/ai/agent
 ExecStart=/usr/bin/python3 /usr/lib/tuwaiq/ai/agent/service_main.py
 RuntimeDirectory=tuwaiq
 RuntimeDirectoryMode=0755
+# Shared with tuwaiq-agent-broker.service. Preserve keeps the broker
+# socket inode when this unit is restarted.
+RuntimeDirectoryPreserve=yes
 StateDirectory=tuwaiq/ai
 StateDirectoryMode=0755
 Restart=on-failure
